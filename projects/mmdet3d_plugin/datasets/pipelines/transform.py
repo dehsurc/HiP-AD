@@ -150,6 +150,8 @@ class NuScenesSparse4DAdaptor(object):
             'gt_ego_fut_trajs',
             'gt_ego_fut_masks',
             'gt_ego_fut_cmd',
+            'gt_ego_fut_trajs_2hz',
+            'gt_ego_fut_masks_2hz',
             "command_near_xy",
             'ego_status',
         ]:
