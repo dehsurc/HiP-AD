@@ -938,13 +938,15 @@ class SparseOneDecoder(BaseModule):
                         ego_reg, ego_cls, ego_status_ = None, None, self.ego_refine[refine_i](ego_instance_feature,
                                                                                               ego_anchor_embed)
                     else:
-                        plan_anchor = torch.tile(self.ego_instance_bank_list[bank_idx].plan_anchor[None],
-                                                 (batch_size, 1, 1, 1, 1))
-                        plan_pos = gen_sineembed_for_position(plan_anchor[..., -1, :])
-                        plan_mode_query = self.ego_instance_bank_list[bank_idx].plan_anchor_encoder(plan_pos).flatten(1, 2).unsqueeze(1)
-                        plan_query = plan_mode_query + (ego_instance_feature + ego_anchor_embed).unsqueeze(2)
+                        ego_plan_anchor = torch.tile(self.ego_instance_bank_list[bank_idx].plan_anchor[None],
+                                                     (batch_size, 1, 1, 1, 1))
+                        ego_plan_pos = gen_sineembed_for_position(ego_plan_anchor[..., -1, :])
+                        ego_plan_mode_query = self.ego_instance_bank_list[bank_idx].plan_anchor_encoder(ego_plan_pos).flatten(1, 2).unsqueeze(1)
+                        plan_query = ego_plan_mode_query + (ego_instance_feature + ego_anchor_embed).unsqueeze(2)
 
-                        ego_cls, ego_reg, ego_status_ = self.ego_refine[refine_i](plan_query, ego_instance_feature, ego_anchor_embed)
+                        ego_cls, ego_reg, ego_status_ = self.ego_refine[refine_i](
+                            plan_query, ego_instance_feature, ego_anchor_embed
+                        )
 
                     ego_classification.append(ego_cls)
                     ego_prediction.append(ego_reg)
@@ -1603,4 +1605,3 @@ class SparseOneDecoder(BaseModule):
                 ego_output, det_output, motion_output, plan_output, data)
 
         return det_result, map_result, ego_result, plan_result, motion_result
-

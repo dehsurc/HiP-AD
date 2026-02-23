@@ -154,6 +154,7 @@ class NuScenesSparse4DAdaptor(object):
             'gt_ego_fut_masks_2hz',
             "command_near_xy",
             'ego_status',
+            'ego_status_mask',
         ]:
             if key not in input_dict:
                 continue

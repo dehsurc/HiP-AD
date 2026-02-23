@@ -99,6 +99,9 @@ class NuScenes3DDataset(Dataset):
         keep_consistent_seq_aug=True,
         work_dir=None,
         eval_config=None,
+        ego_status_dims=10,
+        ego_status_mask_limit_vel=20.0,
+        ego_status_mask_limit_accel=40.0,
     ):
         self.version = version
         self.load_interval = load_interval
@@ -145,6 +148,11 @@ class NuScenes3DDataset(Dataset):
         
         self.work_dir = work_dir
         self.eval_config = eval_config
+        if ego_status_dims not in (6, 10):
+            raise ValueError(f"ego_status_dims must be 6 or 10, got {ego_status_dims}")
+        self.ego_status_dims = ego_status_dims
+        self.ego_status_mask_limit_vel = ego_status_mask_limit_vel
+        self.ego_status_mask_limit_accel = ego_status_mask_limit_accel
 
     def __len__(self):
         return len(self.data_infos)
@@ -297,6 +305,7 @@ class NuScenes3DDataset(Dataset):
     
     def get_data_info(self, index):
         info = self.data_infos[index]
+        ego_status, ego_status_mask = self._build_ego_status(info)
         input_dict = dict(
             token=info["token"],
             map_location=info["map_location"],
@@ -307,7 +316,8 @@ class NuScenes3DDataset(Dataset):
             lidar2ego_rotation=info["lidar2ego_rotation"],
             ego2global_translation=info["ego2global_translation"],
             ego2global_rotation=info["ego2global_rotation"],
-            ego_status=info['ego_status'].astype(np.float32),
+            ego_status=ego_status,
+            ego_status_mask=ego_status_mask,
             map_infos=info["map_annos"],
         )
         lidar2ego = np.eye(4)
@@ -360,6 +370,30 @@ class NuScenes3DDataset(Dataset):
         annos = self.get_ann_info(index)
         input_dict.update(annos)
         return input_dict
+
+    def _build_ego_status(self, info):
+        status = info["ego_status"].astype(np.float32)
+        if self.ego_status_dims == 6:
+            # Match B2D-style status layout: [vx, ax, ay, wx, wy, steer].
+            status = status[[6, 0, 1, 3, 4, 9]]
+            accel_xy = status[1:3]
+            speed = status[0]
+            speed_idx = 0
+            accel_idx = slice(1, 3)
+        else:
+            # nuScenes raw layout: [ax, ay, az, wx, wy, wz, vx, vy, vz, steer].
+            accel_xy = status[0:2]
+            speed = status[6]
+            speed_idx = 6
+            accel_idx = slice(0, 2)
+
+        status_mask = np.ones(self.ego_status_dims, dtype=np.float32)
+        if np.abs(speed) > self.ego_status_mask_limit_vel:
+            status_mask[speed_idx] = 0.0
+        if np.linalg.norm(accel_xy) > self.ego_status_mask_limit_accel:
+            status_mask[accel_idx] = 0.0
+
+        return status.astype(np.float32), status_mask
 
     def get_ann_info(self, index):
         info = self.data_infos[index]

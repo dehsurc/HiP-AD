@@ -11,7 +11,7 @@ length = {'trainval': 28130, 'mini': 323}
 num_gpus = 8
 batch_size = 6
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 18
+num_epochs = 12
 checkpoint_epoch_interval = 20
 
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=1)
@@ -21,7 +21,7 @@ log_config = dict(
         dict(type="TextLoggerHook", by_epoch=False),
     ],
 )
-load_from = "./work_dirs/hipad_nusc_stage1/latest.pth"
+load_from = None
 resume_from = None
 workflow = [("train", 1)]
 fp16 = dict(loss_scale=32.0)
@@ -85,7 +85,8 @@ temporal_plan = True
 # tasks
 task_config = dict(with_onedecoder=True)
 
-task_select = ["det", "map", "plan", "ego", "motion"]
+# Stage1 pretraining excludes motion loss.
+task_select = ["det", "map", "plan", "ego"]
 query_select = ["det", "map", "plan", "ego"]  # with query initial order
 
 single_frame_layer = ["concat", "gnn", "inter_gnn", "norm", "split", "deformable", "concat", "ffn", "norm", "split", "refine"]
@@ -474,7 +475,7 @@ model = dict(
                               loss_line=dict(type="LinesL1Loss", loss_weight=10.0, beta=0.01),
                               num_sample=map_num_pts,
                               roi_size=map_roi_size),
-            loss_ego_status=dict(type="L1Loss", loss_weight=1.0),
+            loss_ego_status=dict(type="L1Loss", loss_weight=0.0),
             loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.5),
             loss_plan_reg=dict(type="L1Loss", loss_weight=1.0),
             loss_motion_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.2),
@@ -696,7 +697,7 @@ eval_mode = dict(
     with_det=True,
     with_tracking=True,
     with_map=True,
-    with_motion=True,
+    with_motion=False,
     with_planning=True,
     tracking_threshold=0.2,
     motion_threshhold=0.2,
@@ -707,4 +708,4 @@ evaluation = dict(
     eval_mode=eval_mode,
 )
 
-load_from = "./work_dirs/hipad_nusc_stage1/latest.pth"
+load_from = None

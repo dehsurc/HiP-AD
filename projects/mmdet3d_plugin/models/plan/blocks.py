@@ -44,6 +44,12 @@ class SparsePlanRefinementModule(BaseModule):
         else:
             output = self.plan_reg_branch(instance_feature)
 
+        # Ensure anchor/output are flattened to [B, N, T*2]
+        if output.dim() > 3:
+            output = output.flatten(-2)
+        if anchor.dim() > 3:
+            anchor = anchor.flatten(-2)
+
         output = output + anchor
 
         cls = self.plan_cls_branch(instance_feature)
@@ -152,6 +158,12 @@ class SparsePlanAlignRefinementModule(BaseModule):
 
         cls_outputs = torch.cat(cls_outputs, dim=1)
         reg_outputs = torch.cat(reg_outputs, dim=1)
+
+        # Ensure anchor/reg outputs are flattened to [B, N, T*2]
+        if reg_outputs.dim() > 3:
+            reg_outputs = reg_outputs.flatten(-2)
+        if anchor.dim() > 3:
+            anchor = anchor.flatten(-2)
 
         reg_outputs = reg_outputs + anchor
 
