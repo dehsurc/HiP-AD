@@ -248,6 +248,10 @@ class SparseOneDecoder(BaseModule):
 
         if 'ego' in self.query_select:
             self.ego_instance_bank = build(ego_instance_bank, PLUGIN_LAYERS)
+            # In ego-status supervision mode, ego plan anchor branch is not used in
+            # forward/loss, so exclude its params from DDP gradient reduction.
+            if self.with_supervise_ego_status and hasattr(self.ego_instance_bank, "plan_anchor_encoder"):
+                self.ego_instance_bank.plan_anchor_encoder.requires_grad_(False)
             if ego_anchor_encoder is not None:
                 self.ego_anchor_encoder = build(ego_anchor_encoder, POSITIONAL_ENCODING)
             elif hasattr(self, 'det_anchor_encoder'):
