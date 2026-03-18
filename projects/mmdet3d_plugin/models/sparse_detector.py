@@ -38,6 +38,7 @@ class SparseDetector(BaseDetector):
         use_deformable_func=False,
         depth_branch=None,
         scenes_tokenizer=None,
+        distillation=None,
     ):
         super(SparseDetector, self).__init__(init_cfg=init_cfg)
         if pretrained is not None:
@@ -61,7 +62,32 @@ class SparseDetector(BaseDetector):
         if use_grid_mask:
             self.grid_mask = GridMask(
                 True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7
-            ) 
+            )
+
+        # ---- Distillation ----
+        self._build_distillation(distillation) 
+
+    def _build_distillation(self, distillation_cfg):
+        """Build distillation modules if config is provided."""
+        if distillation_cfg is None:
+            self.teacher = None
+            self.distill_loss = None
+            self.aux_bev_head = None
+            return
+
+        from .distillation import BEVFusionTeacher, DistillationLoss, AuxBEVHeatmapHead
+
+        teacher_cfg = distillation_cfg.get("teacher", {})
+        self.teacher = BEVFusionTeacher(**teacher_cfg)
+
+        loss_cfg = distillation_cfg.get("loss", {})
+        self.distill_loss = DistillationLoss(**loss_cfg)
+
+        aux_cfg = distillation_cfg.get("aux_bev_head", None)
+        if aux_cfg is not None:
+            self.aux_bev_head = AuxBEVHeatmapHead(**aux_cfg)
+        else:
+            self.aux_bev_head = None
 
     @auto_fp16(apply_to=("img",), out_fp32=True)
     def extract_feat(self, img, return_depth=False, metas=None):
@@ -142,6 +168,37 @@ class SparseDetector(BaseDetector):
             output["loss_dense_depth"] = self.depth_branch.loss(
                 depths, data["gt_depth"]
             )
+
+        # ---- Distillation losses ----
+        if self.teacher is not None and "teacher_dense_heatmap" in data:
+            det_output = model_outs[0]  # first element of the tuple
+
+            # Get teacher outputs from cached data
+            teacher_outputs = self.teacher(data)
+
+            # Build auxiliary heatmap from student query features
+            student_heatmap = None
+            if self.aux_bev_head is not None:
+                # Use last decoder layer's instance features and anchors
+                # det_output["instance_feature"]: [B, N, embed_dims]
+                # det_output["prediction"][-1]: [B, N, D] (last layer anchors)
+                student_heatmap = self.aux_bev_head(
+                    det_output["instance_feature"],
+                    det_output["prediction"][-1],
+                )
+
+            # Compute distillation losses
+            distill_losses = self.distill_loss(
+                student_cls_list=det_output["classification"],
+                student_reg_list=det_output["prediction"],
+                student_heatmap=student_heatmap,
+                teacher_outputs=teacher_outputs,
+                gt_labels_3d=data["gt_labels_3d"],
+                gt_bboxes_3d=data["gt_bboxes_3d"],
+                student_sampler=self.head.det_sampler,
+            )
+            output.update(distill_losses)
+
         return output
 
     def forward_test(self, img, **data):

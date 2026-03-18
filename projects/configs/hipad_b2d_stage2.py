@@ -74,7 +74,7 @@ operation_order = single_frame_layer * num_single_frame_decoder + \
                   temporal_frame_layer * (num_decoder - num_single_frame_decoder)
 
 # anchors
-project_dir = "/opt/data/private/project/HiP-AD"
+project_dir = "/home/yongjae/e2e/HiP-AD"
 
 anchor_paths = {
     "det" : f"{project_dir}/data/kmeans/b2d_det_900.npy",
@@ -669,4 +669,4 @@ evaluation = dict(
     eval_mode=eval_mode,
 )
 
-load_from = "./work_dirs/hipad_b2d_stage1/latest.pth"
+load_from = "/home/yongjae/e2e/HiP-AD/ckpts/HiP-AD_stage2.pth"

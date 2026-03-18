@@ -19,6 +19,7 @@ from .loading import (
     )
 
 from .vectorize import VectorizeMap, VectorizePloyLine
+from .load_teacher_cache import LoadTeacherCache
 
 __all__ = [
     "InstanceNameFilter",
@@ -34,5 +35,6 @@ __all__ = [
     "VectorizeMap",
     "VectorizePloyLine",
     "B2DLoadPointsFromFile",
-    "B2DMultiScaleDepthMapGenerator"
+    "B2DMultiScaleDepthMapGenerator",
+    "LoadTeacherCache",
 ]

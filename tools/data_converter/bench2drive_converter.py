@@ -335,6 +335,7 @@ def preprocess(folder_list, idx, tmp_dir, train_or_val):
             sensor_infos['LIDAR_TOP']['lidar2ego'] = left2right @ np.array(anno['sensors']['LIDAR_TOP']['lidar2ego']) @ left2right @ lidar_to_righthand_ego
             world2lidar = lefthand_ego_to_lidar @ np.array(anno['sensors']['LIDAR_TOP']['world2lidar']) @ left2right
             sensor_infos['LIDAR_TOP']['world2lidar'] = world2lidar
+            sensor_infos['LIDAR_TOP']['data_path'] = join(folder_name, 'lidar', ann_name.split('.')[0] + '.laz')
             frame_data['sensors'] = sensor_infos
 
             ###get bounding_boxes infos###
