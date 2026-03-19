@@ -99,6 +99,7 @@ class NuScenes3DDataset(Dataset):
         keep_consistent_seq_aug=True,
         work_dir=None,
         eval_config=None,
+        eval_data_root=None,
         ego_status_dims=10,
         ego_status_mask_limit_vel=20.0,
         ego_status_mask_limit_accel=40.0,
@@ -148,6 +149,7 @@ class NuScenes3DDataset(Dataset):
         
         self.work_dir = work_dir
         self.eval_config = eval_config
+        self.eval_data_root = eval_data_root
         if ego_status_dims not in (6, 10):
             raise ValueError(f"ego_status_dims must be 6 or 10, got {ego_status_dims}")
         self.ego_status_dims = ego_status_dims
@@ -388,10 +390,15 @@ class NuScenes3DDataset(Dataset):
             accel_idx = slice(0, 2)
 
         status_mask = np.ones(self.ego_status_dims, dtype=np.float32)
-        if np.abs(speed) > self.ego_status_mask_limit_vel:
-            status_mask[speed_idx] = 0.0
-        if np.linalg.norm(accel_xy) > self.ego_status_mask_limit_accel:
-            status_mask[accel_idx] = 0.0
+        # If canbus data was unavailable, ego_status is all zeros.
+        # Mask everything so the model does not learn from invalid GT.
+        if np.all(status == 0):
+            status_mask[:] = 0.0
+        else:
+            if np.abs(speed) > self.ego_status_mask_limit_vel:
+                status_mask[speed_idx] = 0.0
+            if np.linalg.norm(accel_xy) > self.ego_status_mask_limit_accel:
+                status_mask[accel_idx] = 0.0
 
         return status.astype(np.float32), status_mask
 
@@ -561,8 +568,9 @@ class NuScenes3DDataset(Dataset):
         from nuscenes import NuScenes
 
         output_dir = osp.join(*osp.split(result_path)[:-1])
+        eval_data_root = self._get_eval_data_root()
         nusc = NuScenes(
-            version=self.version, dataroot=self.data_root, verbose=False
+            version=self.version, dataroot=eval_data_root, verbose=False
         )
         eval_set_map = {
             "v1.0-mini": "mini_val",
@@ -571,14 +579,29 @@ class NuScenes3DDataset(Dataset):
         if not tracking:
             from nuscenes.eval.detection.evaluate import NuScenesEval
 
-            nusc_eval = NuScenesEval(
-                nusc,
-                config=self.det3d_eval_configs,
-                result_path=result_path,
-                eval_set=eval_set_map[self.version],
-                output_dir=output_dir,
-                verbose=True,
-            )
+            try:
+                nusc_eval = NuScenesEval(
+                    nusc,
+                    config=self.det3d_eval_configs,
+                    result_path=result_path,
+                    eval_set=eval_set_map[self.version],
+                    output_dir=output_dir,
+                    verbose=True,
+                )
+            except AssertionError as exc:
+                if "Samples in split doesn't match samples in predictions." in str(exc):
+                    print_log(
+                        (
+                            "Skip nuScenes detection evaluation because the "
+                            "prediction sample tokens do not match the "
+                            "official raw split. This usually means the "
+                            "preprocessed val infos use a different split "
+                            "definition than the raw nuScenes tables."
+                        ),
+                        logger=logger,
+                    )
+                    return {}
+                raise
             nusc_eval.main(render_curves=False)
 
             # record metrics
@@ -605,15 +628,28 @@ class NuScenes3DDataset(Dataset):
         else:
             from nuscenes.eval.tracking.evaluate import TrackingEval
 
-            nusc_eval = TrackingEval(
-                config=self.track3d_eval_configs,
-                result_path=result_path,
-                eval_set=eval_set_map[self.version],
-                output_dir=output_dir,
-                verbose=True,
-                nusc_version=self.version,
-                nusc_dataroot=self.data_root,
-            )
+            try:
+                nusc_eval = TrackingEval(
+                    config=self.track3d_eval_configs,
+                    result_path=result_path,
+                    eval_set=eval_set_map[self.version],
+                    output_dir=output_dir,
+                    verbose=True,
+                    nusc_version=self.version,
+                    nusc_dataroot=eval_data_root,
+                )
+            except AssertionError as exc:
+                if "Samples in split don't match samples in predicted tracks." in str(exc):
+                    print_log(
+                        (
+                            "Skip nuScenes tracking evaluation because the "
+                            "prediction sample tokens do not match the "
+                            "official raw split."
+                        ),
+                        logger=logger,
+                    )
+                    return {}
+                raise
             metrics = nusc_eval.main()
 
             # record metrics
@@ -644,6 +680,17 @@ class NuScenes3DDataset(Dataset):
                 detail["{}/{}".format(metric_prefix, key)] = metrics[key]
 
         return detail
+
+    def _get_eval_data_root(self):
+        if self.eval_data_root:
+            return self.eval_data_root
+        if self.eval_config is not None and self.eval_config.get("eval_data_root"):
+            return self.eval_config["eval_data_root"]
+        return self.data_root
+
+    def _has_nuscenes_tables(self):
+        table_root = osp.join(self._get_eval_data_root(), self.version)
+        return osp.exists(table_root), table_root
 
     def format_results(self, results, jsonfile_prefix=None, tracking=False):
         assert isinstance(results, list), "results must be a list"
@@ -823,20 +870,34 @@ class NuScenes3DDataset(Dataset):
         from .evaluation_nuscenes.motion.motion_eval_uniad import NuScenesEval as NuScenesEvalMotion
 
         output_dir = result_path
+        eval_data_root = self._get_eval_data_root()
         nusc = NuScenes(
-            version=self.version, dataroot=self.data_root, verbose=False)
+            version=self.version, dataroot=eval_data_root, verbose=False)
         eval_set_map = {
             'v1.0-mini': 'mini_val',
             'v1.0-trainval': 'val',
         }
-        nusc_eval = NuScenesEvalMotion(
-            nusc,
-            config=copy.deepcopy(self.det3d_eval_configs),
-            result_path=results,
-            eval_set=eval_set_map[self.version],
-            output_dir=output_dir,
-            verbose=False,
-            seconds=6)
+        try:
+            nusc_eval = NuScenesEvalMotion(
+                nusc,
+                config=copy.deepcopy(self.det3d_eval_configs),
+                result_path=results,
+                eval_set=eval_set_map[self.version],
+                output_dir=output_dir,
+                verbose=False,
+                seconds=6)
+        except AssertionError as exc:
+            if "Samples in split doesn't match samples in predictions." in str(exc):
+                print_log(
+                    (
+                        "Skip nuScenes motion evaluation because the "
+                        "prediction sample tokens do not match the official "
+                        "raw split."
+                    ),
+                    logger=logger,
+                )
+                return {}
+            raise
         metrics = nusc_eval.main(render_curves=False)
         
         MOTION_METRICS = ['EPA', 'min_ade_err', 'min_fde_err', 'miss_rate_err']
@@ -872,30 +933,42 @@ class NuScenes3DDataset(Dataset):
 
         results_dict = dict()
         if eval_mode['with_det']:
-            self.tracking = eval_mode["with_tracking"]
-            self.tracking_threshold = eval_mode["tracking_threshold"]
-            for metric in ["detection", "tracking"]:
-                tracking = metric == "tracking"
-                if tracking and not self.tracking:
-                    continue
-                result_files, tmp_dir = self.format_results(
-                    results, jsonfile_prefix=work_dir, tracking=tracking
+            has_tables, table_root = self._has_nuscenes_tables()
+            if not has_tables:
+                print_log(
+                    (
+                        "Skip nuScenes detection/tracking evaluation because "
+                        f"the SDK tables are missing: {table_root}. "
+                        "Set data_root to the raw nuScenes dataset root to "
+                        "enable official detection metrics."
+                    ),
+                    logger=logger,
                 )
-
-                if isinstance(result_files, dict):
-                    for name in result_names:
-                        ret_dict = self._evaluate_single(
-                            result_files[name], tracking=tracking
-                        )
-                    results_dict.update(ret_dict)
-                elif isinstance(result_files, str):
-                    ret_dict = self._evaluate_single(
-                        result_files, tracking=tracking
+            else:
+                self.tracking = eval_mode["with_tracking"]
+                self.tracking_threshold = eval_mode["tracking_threshold"]
+                for metric in ["detection", "tracking"]:
+                    tracking = metric == "tracking"
+                    if tracking and not self.tracking:
+                        continue
+                    result_files, tmp_dir = self.format_results(
+                        results, jsonfile_prefix=work_dir, tracking=tracking
                     )
-                    results_dict.update(ret_dict)
 
-                if tmp_dir is not None:
-                    tmp_dir.cleanup()
+                    if isinstance(result_files, dict):
+                        for name in result_names:
+                            ret_dict = self._evaluate_single(
+                                result_files[name], tracking=tracking
+                            )
+                        results_dict.update(ret_dict)
+                    elif isinstance(result_files, str):
+                        ret_dict = self._evaluate_single(
+                            result_files, tracking=tracking
+                        )
+                        results_dict.update(ret_dict)
+
+                    if tmp_dir is not None:
+                        tmp_dir.cleanup()
 
         if eval_mode['with_map']:
             from .evaluation_nuscenes.map.vector_eval import VectorEvaluate

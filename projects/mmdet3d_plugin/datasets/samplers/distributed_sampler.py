@@ -40,6 +40,14 @@ class DistributedSampler(_DistributedSampler):
         timestamps = [
             x["timestamp"] for x in self.dataset.data_infos
         ]
+        # Detect timestamp scale: nuScenes uses microseconds (>1e12),
+        # B2D uses small integers.  Normalise to seconds for the gap check.
+        ts_scale = 1e6 if timestamps and timestamps[0] > 1e12 else 1.0
+        timestamps_sec = [t / ts_scale for t in timestamps]
+
+        scene_tokens = [
+            x.get("scene_token") for x in self.dataset.data_infos
+        ]
         vehicle_idx = [
             x["lidar_path"].split("/")[-1][:4]
             if "lidar_path" in x
@@ -50,8 +58,9 @@ class DistributedSampler(_DistributedSampler):
         sequence_splits = []
         for i in range(len(timestamps)):
             if i == 0 or (
-                abs(timestamps[i] - timestamps[i - 1]) > 4
+                abs(timestamps_sec[i] - timestamps_sec[i - 1]) > 4
                 or vehicle_idx[i] != vehicle_idx[i - 1]
+                or (scene_tokens[i] is not None and scene_tokens[i] != scene_tokens[i - 1])
             ):
                 sequence_splits.append([i])
             else:
@@ -59,11 +68,12 @@ class DistributedSampler(_DistributedSampler):
 
         indices = []
         perfix_sum = 0
-        split_length = len(self.dataset) // self.num_replicas
+        start = math.ceil(len(self.dataset) * self.rank / self.num_replicas)
+        end = math.ceil(len(self.dataset) * (self.rank + 1) / self.num_replicas)
         for i in range(len(sequence_splits)):
-            if perfix_sum >= (self.rank + 1) * split_length:
+            if perfix_sum >= end:
                 break
-            elif perfix_sum >= self.rank * split_length:
+            elif perfix_sum >= start:
                 indices.extend(sequence_splits[i])
             perfix_sum += len(sequence_splits[i])
 

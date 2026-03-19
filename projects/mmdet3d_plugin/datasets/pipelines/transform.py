@@ -105,7 +105,7 @@ class B2DMultiScaleDepthMapGenerator(object):
 
 @PIPELINES.register_module()
 class NuScenesSparse4DAdaptor(object):
-    def __init(self):
+    def __init__(self):
         pass
 
     def __call__(self, input_dict):
