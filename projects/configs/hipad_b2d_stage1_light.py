@@ -42,9 +42,9 @@ ego_fut_cmd = 1
 ego_fut_mode = 48
 
 # model
-embed_dims = 256
+embed_dims = 128
 num_groups = 8
-num_decoder = 6
+num_decoder = 3
 num_single_frame_decoder = 1
 use_deformable_func = True
 strides = [4, 8, 16, 32]
@@ -126,6 +126,7 @@ model = dict(
         evaluate_bench2dive=True,
         onedecoder_head=dict(
             type="SparseOneDecoder",
+            embed_dims=embed_dims,
             task_select=task_select,
             query_select=query_select,
             operation_order=operation_order,
@@ -183,7 +184,7 @@ model = dict(
             det_anchor_encoder=dict(
                 type="SparseBox3DEncoder",
                 vel_dims=3,
-                embed_dims=[128, 32, 32, 64] if decouple_attn else 256,
+                embed_dims=[64, 16, 16, 32] if decouple_attn else 128,
                 mode="cat" if decouple_attn else "add",
                 output_fc=not decouple_attn,
                 in_loops=1,
@@ -642,7 +643,7 @@ eval_mode = dict(
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch*checkpoint_epoch_interval,
+    interval=num_iters_per_epoch * checkpoint_epoch_interval,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
 )

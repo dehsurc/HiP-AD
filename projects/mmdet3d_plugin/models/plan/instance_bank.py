@@ -130,7 +130,7 @@ class PlanningInstanceBank(nn.Module):
     def get(self, batch_size, metas, feature_maps, dn_metas=None):
         instance_feature, anchor = self.prepare_planning(batch_size, feature_maps, metas)
 
-        if self.cached_anchor is not None:
+        if self.cached_anchor is not None and self.cached_anchor.shape[0] == batch_size:
             history_time = self.metas["timestamp"]
             time_interval = metas["timestamp"] - history_time
             time_interval = time_interval.to(dtype=instance_feature.dtype)
@@ -249,7 +249,7 @@ class PlanningInstanceBank(nn.Module):
 
         self.metas = metas
         _confidence = _confidence.squeeze(-1).sigmoid()
-        if self.confidence is not None:
+        if self.confidence is not None and self.confidence.shape[0] == bs:
             _confidence[:, : num_temp_mode] = torch.maximum(
                 self.confidence.reshape(bs * num_cmd, -1) * self.confidence_decay, _confidence[:, : num_temp_mode])
 

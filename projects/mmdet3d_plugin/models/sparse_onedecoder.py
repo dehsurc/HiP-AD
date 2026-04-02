@@ -359,10 +359,10 @@ class SparseOneDecoder(BaseModule):
             self.fc_after = nn.Linear(self.embed_dims * 2, self.embed_dims, bias=False)
 
         if self.with_distance_attn_mask:
-            self.distance_tau = nn.Linear(256, 8)
+            self.distance_tau = nn.Linear(self.embed_dims, 8)
 
         if self.with_velocity_attn_mask:
-            self.velocity_tau = nn.Linear(256, 8)
+            self.velocity_tau = nn.Linear(self.embed_dims, 8)
 
         self.run_step = 0
         self.attn_mask = None
@@ -925,7 +925,7 @@ class SparseOneDecoder(BaseModule):
 
                 if "motion" in self.task_select:
                     motion_anchor = self.get_motion_anchor(det_cls, det_anchor)
-                    motion_mode_query = self.motion_anchor_encoder(gen_sineembed_for_position(motion_anchor[..., -1, :]))
+                    motion_mode_query = self.motion_anchor_encoder(gen_sineembed_for_position(motion_anchor[..., -1, :], hidden_dim=self.embed_dims))
                     motion_query = motion_mode_query + (det_instance_feature + det_anchor_embed).unsqueeze(2)
                     motion_cls, motion_reg = self.motion_refine[refine_i](motion_query)
 
@@ -940,7 +940,7 @@ class SparseOneDecoder(BaseModule):
                     else:
                         plan_anchor = torch.tile(self.ego_instance_bank_list[bank_idx].plan_anchor[None],
                                                  (batch_size, 1, 1, 1, 1))
-                        plan_pos = gen_sineembed_for_position(plan_anchor[..., -1, :])
+                        plan_pos = gen_sineembed_for_position(plan_anchor[..., -1, :], hidden_dim=self.embed_dims)
                         plan_mode_query = self.ego_instance_bank_list[bank_idx].plan_anchor_encoder(plan_pos).flatten(1, 2).unsqueeze(1)
                         plan_query = plan_mode_query + (ego_instance_feature + ego_anchor_embed).unsqueeze(2)
 
@@ -954,12 +954,12 @@ class SparseOneDecoder(BaseModule):
                     use_plan_anchor_embed = True
                     if self.with_target_point_embed:
                         target_point = metas['target_point'].unsqueeze(1).unsqueeze(1)
-                        target_point_embed = self.target_point_encoder(gen_sineembed_for_position(target_point))
+                        target_point_embed = self.target_point_encoder(gen_sineembed_for_position(target_point, hidden_dim=self.embed_dims))
                         plan_anchor_embed += target_point_embed.squeeze(1)
 
                     if self.with_target_point_next_embed:
                         target_point_next = metas['target_point_next'].unsqueeze(1).unsqueeze(1)
-                        target_point_next_embed = self.target_point_encoder(gen_sineembed_for_position(target_point_next))
+                        target_point_next_embed = self.target_point_encoder(gen_sineembed_for_position(target_point_next, hidden_dim=self.embed_dims))
                         plan_anchor_embed += target_point_next_embed.squeeze(1)
 
                     if self.with_command_embed:

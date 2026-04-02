@@ -8,9 +8,9 @@ num_gpus = 8
 batch_size = 6
 num_iters_per_epoch = int(234769 // (num_gpus * batch_size))
 num_epochs = 18
-checkpoint_epoch_interval = 20
+checkpoint_epoch_interval = 1
 
-checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=1)
+checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
 log_config = dict(
     interval=50,
     hooks=[
@@ -42,9 +42,9 @@ ego_fut_cmd = 1
 ego_fut_mode = 48
 
 # model
-embed_dims = 256
+embed_dims = 128
 num_groups = 8
-num_decoder = 6
+num_decoder = 3
 num_single_frame_decoder = 1
 use_deformable_func = True
 strides = [4, 8, 16, 32]
@@ -74,7 +74,7 @@ operation_order = single_frame_layer * num_single_frame_decoder + \
                   temporal_frame_layer * (num_decoder - num_single_frame_decoder)
 
 # anchors
-project_dir = "/opt/data/private/project/HiP-AD"
+project_dir = "/workspace/HiP-AD"
 
 anchor_paths = {
     "det" : f"{project_dir}/data/kmeans/b2d_det_900.npy",
@@ -144,6 +144,7 @@ model = dict(
         evaluate_bench2dive=True,
         onedecoder_head=dict(
             type="SparseOneDecoder",
+            embed_dims=embed_dims,
             task_select=task_select,
             query_select=query_select,
             operation_order=operation_order,
@@ -202,7 +203,7 @@ model = dict(
             det_anchor_encoder=dict(
                 type="SparseBox3DEncoder",
                 vel_dims=3,
-                embed_dims=[128, 32, 32, 64] if decouple_attn else 256,
+                embed_dims=[64, 16, 16, 32] if decouple_attn else 128,
                 mode="cat" if decouple_attn else "add",
                 output_fc=not decouple_attn,
                 in_loops=1,
@@ -655,10 +656,10 @@ runner = dict(
 
 # ================== eval ========================
 eval_mode = dict(
-    with_det=False,
-    with_tracking=False,
-    with_map=False,
-    with_motion=False,
+    with_det=True,
+    with_tracking=True,
+    with_map=True,
+    with_motion=True,
     with_planning=True,
     tracking_threshold=0.2,
     motion_threshhold=0.2,
@@ -669,4 +670,4 @@ evaluation = dict(
     eval_mode=eval_mode,
 )
 
-load_from = "./work_dirs/hipad_b2d_stage1/latest.pth"
+load_from = "/workspace/HiP-AD/work_dirs/hipad_b2d_stage1/latest.pth"

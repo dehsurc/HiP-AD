@@ -5,9 +5,9 @@ plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 
 num_gpus = 8
-batch_size = 8
+batch_size = 6
 num_iters_per_epoch = int(234769 // (num_gpus * batch_size))
-num_epochs = 12
+num_epochs = 18
 checkpoint_epoch_interval = 1
 
 checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
@@ -42,9 +42,9 @@ ego_fut_cmd = 1
 ego_fut_mode = 48
 
 # model
-embed_dims = 256
+embed_dims = 128
 num_groups = 8
-num_decoder = 6
+num_decoder = 3
 num_single_frame_decoder = 1
 use_deformable_func = True
 strides = [4, 8, 16, 32]
@@ -64,7 +64,7 @@ temporal_plan = True
 # tasks
 task_config = dict(with_onedecoder=True)
 
-task_select = ["det", "map", "plan", "ego"]
+task_select = ["det", "map", "plan", "ego", "motion"]
 query_select = ["det", "map", "plan", "ego"]  # with query initial order
 
 single_frame_layer = ["concat", "gnn", "inter_gnn", "norm", "split", "deformable", "concat", "ffn", "norm", "split", "refine"]
@@ -82,9 +82,27 @@ anchor_paths = {
     "motion": f"{project_dir}/data/kmeans/b2d_motion_{fut_mode}.npy",
 }
 
-plan_anchor_paths = f"{project_dir}/data/kmeans/b2d_plan_spat_6x8_5m.npy"
-plan_anchor_refer = ("temp", "2hz")
-plan_anchor_types = [("temp", "2hz")]
+spat_path_6x8_2m = f"{project_dir}/data/kmeans/b2d_plan_spat_6x8_2m.npy"
+spat_path_6x8_5m = f"{project_dir}/data/kmeans/b2d_plan_spat_6x8_5m.npy"
+
+plan_anchor_paths = {
+    ("temp", "5hz"): spat_path_6x8_2m,
+    ("spat", "2m") : spat_path_6x8_2m,
+    ("temp", "2hz"): spat_path_6x8_5m,
+    ("spat", "5m") : spat_path_6x8_5m,
+    ("speed", "5hz", (0, 0.4)) : spat_path_6x8_2m,
+    ("speed", "5hz", (0.4, 3)) : spat_path_6x8_2m,
+    ("speed", "5hz", (3, 999)) : spat_path_6x8_2m,
+    ("speed", "2hz", (0, 0.4)) : spat_path_6x8_5m,
+    ("speed", "2hz", (0.4, 3)) : spat_path_6x8_5m,
+    ("speed", "2hz", (3, 999)) : spat_path_6x8_5m,
+}
+
+plan_speed_refer = ("temp", "5hz")
+plan_anchor_refer = ("spat", "2m")
+plan_anchor_types = [("temp", "5hz"), ("spat", "2m"), ("temp", "2hz"), ("spat", "5m"),
+                     ("speed", "5hz", (0, 0.4)), ("speed", "5hz", (0.4, 3)), ("speed", "5hz", (3, 999)),
+                     ("speed", "2hz", (0, 0.4)), ("speed", "2hz", (0.4, 3)), ("speed", "2hz", (3, 999))]
 
 
 model = dict(
@@ -130,6 +148,7 @@ model = dict(
             query_select=query_select,
             operation_order=operation_order,
             num_single_frame_decoder=num_single_frame_decoder,
+            plan_speed_refer=plan_speed_refer,
             plan_anchor_refer=plan_anchor_refer,
             with_command_embed=True,
             with_target_point_embed=True,
@@ -450,9 +469,9 @@ model = dict(
                               loss_line=dict(type="LinesL1Loss", loss_weight=10.0, beta=0.01),
                               num_sample=map_num_pts,
                               roi_size=map_roi_size),
-            loss_ego_status=dict(type="L1Loss", loss_weight=0.0),
-            loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.0),
-            loss_plan_reg=dict(type="L1Loss", loss_weight=0.0),
+            loss_ego_status=dict(type="L1Loss", loss_weight=1.0),
+            loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.5),
+            loss_plan_reg=dict(type="L1Loss", loss_weight=1.0),
             loss_motion_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.2),
             loss_motion_reg=dict(type="L1Loss", loss_weight=0.2),
             # weights
@@ -463,7 +482,7 @@ model = dict(
             map_decoder=dict(type="SparsePoint3DDecoder"),
             plan_decoder=dict(type="SparsePlanDecoder", ego_fut_ts=ego_fut_ts, ego_fut_cmd=ego_fut_cmd,
                               ego_fut_mode=ego_fut_mode, ego_vehicle="b2d", anchor_types=plan_anchor_types,
-                              anchor_refer=plan_anchor_refer, with_rescore=True),
+                              anchor_refer=plan_anchor_refer, speed_refer=plan_speed_refer, with_rescore=True),
             motion_decoder=dict(type="SparseMotionDecoder"),
         ),
     ),
@@ -497,9 +516,11 @@ train_pipeline = [
     dict(type="NuScenesSparse4DAdaptor"),
     dict(type="Collect",
          keys=["img", "timestamp", "projection_mat", "image_wh", "gt_depth", "focal",
-               "gt_ego_fut_cmd", "target_point", "ego_status", "ego_status_mask",
+               "gt_ego_fut_cmd", "target_point",  "ego_status", "ego_status_mask",
                "gt_bboxes_3d", "gt_labels_3d", "gt_map_labels", "gt_map_pts",
-               "gt_agent_fut_trajs", "gt_agent_fut_masks", "gt_ego_fut_trajs_2hz", "gt_ego_fut_masks_2hz"
+               "gt_agent_fut_trajs", "gt_agent_fut_masks",
+               "gt_ego_spat_trajs_2m", "gt_ego_spat_masks_2m", "gt_ego_spat_trajs_5m", "gt_ego_spat_masks_5m",
+               "gt_ego_fut_trajs_2hz", "gt_ego_fut_masks_2hz", "gt_ego_fut_trajs_5hz", "gt_ego_fut_masks_5hz",
                ],
          meta_keys=["T_global", "T_global_inv", "timestamp", "instance_id", "scene_token"],
     ),
@@ -559,8 +580,8 @@ data_basic_config = dict(
     data_root=data_root,
     det_classes=det_class_names,
     map_classes=map_class_names,
-    plan_anchor_types=plan_anchor_types,
     modality=input_modality,
+    plan_anchor_types=plan_anchor_types,
 )
 
 
@@ -574,6 +595,7 @@ data_aug_conf = {
     "rand_flip": True,
     "rot3d_range": [0, 0],
 }
+
 
 data = dict(
     samples_per_gpu=batch_size,
@@ -646,3 +668,5 @@ evaluation = dict(
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
 )
+
+load_from = "/workspace/HiP-AD/work_dirs/hipad_b2d_stage1/latest.pth"
