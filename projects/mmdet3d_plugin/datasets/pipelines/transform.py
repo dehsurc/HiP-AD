@@ -159,7 +159,12 @@ class NuScenesSparse4DAdaptor(object):
             if key not in input_dict:
                 continue
             input_dict[key] = DC(to_tensor(input_dict[key]), stack=True, cpu_only=False, pad_dims=None)
-        
+
+        # Teacher distillation data (optional)
+        for key in ['teacher_logits', 'teacher_boxes', 'teacher_scores']:
+            if key in input_dict:
+                input_dict[key] = DC(to_tensor(input_dict[key]), stack=True, cpu_only=False, pad_dims=None)
+
         return input_dict
 
     def limit_period(

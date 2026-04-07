@@ -4,6 +4,7 @@ import warnings
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.cnn import Linear
 from mmcv.cnn.bricks.registry import (
     ATTENTION,
@@ -151,6 +152,15 @@ class SparseOneDecoder(BaseModule):
             topk_mode_list=None,
             keep_topk_relative_pos=False,
 
+            # distillation
+            distill_alpha_cls=0.0,
+            distill_alpha_reg=0.0,
+            distill_temperature=4.0,
+            distill_score_thr=0.1,
+            distill_last_layer_only=True,
+            distill_mode="teacher_tp",  # "teacher_tp" or "pseudo_gt"
+            det_gt_loss_weight=1.0,     # weight for GT detection losses (0.0 = distill-only)
+
             **kwargs,
     ):
         super(SparseOneDecoder, self).__init__(init_cfg)
@@ -180,6 +190,16 @@ class SparseOneDecoder(BaseModule):
         self.decouple_attn = decouple_attn
         self.operation_order = operation_order
         self.cls_threshold_to_reg = cls_threshold_to_reg
+
+        # Distillation config
+        self.distill_alpha_cls = distill_alpha_cls
+        self.distill_alpha_reg = distill_alpha_reg
+        self.distill_temperature = distill_temperature
+        self.distill_score_thr = distill_score_thr
+        self.distill_last_layer_only = distill_last_layer_only
+        self.use_distill = (distill_alpha_cls > 0 or distill_alpha_reg > 0)
+        self.distill_mode = distill_mode
+        self.det_gt_loss_weight = det_gt_loss_weight
 
         self.independent_gnn = independent_gnn
         self.independent_temp_gnn = independent_temp_gnn
@@ -363,10 +383,10 @@ class SparseOneDecoder(BaseModule):
             self.fc_after = nn.Linear(self.embed_dims * 2, self.embed_dims, bias=False)
 
         if self.with_distance_attn_mask:
-            self.distance_tau = nn.Linear(256, 8)
+            self.distance_tau = nn.Linear(self.embed_dims, 8)
 
         if self.with_velocity_attn_mask:
-            self.velocity_tau = nn.Linear(256, 8)
+            self.velocity_tau = nn.Linear(self.embed_dims, 8)
 
         self.run_step = 0
         self.attn_mask = None
@@ -929,7 +949,7 @@ class SparseOneDecoder(BaseModule):
 
                 if "motion" in self.task_select:
                     motion_anchor = self.get_motion_anchor(det_cls, det_anchor)
-                    motion_mode_query = self.motion_anchor_encoder(gen_sineembed_for_position(motion_anchor[..., -1, :]))
+                    motion_mode_query = self.motion_anchor_encoder(gen_sineembed_for_position(motion_anchor[..., -1, :], hidden_dim=self.embed_dims))
                     motion_query = motion_mode_query + (det_instance_feature + det_anchor_embed).unsqueeze(2)
                     motion_cls, motion_reg = self.motion_refine[refine_i](motion_query)
 
@@ -944,7 +964,7 @@ class SparseOneDecoder(BaseModule):
                     else:
                         ego_plan_anchor = torch.tile(self.ego_instance_bank_list[bank_idx].plan_anchor[None],
                                                      (batch_size, 1, 1, 1, 1))
-                        ego_plan_pos = gen_sineembed_for_position(ego_plan_anchor[..., -1, :])
+                        ego_plan_pos = gen_sineembed_for_position(ego_plan_anchor[..., -1, :], hidden_dim=self.embed_dims)
                         ego_plan_mode_query = self.ego_instance_bank_list[bank_idx].plan_anchor_encoder(ego_plan_pos).flatten(1, 2).unsqueeze(1)
                         plan_query = ego_plan_mode_query + (ego_instance_feature + ego_anchor_embed).unsqueeze(2)
 
@@ -960,12 +980,12 @@ class SparseOneDecoder(BaseModule):
                     use_plan_anchor_embed = True
                     if self.with_target_point_embed:
                         target_point = metas['target_point'].unsqueeze(1).unsqueeze(1)
-                        target_point_embed = self.target_point_encoder(gen_sineembed_for_position(target_point))
+                        target_point_embed = self.target_point_encoder(gen_sineembed_for_position(target_point, hidden_dim=self.embed_dims))
                         plan_anchor_embed += target_point_embed.squeeze(1)
 
                     if self.with_target_point_next_embed:
                         target_point_next = metas['target_point_next'].unsqueeze(1).unsqueeze(1)
-                        target_point_next_embed = self.target_point_encoder(gen_sineembed_for_position(target_point_next))
+                        target_point_next_embed = self.target_point_encoder(gen_sineembed_for_position(target_point_next, hidden_dim=self.embed_dims))
                         plan_anchor_embed += target_point_next_embed.squeeze(1)
 
                     if self.with_command_embed:
@@ -1128,11 +1148,24 @@ class SparseOneDecoder(BaseModule):
         reg_preds = model_outs["prediction"]
         cls_scores = model_outs["classification"]
 
+        # Determine GT source based on distill mode
+        use_pseudo_gt = (self.distill_mode == "pseudo_gt"
+                         and self.use_distill
+                         and "teacher_logits" in data)
+        if use_pseudo_gt:
+            gt_labels, gt_bboxes = self._build_pseudo_gt(data)
+        else:
+            gt_labels = data["gt_labels_3d"]
+            gt_bboxes = data["gt_bboxes_3d"]
+
+        # GT loss weight: applies only in teacher_tp mode (pseudo_gt uses teacher AS gt)
+        gt_w = self.det_gt_loss_weight if not use_pseudo_gt else 1.0
+
         output = {}
         for decoder_idx, (cls, reg, qt) in enumerate(zip(cls_scores, reg_preds, quality)):
             reg = reg[..., : len(self.det_reg_weights)]
             cls_target, reg_target, reg_weights = self.det_sampler.sample(
-                cls, reg, data["gt_labels_3d"], data["gt_bboxes_3d"])
+                cls, reg, gt_labels, gt_bboxes)
             reg_target = reg_target[..., : len(self.det_reg_weights)]
             mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))
             mask_valid = mask.clone()
@@ -1145,7 +1178,7 @@ class SparseOneDecoder(BaseModule):
 
             cls = cls.flatten(end_dim=1)
             cls_target = cls_target.flatten(end_dim=1)
-            cls_loss = self.loss_det_cls(cls, cls_target, avg_factor=num_pos)
+            cls_loss = self.loss_det_cls(cls, cls_target, avg_factor=num_pos) * gt_w
 
             mask = mask.reshape(-1)
             reg_weights = reg_weights * reg.new_tensor(self.det_reg_weights)
@@ -1168,14 +1201,200 @@ class SparseOneDecoder(BaseModule):
                     output["det_loss_cns"] = 0.0
                     output["det_loss_yns"] = 0.0
                 output["det_loss_cls"] += cls_loss
-                output["det_loss_box"] += reg_loss[f"det_loss_box_{decoder_idx}"]
-                output["det_loss_cns"] += reg_loss[f"det_loss_cns_{decoder_idx}"]
-                output["det_loss_yns"] += reg_loss[f"det_loss_yns_{decoder_idx}"]
+                output["det_loss_box"] += reg_loss[f"det_loss_box_{decoder_idx}"] * gt_w
+                output["det_loss_cns"] += reg_loss[f"det_loss_cns_{decoder_idx}"] * gt_w
+                output["det_loss_yns"] += reg_loss[f"det_loss_yns_{decoder_idx}"] * gt_w
             else:
                 output[f"det_loss_cls_{decoder_idx}"] = cls_loss
-                output.update(reg_loss)
+                for k, v in reg_loss.items():
+                    output[k] = v * gt_w
+
+            # Distillation loss (teacher_tp mode only — pseudo_gt uses standard loss pipeline)
+            if self.distill_mode == "teacher_tp" and self.use_distill and "teacher_logits" in data:
+                apply_kd = (not self.distill_last_layer_only) or (decoder_idx == len(cls_scores) - 1)
+                if apply_kd:
+                    kd_cls_loss, kd_reg_loss = self._compute_distill_loss(
+                        cls_scores[decoder_idx], reg_preds[decoder_idx], data)
+                    if self.combine_layer_loss:
+                        if "det_loss_kd_cls" not in output:
+                            output["det_loss_kd_cls"] = 0.0
+                            output["det_loss_kd_reg"] = 0.0
+                        output["det_loss_kd_cls"] += kd_cls_loss
+                        output["det_loss_kd_reg"] += kd_reg_loss
+                    else:
+                        output[f"det_loss_kd_cls_{decoder_idx}"] = kd_cls_loss
+                        output[f"det_loss_kd_reg_{decoder_idx}"] = kd_reg_loss
+
+        # Restore real GT indices for downstream tasks (motion, plan)
+        # pseudo_gt matching produces indices relative to pseudo GT objects,
+        # but motion/plan losses need indices relative to real GT objects.
+        if use_pseudo_gt:
+            last_cls = cls_scores[-1]
+            last_reg = reg_preds[-1][..., : len(self.det_reg_weights)]
+            self.det_sampler.sample(
+                last_cls, last_reg, data["gt_labels_3d"], data["gt_bboxes_3d"])
 
         return output
+
+    def _build_pseudo_gt(self, data):
+        """Build pseudo GT from teacher predictions for pseudo_gt distill mode.
+
+        Filters teacher proposals by score threshold and converts them to
+        the same format as gt_labels_3d / gt_bboxes_3d.
+
+        Returns:
+            pseudo_gt_labels: list of [N_valid] int64 tensors (class indices)
+            pseudo_gt_bboxes: list of [N_valid, 9] float tensors
+                              (x, y, z, w, l, h, yaw, vx, vy)
+        """
+        teacher_logits = data["teacher_logits"]   # [B, 200, 10]
+        teacher_boxes = data["teacher_boxes"]     # [B, 200, 9]
+        teacher_scores = data["teacher_scores"]   # [B, 200]
+        bs = teacher_scores.shape[0]
+
+        pseudo_gt_labels = []
+        pseudo_gt_bboxes = []
+        for b in range(bs):
+            mask = teacher_scores[b] > self.distill_score_thr
+            if mask.any():
+                boxes = teacher_boxes[b][mask]                          # [N_valid, 9]
+                labels = teacher_logits[b][mask].sigmoid().argmax(dim=-1)  # [N_valid]
+                pseudo_gt_labels.append(labels.long())
+                pseudo_gt_bboxes.append(boxes)
+            else:
+                pseudo_gt_labels.append(teacher_scores.new_zeros(0, dtype=torch.long))
+                pseudo_gt_bboxes.append(teacher_boxes.new_zeros(0, 9))
+        return pseudo_gt_labels, pseudo_gt_bboxes
+
+    def _compute_distill_loss(self, student_cls, student_reg, data):
+        """Compute distillation loss between student and teacher predictions.
+
+        Args:
+            student_cls: [B, N_query, 10] classification logits (last decoder layer)
+            student_reg: [B, N_query, D] regression predictions (last decoder layer)
+            data: dict containing teacher_logits, teacher_boxes, teacher_scores,
+                  gt_bboxes_3d, gt_labels_3d
+
+        Returns:
+            kd_cls_loss, kd_reg_loss
+        """
+        T = self.distill_temperature
+        teacher_logits = data["teacher_logits"]   # [B, 200, 10]
+        teacher_boxes = data["teacher_boxes"]     # [B, 200, 9]
+        teacher_scores = data["teacher_scores"]   # [B, 200]
+
+        bs = student_cls.shape[0]
+        device = student_cls.device
+
+        total_kd_cls = student_cls.new_tensor(0.0)
+        total_kd_reg = student_cls.new_tensor(0.0)
+        num_matched = 0
+
+        # Use Hungarian matching results from the last decoder layer
+        indices = self.det_sampler.indices  # list of (pred_idx, gt_idx) per batch
+
+        for b in range(bs):
+            pred_idx, gt_idx = indices[b]
+            if pred_idx is None or len(pred_idx) == 0:
+                continue
+
+            gt_boxes = data["gt_bboxes_3d"][b]  # [N_gt, D]
+            gt_centers = gt_boxes[:, :3]         # [N_gt, 3]
+
+            t_boxes = teacher_boxes[b]           # [200, 9]
+            t_scores = teacher_scores[b]         # [200]
+            t_logits = teacher_logits[b]         # [200, 10]
+
+            # Score filter for teacher proposals
+            score_mask = t_scores > self.distill_score_thr
+            if not score_mask.any():
+                continue
+
+            # For each matched GT, find closest teacher proposal
+            for i in range(len(gt_idx)):
+                gt_i = gt_idx[i]
+                student_q = pred_idx[i]
+                gt_center = gt_centers[gt_i, :3]  # [3]
+
+                # Distance from this GT to all valid teacher proposals
+                t_centers = t_boxes[:, :3]         # [200, 3]
+                dists = torch.norm(t_centers - gt_center.unsqueeze(0), dim=-1)  # [200]
+                dists = torch.where(score_mask, dists, torch.full_like(dists, 1e8))
+                teacher_idx = dists.argmin()
+
+                if dists[teacher_idx] > 2.0:  # skip if no close teacher proposal
+                    continue
+
+                # Classification KD loss (KL divergence)
+                if self.distill_alpha_cls > 0:
+                    s_logit = student_cls[b, student_q]   # [10]
+                    t_logit = t_logits[teacher_idx]        # [10]
+                    t_prob = torch.sigmoid(t_logit / T)
+                    s_prob = torch.sigmoid(s_logit / T)
+                    kd_cls = F.binary_cross_entropy(s_prob, t_prob, reduction='sum') * (T ** 2)
+                    total_kd_cls = total_kd_cls + kd_cls
+
+                # Regression KD loss (L1 on converted box)
+                if self.distill_alpha_reg > 0:
+                    s_reg = student_reg[b, student_q]  # [D]
+                    t_box = t_boxes[teacher_idx]        # [9]: x,y,z,x_size,y_size,z_size,yaw,vx,vy
+
+                    # Convert teacher box to student format
+                    # Teacher (LiDAR): [x, y, z, x_size(w), y_size(l), z_size(h), yaw, vx, vy]
+                    # Student (encoded): [x, y, z, log(w), log(l), log(h), sin(yaw), cos(yaw), vx, vy, vz]
+                    t_converted = torch.stack([
+                        t_box[0], t_box[1], t_box[2],           # x, y, z
+                        torch.log(t_box[3].clamp(min=1e-5)),    # log(w) = log(x_size)
+                        torch.log(t_box[4].clamp(min=1e-5)),    # log(l) = log(y_size)
+                        torch.log(t_box[5].clamp(min=1e-5)),    # log(h) = log(z_size)
+                        torch.sin(t_box[6]),                     # sin(yaw)
+                        torch.cos(t_box[6]),                     # cos(yaw)
+                        t_box[7], t_box[8],                      # vx, vy
+                    ])
+                    # Match dims: only use shared dims
+                    s_reg_matched = s_reg[:len(t_converted)]
+                    kd_reg = F.l1_loss(s_reg_matched, t_converted, reduction='sum')
+                    total_kd_reg = total_kd_reg + kd_reg
+
+                num_matched += 1
+
+        # Debug: print matching stats
+        if not hasattr(self, '_kd_debug_count'):
+            self._kd_debug_count = 0
+        if self._kd_debug_count < 3:
+            # Gather min distances for debugging
+            _all_min_dists = []
+            for b in range(bs):
+                pred_idx, gt_idx = indices[b]
+                if pred_idx is None or len(pred_idx) == 0:
+                    continue
+                gt_boxes = data["gt_bboxes_3d"][b]
+                gt_centers = gt_boxes[:, :3]
+                t_boxes_b = teacher_boxes[b]
+                t_scores_b = teacher_scores[b]
+                score_mask = t_scores_b > self.distill_score_thr
+                if not score_mask.any():
+                    continue
+                for i in range(min(3, len(gt_idx))):
+                    gt_center = gt_centers[gt_idx[i], :3]
+                    t_centers = t_boxes_b[:, :3]
+                    dists = torch.norm(t_centers - gt_center.unsqueeze(0), dim=-1)
+                    dists = torch.where(score_mask, dists, torch.full_like(dists, 1e8))
+                    _all_min_dists.append(dists.min().item())
+            print(f"  [KD_DEBUG] bs={bs}, num_matched={num_matched}, "
+                  f"score_thr={self.distill_score_thr}, "
+                  f"indices_lens={[len(indices[b][0]) if indices[b][0] is not None else 0 for b in range(bs)]}, "
+                  f"teacher_scores_range=({teacher_scores.min().item():.3f}, {teacher_scores.max().item():.3f}), "
+                  f"min_dists_sample={[f'{d:.1f}' for d in _all_min_dists[:10]]}, "
+                  f"gt_center_sample={data['gt_bboxes_3d'][0][:2, :3].tolist() if len(data['gt_bboxes_3d'][0]) > 0 else 'empty'}, "
+                  f"teacher_center_sample={teacher_boxes[0, :3, :3].tolist()}")
+            self._kd_debug_count += 1
+
+        # Average over matched pairs
+        num_matched = max(num_matched, 1)
+        kd_cls_loss = self.distill_alpha_cls * total_kd_cls / num_matched
+        kd_reg_loss = self.distill_alpha_reg * total_kd_reg / num_matched
+        return kd_cls_loss, kd_reg_loss
 
     @force_fp32(apply_to=("model_outs"))
     def loss_map(self, model_outs, data):
@@ -1308,7 +1527,7 @@ class SparseOneDecoder(BaseModule):
             reg_weight = reg_weight.unsqueeze(-1)
             reg_pred = reg_pred.cumsum(dim=-2)
             reg_target = reg_target.cumsum(dim=-2)
-            reg_loss = self.loss_motion_reg(reg_pred, reg_target, weight=reg_weight, avg_factor=num_pos)
+            reg_loss = self.loss_motion_reg(reg_pred, reg_target, weight=reg_weight, avg_factor=num_pos * self.fut_ts)
 
             if self.combine_layer_loss:
                 if "motion_loss_cls" not in output:

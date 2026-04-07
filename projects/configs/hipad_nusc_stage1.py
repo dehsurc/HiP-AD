@@ -3,22 +3,29 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = None
+work_dir = "work_dirs/hipad_nusc_stage1"
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
 
-num_gpus = 8
-batch_size = 6
+num_gpus = 2
+batch_size = 8
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 12
-checkpoint_epoch_interval = 20
+num_epochs = 24
+checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=1)
+wandb_project = "hipad"
+wandb_name = "hipad_nusc_stage1_24ep"
 log_config = dict(
     interval=50,
     hooks=[
         dict(type="TextLoggerHook", by_epoch=False),
+        dict(
+            type="WandbLoggerHook",
+            init_kwargs=dict(entity="e2ekd", project=wandb_project, name=wandb_name),
+            by_epoch=False,
+        ),
     ],
 )
 load_from = None
@@ -476,8 +483,8 @@ model = dict(
                               num_sample=map_num_pts,
                               roi_size=map_roi_size),
             loss_ego_status=dict(type="L1Loss", loss_weight=0.0),
-            loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.5),
-            loss_plan_reg=dict(type="L1Loss", loss_weight=1.0),
+            loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.0),
+            loss_plan_reg=dict(type="L1Loss", loss_weight=0.0),
             loss_motion_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.2),
             loss_motion_reg=dict(type="L1Loss", loss_weight=0.2),
             # weights
@@ -497,6 +504,7 @@ model = dict(
 # ================== data ========================
 dataset_type = "NuScenes3DDataset"
 data_root = "data/nuscenes/"
+eval_data_root = "data/infos/nuscenes/"
 anno_root = "data/infos/" if version == 'trainval' else "data/infos/mini/"
 file_client_args = dict(backend="disk")
 
@@ -621,6 +629,7 @@ data_basic_config = dict(
 
 eval_config = dict(
     **data_basic_config,
+    eval_data_root=eval_data_root,
     ann_file=anno_root + "nuscenes_infos_val.pkl",
     pipeline=eval_pipeline,
     test_mode=True,
@@ -671,7 +680,7 @@ data = dict(
 # ================== training ========================
 optimizer = dict(
     type="AdamW",
-    lr=2e-4,
+    lr=1e-4,
     weight_decay=0.001,
     paramwise_cfg=dict(
         custom_keys={
@@ -695,7 +704,7 @@ runner = dict(
 # ================== eval ========================
 eval_mode = dict(
     with_det=True,
-    with_tracking=True,
+    with_tracking=False,
     with_map=True,
     with_motion=False,
     with_planning=True,

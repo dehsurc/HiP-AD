@@ -14,7 +14,7 @@ from pyquaternion import Quaternion
 # camera coordinate system, and lidar coordinate system) to the right-handed coordinate system
 # consistent with the nuscenes dataset.
 
-DATAROOT = './data/bench2drive'
+DATAROOT = '/data4/kyungmin/Bench2Drive'
 MAP_ROOT = './data/bench2drive/maps'
 OUT_DIR = './data/infos'
 

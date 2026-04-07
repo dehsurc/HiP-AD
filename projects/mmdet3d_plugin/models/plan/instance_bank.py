@@ -127,7 +127,24 @@ class PlanningInstanceBank(nn.Module):
         self.metas = None
         self.mask = None
 
+    def _is_cache_compatible(self, batch_size):
+        cached_tensors = [self.cached_feature, self.cached_anchor, self.confidence]
+        cached_tensors = [tensor for tensor in cached_tensors if tensor is not None]
+        if len(cached_tensors) == 0:
+            return True
+
+        if any(tensor.shape[0] != batch_size for tensor in cached_tensors):
+            return False
+
+        if self.confidence is not None and self.confidence.shape[-1] != self.num_temp_mode:
+            return False
+
+        return True
+
     def get(self, batch_size, metas, feature_maps, dn_metas=None):
+        if not self._is_cache_compatible(batch_size):
+            self.reset()
+
         instance_feature, anchor = self.prepare_planning(batch_size, feature_maps, metas)
 
         if self.cached_anchor is not None:
@@ -175,6 +192,9 @@ class PlanningInstanceBank(nn.Module):
         return instance_feature, anchor
 
     def update(self, instance_feature, anchor, confidence):
+        if not self._is_cache_compatible(instance_feature.shape[0]):
+            self.reset()
+
         if self.cached_feature is None:
             return instance_feature, anchor
 
@@ -238,6 +258,9 @@ class PlanningInstanceBank(nn.Module):
             return
 
         bs, nj, _ = anchor.shape
+        if not self._is_cache_compatible(bs):
+            self.reset()
+
         num_cmd = self.ego_fut_cmd * self.anchor_group
         num_mode = self.ego_fut_mode
         num_temp_mode = self.num_temp_mode
@@ -249,7 +272,7 @@ class PlanningInstanceBank(nn.Module):
 
         self.metas = metas
         _confidence = _confidence.squeeze(-1).sigmoid()
-        if self.confidence is not None:
+        if self.confidence is not None and self.confidence.shape[0] == bs:
             _confidence[:, : num_temp_mode] = torch.maximum(
                 self.confidence.reshape(bs * num_cmd, -1) * self.confidence_decay, _confidence[:, : num_temp_mode])
 

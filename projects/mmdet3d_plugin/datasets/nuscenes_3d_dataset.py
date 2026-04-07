@@ -103,6 +103,7 @@ class NuScenes3DDataset(Dataset):
         ego_status_dims=10,
         ego_status_mask_limit_vel=20.0,
         ego_status_mask_limit_accel=40.0,
+        teacher_cache_path=None,
     ):
         self.version = version
         self.load_interval = load_interval
@@ -155,6 +156,15 @@ class NuScenes3DDataset(Dataset):
         self.ego_status_dims = ego_status_dims
         self.ego_status_mask_limit_vel = ego_status_mask_limit_vel
         self.ego_status_mask_limit_accel = ego_status_mask_limit_accel
+
+        # Teacher cache for distillation
+        self.teacher_cache = None
+        if teacher_cache_path is not None:
+            import pickle
+            print_log(f"Loading teacher cache from {teacher_cache_path}...", logger='root')
+            with open(teacher_cache_path, "rb") as f:
+                self.teacher_cache = pickle.load(f)
+            print_log(f"Loaded teacher cache: {len(self.teacher_cache)} samples", logger='root')
 
     def __len__(self):
         return len(self.data_infos)
@@ -371,6 +381,21 @@ class NuScenes3DDataset(Dataset):
 
         annos = self.get_ann_info(index)
         input_dict.update(annos)
+
+        # Load teacher cache for distillation
+        if self.teacher_cache is not None:
+            token = info["token"]
+            teacher = self.teacher_cache.get(token, None)
+            if teacher is not None:
+                input_dict["teacher_logits"] = teacher["logits"].astype(np.float32)  # [200, 10]
+                input_dict["teacher_boxes"] = teacher["boxes"].astype(np.float32)    # [200, 9]
+                input_dict["teacher_scores"] = teacher["scores"].astype(np.float32)  # [200]
+            else:
+                # Fallback: zeros if token not found in cache
+                input_dict["teacher_logits"] = np.zeros((200, 10), dtype=np.float32)
+                input_dict["teacher_boxes"] = np.zeros((200, 9), dtype=np.float32)
+                input_dict["teacher_scores"] = np.zeros((200,), dtype=np.float32)
+
         return input_dict
 
     def _build_ego_status(self, info):

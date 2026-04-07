@@ -1,8 +1,10 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
+import io
 import mmcv
 import os
 from os import path as osp
+import pickle
 
 import torch
 import warnings
@@ -23,6 +25,18 @@ from mmdet.models import build_detector
 
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.apis.test import custom_multi_gpu_test
+
+
+class CPUUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "torch.storage" and name == "_load_from_bytes":
+            return lambda b: torch.load(io.BytesIO(b), map_location="cpu")
+        return super().find_class(module, name)
+
+
+def load_result_file_cpu(result_file):
+    with open(result_file, "rb") as f:
+        return CPUUnpickler(f).load()
 
 
 def parse_args():
@@ -250,7 +264,7 @@ def main():
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
     if args.result_file is not None:
-        outputs = mmcv.load(args.result_file)
+        outputs = load_result_file_cpu(args.result_file)
     elif not distributed:
         model = MMDataParallel(model, device_ids=[0])
         outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
@@ -280,6 +294,7 @@ def main():
                 "gpu_collect",
                 "save_best",
                 "rule",
+                "out_dir",
             ]:
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(kwargs)
@@ -296,6 +311,7 @@ def main():
                 "gpu_collect",
                 "save_best",
                 "rule",
+                "out_dir",
             ]:
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, **kwargs))

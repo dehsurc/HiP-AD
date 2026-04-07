@@ -3,7 +3,7 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/hipad_nusc_stage2"
+work_dir = "work_dirs/hipad_nusc_stage2_distill_v2"
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
@@ -11,19 +11,20 @@ length = {'trainval': 28130, 'mini': 323}
 num_gpus = 2
 batch_size = 6
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 36
+num_epochs = 6
 checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
-wandb_project = "hipad"
-wandb_name = "hipad_nusc_stage2_36ep"
+import datetime
+wandb_project = "nusc_det_distill"
+wandb_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 log_config = dict(
     interval=50,
     hooks=[
         dict(type="TextLoggerHook", by_epoch=False),
         dict(
             type="WandbLoggerHook",
-            init_kwargs=dict(entity="e2ekd", project=wandb_project, name=wandb_name),
+            init_kwargs=dict(project=wandb_project, name=wandb_name, entity="e2ekd"),
             by_epoch=False,
         ),
     ],
@@ -113,6 +114,17 @@ plan_speed_refer = None
 plan_anchor_refer = ("temp", "2hz")
 plan_anchor_types = [("temp", "2hz")]
 
+# ================== distillation config ========================
+teacher_cache_path = "data/cache/det/bevfusion_teacher_train.pkl"
+distill_alpha_cls = 0.05   # KD classification loss weight (reduced: ~40 → ~4, balanced with det_loss_cls)
+distill_alpha_reg = 0.1    # KD regression loss weight (reduced: KD is auxiliary)
+distill_temperature = 4.0  # softening temperature for cls KD
+distill_score_thr = 0.3    # only use teacher proposals with score > this (was 0.1)
+distill_last_layer_only = True  # apply KD to last decoder layer only
+# Teacher box format: [x, y, z, x_size, y_size, z_size, yaw, vx, vy]
+# Student box format: [x, y, z, w, l, h, sin, cos, vx, vy, vz]
+# Regression KD: convert teacher to student format, L1 loss on matched boxes
+
 
 model = dict(
     type="SparseDetector",
@@ -167,6 +179,14 @@ model = dict(
             with_incremental_plan_refine=True,
             motion_anchor=anchor_paths["motion"],
             cls_threshold_to_reg=0.05,
+            # distillation
+            distill_alpha_cls=distill_alpha_cls,
+            distill_alpha_reg=distill_alpha_reg,
+            distill_temperature=distill_temperature,
+            distill_score_thr=distill_score_thr,
+            distill_last_layer_only=distill_last_layer_only,
+            distill_mode="teacher_tp",
+            det_gt_loss_weight=1.0,
             # instance_bank
             det_instance_bank=dict(
                 type="InstanceBank",
@@ -556,8 +576,11 @@ train_pipeline = [
             "gt_ego_fut_masks_2hz",
             "ego_status",
             "ego_status_mask",
+            "teacher_logits",
+            "teacher_boxes",
+            "teacher_scores",
         ],
-        meta_keys=["T_global", "T_global_inv", "timestamp", "instance_id"],
+        meta_keys=["T_global", "T_global_inv", "timestamp", "instance_id", "token"],
     ),
 ]
 
@@ -657,6 +680,7 @@ data = dict(
         with_seq_flag=True,
         sequences_split_num=2,
         keep_consistent_seq_aug=True,
+        teacher_cache_path=teacher_cache_path,
     ),
     val=dict(
         **data_basic_config,
@@ -703,7 +727,7 @@ runner = dict(
 # ================== eval ========================
 eval_mode = dict(
     with_det=True,
-    with_tracking=False,
+    with_tracking=True,
     with_map=True,
     with_motion=True,
     with_planning=True,
@@ -711,7 +735,7 @@ eval_mode = dict(
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval * 2,
+    interval=num_iters_per_epoch * checkpoint_epoch_interval,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
     out_dir="val_vis",

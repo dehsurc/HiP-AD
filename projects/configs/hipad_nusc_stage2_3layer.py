@@ -3,20 +3,20 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/hipad_nusc_stage2"
+work_dir = None
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
 
-num_gpus = 2
-batch_size = 6
+num_gpus = 4
+batch_size = 8
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 36
+num_epochs = 18
 checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
 wandb_project = "hipad"
-wandb_name = "hipad_nusc_stage2_36ep"
+wandb_name = "hipad_nusc_stage2_3layer_18ep"
 log_config = dict(
     interval=50,
     hooks=[
@@ -28,7 +28,7 @@ log_config = dict(
         ),
     ],
 )
-load_from = "./work_dirs/hipad_nusc_stage1/latest.pth"
+load_from = "./work_dirs/hipad_nusc_stage1_3layer/latest.pth"
 resume_from = None
 workflow = [("train", 1)]
 fp16 = dict(loss_scale=32.0)
@@ -70,9 +70,9 @@ ego_fut_mode = 6
 ego_status_dims = 6
 
 # model
-embed_dims = 256
+embed_dims = 128
 num_groups = 8
-num_decoder = 6
+num_decoder = 3
 num_single_frame_decoder = 1
 use_deformable_func = True
 strides = [4, 8, 16, 32]
@@ -153,6 +153,7 @@ model = dict(
         evaluate_bench2dive=False,
         onedecoder_head=dict(
             type="SparseOneDecoder",
+            embed_dims=embed_dims,
             task_select=task_select,
             query_select=query_select,
             operation_order=operation_order,
@@ -213,7 +214,7 @@ model = dict(
             det_anchor_encoder=dict(
                 type="SparseBox3DEncoder",
                 vel_dims=3,
-                embed_dims=[128, 32, 32, 64] if decouple_attn else 256,
+                embed_dims=[64, 16, 16, 32] if decouple_attn else 128,
                 mode="cat" if decouple_attn else "add",
                 output_fc=not decouple_attn,
                 in_loops=1,
@@ -727,4 +728,4 @@ custom_hooks = [
     )
 ]
 
-load_from = "./work_dirs/hipad_nusc_stage1/latest.pth"
+load_from = "./work_dirs/hipad_nusc_stage1_3layer/latest.pth"

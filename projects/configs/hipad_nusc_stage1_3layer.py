@@ -3,20 +3,20 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/hipad_nusc_stage2"
+work_dir = None
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
 
 num_gpus = 2
-batch_size = 6
+batch_size = 8
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 36
+num_epochs = 12
 checkpoint_epoch_interval = 3
 
-checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=1)
 wandb_project = "hipad"
-wandb_name = "hipad_nusc_stage2_36ep"
+wandb_name = "hipad_nusc_stage1_3layer_12ep"
 log_config = dict(
     interval=50,
     hooks=[
@@ -28,7 +28,7 @@ log_config = dict(
         ),
     ],
 )
-load_from = "./work_dirs/hipad_nusc_stage1/latest.pth"
+load_from = None
 resume_from = None
 workflow = [("train", 1)]
 fp16 = dict(loss_scale=32.0)
@@ -70,9 +70,9 @@ ego_fut_mode = 6
 ego_status_dims = 6
 
 # model
-embed_dims = 256
+embed_dims = 128
 num_groups = 8
-num_decoder = 6
+num_decoder = 3
 num_single_frame_decoder = 1
 use_deformable_func = True
 strides = [4, 8, 16, 32]
@@ -92,7 +92,8 @@ temporal_plan = True
 # tasks
 task_config = dict(with_onedecoder=True)
 
-task_select = ["det", "map", "plan", "ego", "motion"]
+# Stage1 pretraining excludes motion loss.
+task_select = ["det", "map", "plan", "ego"]
 query_select = ["det", "map", "plan", "ego"]  # with query initial order
 
 single_frame_layer = ["concat", "gnn", "inter_gnn", "norm", "split", "deformable", "concat", "ffn", "norm", "split", "refine"]
@@ -153,6 +154,7 @@ model = dict(
         evaluate_bench2dive=False,
         onedecoder_head=dict(
             type="SparseOneDecoder",
+            embed_dims=embed_dims,
             task_select=task_select,
             query_select=query_select,
             operation_order=operation_order,
@@ -213,7 +215,7 @@ model = dict(
             det_anchor_encoder=dict(
                 type="SparseBox3DEncoder",
                 vel_dims=3,
-                embed_dims=[128, 32, 32, 64] if decouple_attn else 256,
+                embed_dims=[64, 16, 16, 32] if decouple_attn else 128,
                 mode="cat" if decouple_attn else "add",
                 output_fc=not decouple_attn,
                 in_loops=1,
@@ -481,9 +483,9 @@ model = dict(
                               loss_line=dict(type="LinesL1Loss", loss_weight=10.0, beta=0.01),
                               num_sample=map_num_pts,
                               roi_size=map_roi_size),
-            loss_ego_status=dict(type="L1Loss", loss_weight=1.0),
-            loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.5),
-            loss_plan_reg=dict(type="L1Loss", loss_weight=1.0),
+            loss_ego_status=dict(type="L1Loss", loss_weight=0.0),
+            loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.0),
+            loss_plan_reg=dict(type="L1Loss", loss_weight=0.0),
             loss_motion_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.2),
             loss_motion_reg=dict(type="L1Loss", loss_weight=0.2),
             # weights
@@ -705,26 +707,15 @@ eval_mode = dict(
     with_det=True,
     with_tracking=False,
     with_map=True,
-    with_motion=True,
+    with_motion=False,
     with_planning=True,
     tracking_threshold=0.2,
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval * 2,
+    interval=num_iters_per_epoch*checkpoint_epoch_interval,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
-    out_dir="val_vis",
 )
 
-custom_hooks = [
-    dict(
-        type="WandbValVisHook",
-        vis_dir="val_vis/visual",
-        max_images=8,
-        interval=1,
-        priority="LOWEST",
-    )
-]
-
-load_from = "./work_dirs/hipad_nusc_stage1/latest.pth"
+load_from = None

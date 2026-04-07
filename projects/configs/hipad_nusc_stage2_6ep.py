@@ -3,7 +3,7 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/hipad_nusc_stage2"
+work_dir = None
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
@@ -11,19 +11,20 @@ length = {'trainval': 28130, 'mini': 323}
 num_gpus = 2
 batch_size = 6
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 36
+num_epochs = 6
 checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
-wandb_project = "hipad"
-wandb_name = "hipad_nusc_stage2_36ep"
+import datetime
+wandb_project = "nusc_det_distill"
+wandb_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 log_config = dict(
     interval=50,
     hooks=[
         dict(type="TextLoggerHook", by_epoch=False),
         dict(
             type="WandbLoggerHook",
-            init_kwargs=dict(entity="e2ekd", project=wandb_project, name=wandb_name),
+            init_kwargs=dict(project=wandb_project, name=wandb_name, entity="e2ekd"),
             by_epoch=False,
         ),
     ],
@@ -703,7 +704,7 @@ runner = dict(
 # ================== eval ========================
 eval_mode = dict(
     with_det=True,
-    with_tracking=False,
+    with_tracking=True,
     with_map=True,
     with_motion=True,
     with_planning=True,
@@ -711,7 +712,7 @@ eval_mode = dict(
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval * 2,
+    interval=num_iters_per_epoch * checkpoint_epoch_interval,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
     out_dir="val_vis",
