@@ -3,7 +3,7 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/exp/E8_E1_stage2_6ep_distill_w_det"
+work_dir = "work_dirs/exp/E7_E1_stage2_6ep_distill_wo_det"
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
@@ -15,8 +15,9 @@ num_epochs = 6
 checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
+import datetime
 wandb_project = "hipad"
-wandb_name = "E8_E1_stage2_distill_w_det"
+wandb_name = "E7_E1_stage2_distill_wo_det"
 log_config = dict(
     interval=50,
     hooks=[
@@ -118,11 +119,10 @@ teacher_cache_path = "data/cache/det/bevfusion_teacher_train.pkl"
 distill_alpha_cls = 0.2
 distill_alpha_reg = 0.4
 distill_temperature = 4.0  # softening temperature for cls KD
-distill_score_thr = 0.3    # only use teacher proposals with score > this (was 0.1)
+distill_score_thr = 0.1    # only use teacher proposals with score > this
 distill_last_layer_only = True  # apply KD to last decoder layer only
-# Teacher box format: [x, y, z, x_size, y_size, z_size, yaw, vx, vy]
-# Student box format: [x, y, z, w, l, h, sin, cos, vx, vy, vz]
-# Regression KD: convert teacher to student format, L1 loss on matched boxes
+distill_mode = "pseudo_gt"     # "teacher_tp" or "pseudo_gt"
+det_gt_loss_weight = 0.0        # 0.0 = distill-only (no GT det supervision)
 
 
 model = dict(
@@ -184,8 +184,8 @@ model = dict(
             distill_temperature=distill_temperature,
             distill_score_thr=distill_score_thr,
             distill_last_layer_only=distill_last_layer_only,
-            distill_mode="teacher_tp",
-            det_gt_loss_weight=1.0,
+            distill_mode=distill_mode,
+            det_gt_loss_weight=det_gt_loss_weight,
             # instance_bank
             det_instance_bank=dict(
                 type="InstanceBank",

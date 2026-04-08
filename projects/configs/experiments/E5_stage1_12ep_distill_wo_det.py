@@ -118,7 +118,7 @@ teacher_cache_path = "data/cache/det/bevfusion_teacher_train.pkl"
 distill_alpha_cls = 0.2
 distill_alpha_reg = 0.4
 distill_temperature = 4.0
-distill_score_thr = 0.3
+distill_score_thr = 0.1
 distill_last_layer_only = True
 
 model = dict(
@@ -180,7 +180,7 @@ model = dict(
             distill_temperature=distill_temperature,
             distill_score_thr=distill_score_thr,
             distill_last_layer_only=distill_last_layer_only,
-            distill_mode="teacher_tp",
+            distill_mode="pseudo_gt",
             det_gt_loss_weight=0.0,
             # instance_bank
             det_instance_bank=dict(

@@ -1158,18 +1158,14 @@ class SparseOneDecoder(BaseModule):
                               and self.use_distill
                               and "teacher_logits" in data)
 
-        if use_pseudo_gt:
-            gt_labels, gt_bboxes = self._build_pseudo_gt(data)
-        else:
-            # Both "teacher_tp" and "pseudo_gt_plus" use real GT as primary
-            gt_labels = data["gt_labels_3d"]
-            gt_bboxes = data["gt_bboxes_3d"]
+        # All modes use real GT as primary (pseudo_gt adds separate kd_loss)
+        gt_labels = data["gt_labels_3d"]
+        gt_bboxes = data["gt_bboxes_3d"]
 
-        # GT loss weight: applies only in teacher_tp mode (pseudo_gt uses teacher AS gt)
-        gt_w = self.det_gt_loss_weight if not use_pseudo_gt else 1.0
+        gt_w = self.det_gt_loss_weight
 
-        # Pre-build pseudo GT for pseudo_gt_plus mode (used in loop below)
-        if use_pseudo_gt_plus:
+        # Pre-build pseudo GT for pseudo_gt / pseudo_gt_plus mode
+        if use_pseudo_gt or use_pseudo_gt_plus:
             pgt_labels, pgt_bboxes = self._build_pseudo_gt(data)
 
         output = {}
@@ -1220,7 +1216,7 @@ class SparseOneDecoder(BaseModule):
                 for k, v in reg_loss.items():
                     output[k] = v * gt_w
 
-            # Distillation loss (teacher_tp mode only — pseudo_gt uses standard loss pipeline)
+            # Distillation KD loss (teacher_tp mode)
             if self.distill_mode == "teacher_tp" and self.use_distill and "teacher_logits" in data:
                 apply_kd = (not self.distill_last_layer_only) or (decoder_idx == len(cls_scores) - 1)
                 if apply_kd:
@@ -1235,6 +1231,56 @@ class SparseOneDecoder(BaseModule):
                     else:
                         output[f"det_loss_kd_cls_{decoder_idx}"] = kd_cls_loss
                         output[f"det_loss_kd_reg_{decoder_idx}"] = kd_reg_loss
+
+            # Pseudo GT mode: separate kd_loss using teacher pseudo GT through det loss pipeline
+            if use_pseudo_gt:
+                apply_kd = (not self.distill_last_layer_only) or (decoder_idx == len(cls_scores) - 1)
+                if apply_kd:
+                    cls_raw = cls_scores[decoder_idx]
+                    reg_raw = reg_preds[decoder_idx][..., : len(self.det_reg_weights)]
+                    qt_raw = quality[decoder_idx]
+
+                    pgt_cls_target, pgt_reg_target, pgt_reg_weights = self.det_sampler.sample(
+                        cls_raw, reg_raw, pgt_labels, pgt_bboxes)
+                    pgt_reg_target = pgt_reg_target[..., : len(self.det_reg_weights)]
+                    pgt_mask = torch.logical_not(torch.all(pgt_reg_target == 0, dim=-1))
+                    pgt_num_pos = max(reduce_mean(torch.sum(pgt_mask).to(dtype=reg_raw.dtype)), 1.0)
+
+                    if self.cls_threshold_to_reg > 0:
+                        pgt_mask = torch.logical_and(
+                            pgt_mask, cls_raw.max(dim=-1).values.sigmoid() > self.cls_threshold_to_reg)
+
+                    pgt_cls = cls_raw.flatten(end_dim=1)
+                    pgt_cls_target = pgt_cls_target.flatten(end_dim=1)
+                    pgt_cls_loss = self.loss_det_cls(pgt_cls, pgt_cls_target, avg_factor=pgt_num_pos)
+
+                    pgt_mask = pgt_mask.reshape(-1)
+                    pgt_reg_weights_w = pgt_reg_weights * reg_raw.new_tensor(self.det_reg_weights)
+                    pgt_reg_target = pgt_reg_target.flatten(end_dim=1)[pgt_mask]
+                    pgt_reg = reg_raw.flatten(end_dim=1)[pgt_mask]
+                    pgt_reg_weights_w = pgt_reg_weights_w.flatten(end_dim=1)[pgt_mask]
+                    pgt_reg_target = torch.where(pgt_reg_target.isnan(), pgt_reg.new_tensor(0.0), pgt_reg_target)
+                    pgt_cls_target_masked = pgt_cls_target[pgt_mask]
+                    pgt_qt = qt_raw.flatten(end_dim=1)[pgt_mask] if qt_raw is not None else None
+
+                    pgt_reg_loss = self.loss_det_reg(
+                        pgt_reg, pgt_reg_target, weight=pgt_reg_weights_w, avg_factor=pgt_num_pos,
+                        prefix="det_kd_", suffix=f"_{decoder_idx}", quality=pgt_qt, cls_target=pgt_cls_target_masked)
+
+                    if self.combine_layer_loss:
+                        if "det_loss_kd_cls" not in output:
+                            output["det_loss_kd_cls"] = 0.0
+                            output["det_loss_kd_box"] = 0.0
+                            output["det_loss_kd_cns"] = 0.0
+                            output["det_loss_kd_yns"] = 0.0
+                        output["det_loss_kd_cls"] += pgt_cls_loss
+                        output["det_loss_kd_box"] += pgt_reg_loss[f"det_kd_loss_box_{decoder_idx}"]
+                        output["det_loss_kd_cns"] += pgt_reg_loss[f"det_kd_loss_cns_{decoder_idx}"]
+                        output["det_loss_kd_yns"] += pgt_reg_loss[f"det_kd_loss_yns_{decoder_idx}"]
+                    else:
+                        output[f"det_loss_kd_cls_{decoder_idx}"] = pgt_cls_loss
+                        for k, v in pgt_reg_loss.items():
+                            output[k] = v
 
             # Pseudo GT plus mode: additional detection loss against teacher predictions
             if use_pseudo_gt_plus:

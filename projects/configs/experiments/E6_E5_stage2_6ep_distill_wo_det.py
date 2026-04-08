@@ -3,7 +3,7 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/exp/E7_E5_stage2_6ep_distill_wo_det"
+work_dir = "work_dirs/exp/E6_E5_stage2_6ep_distill_wo_det"
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
@@ -17,7 +17,7 @@ checkpoint_epoch_interval = 3
 checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
 import datetime
 wandb_project = "hipad"
-wandb_name = "E7_E5_stage2_distill_wo_det"
+wandb_name = "E6_E5_stage2_distill_wo_det"
 log_config = dict(
     interval=50,
     hooks=[
@@ -119,9 +119,9 @@ teacher_cache_path = "data/cache/det/bevfusion_teacher_train.pkl"
 distill_alpha_cls = 0.2
 distill_alpha_reg = 0.4
 distill_temperature = 4.0  # softening temperature for cls KD
-distill_score_thr = 0.3    # only use teacher proposals with score > this
+distill_score_thr = 0.1    # only use teacher proposals with score > this
 distill_last_layer_only = True  # apply KD to last decoder layer only
-distill_mode = "teacher_tp"     # "teacher_tp" or "pseudo_gt"
+distill_mode = "pseudo_gt"     # "teacher_tp" or "pseudo_gt"
 det_gt_loss_weight = 0.0        # 0.0 = distill-only (no GT det supervision)
 
 
