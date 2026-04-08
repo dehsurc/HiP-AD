@@ -11,12 +11,12 @@ length = {'trainval': 28130, 'mini': 323}
 num_gpus = 2
 batch_size = 6
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 36
+num_epochs = 18
 checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
 wandb_project = "hipad"
-wandb_name = "hipad_nusc_stage2_36ep"
+wandb_name = "hipad_nusc_stage2_18ep"
 log_config = dict(
     interval=50,
     hooks=[

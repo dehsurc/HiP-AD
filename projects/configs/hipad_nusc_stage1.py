@@ -707,7 +707,7 @@ eval_mode = dict(
     with_tracking=False,
     with_map=True,
     with_motion=False,
-    with_planning=True,
+    with_planning=False,
     tracking_threshold=0.2,
     motion_threshhold=0.2,
 )
