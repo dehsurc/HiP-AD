@@ -158,8 +158,9 @@ class SparseOneDecoder(BaseModule):
             distill_temperature=4.0,
             distill_score_thr=0.1,
             distill_last_layer_only=True,
-            distill_mode="teacher_tp",  # "teacher_tp" or "pseudo_gt"
+            distill_mode="teacher_tp",  # "teacher_tp", "pseudo_gt", or "pseudo_gt_plus"
             det_gt_loss_weight=1.0,     # weight for GT detection losses (0.0 = distill-only)
+            pseudo_gt_weight=1.0,       # weight for pseudo GT detection loss (pseudo_gt_plus mode)
 
             **kwargs,
     ):
@@ -200,6 +201,7 @@ class SparseOneDecoder(BaseModule):
         self.use_distill = (distill_alpha_cls > 0 or distill_alpha_reg > 0)
         self.distill_mode = distill_mode
         self.det_gt_loss_weight = det_gt_loss_weight
+        self.pseudo_gt_weight = pseudo_gt_weight
 
         self.independent_gnn = independent_gnn
         self.independent_temp_gnn = independent_temp_gnn
@@ -1152,14 +1154,23 @@ class SparseOneDecoder(BaseModule):
         use_pseudo_gt = (self.distill_mode == "pseudo_gt"
                          and self.use_distill
                          and "teacher_logits" in data)
+        use_pseudo_gt_plus = (self.distill_mode == "pseudo_gt_plus"
+                              and self.use_distill
+                              and "teacher_logits" in data)
+
         if use_pseudo_gt:
             gt_labels, gt_bboxes = self._build_pseudo_gt(data)
         else:
+            # Both "teacher_tp" and "pseudo_gt_plus" use real GT as primary
             gt_labels = data["gt_labels_3d"]
             gt_bboxes = data["gt_bboxes_3d"]
 
         # GT loss weight: applies only in teacher_tp mode (pseudo_gt uses teacher AS gt)
         gt_w = self.det_gt_loss_weight if not use_pseudo_gt else 1.0
+
+        # Pre-build pseudo GT for pseudo_gt_plus mode (used in loop below)
+        if use_pseudo_gt_plus:
+            pgt_labels, pgt_bboxes = self._build_pseudo_gt(data)
 
         output = {}
         for decoder_idx, (cls, reg, qt) in enumerate(zip(cls_scores, reg_preds, quality)):
@@ -1224,6 +1235,60 @@ class SparseOneDecoder(BaseModule):
                     else:
                         output[f"det_loss_kd_cls_{decoder_idx}"] = kd_cls_loss
                         output[f"det_loss_kd_reg_{decoder_idx}"] = kd_reg_loss
+
+            # Pseudo GT plus mode: additional detection loss against teacher predictions
+            if use_pseudo_gt_plus:
+                apply_pgt = (not self.distill_last_layer_only) or (decoder_idx == len(cls_scores) - 1)
+                if apply_pgt:
+                    cls_raw = cls_scores[decoder_idx]
+                    reg_raw = reg_preds[decoder_idx][..., : len(self.det_reg_weights)]
+                    qt_raw = quality[decoder_idx]
+
+                    pgt_cls_target, pgt_reg_target, pgt_reg_weights = self.det_sampler.sample(
+                        cls_raw, reg_raw, pgt_labels, pgt_bboxes)
+                    pgt_reg_target = pgt_reg_target[..., : len(self.det_reg_weights)]
+                    pgt_mask = torch.logical_not(torch.all(pgt_reg_target == 0, dim=-1))
+                    pgt_num_pos = max(reduce_mean(torch.sum(pgt_mask).to(dtype=reg_raw.dtype)), 1.0)
+
+                    if self.cls_threshold_to_reg > 0:
+                        pgt_mask = torch.logical_and(
+                            pgt_mask, cls_raw.max(dim=-1).values.sigmoid() > self.cls_threshold_to_reg)
+
+                    pgt_cls = cls_raw.flatten(end_dim=1)
+                    pgt_cls_target = pgt_cls_target.flatten(end_dim=1)
+                    pgt_cls_loss = self.loss_det_cls(pgt_cls, pgt_cls_target, avg_factor=pgt_num_pos) * self.pseudo_gt_weight
+
+                    pgt_mask = pgt_mask.reshape(-1)
+                    pgt_reg_weights_w = pgt_reg_weights * reg_raw.new_tensor(self.det_reg_weights)
+                    pgt_reg_target = pgt_reg_target.flatten(end_dim=1)[pgt_mask]
+                    pgt_reg = reg_raw.flatten(end_dim=1)[pgt_mask]
+                    pgt_reg_weights_w = pgt_reg_weights_w.flatten(end_dim=1)[pgt_mask]
+                    pgt_reg_target = torch.where(pgt_reg_target.isnan(), pgt_reg.new_tensor(0.0), pgt_reg_target)
+                    pgt_cls_target_masked = pgt_cls_target[pgt_mask]
+                    pgt_qt = qt_raw.flatten(end_dim=1)[pgt_mask] if qt_raw is not None else None
+
+                    pgt_reg_loss = self.loss_det_reg(
+                        pgt_reg, pgt_reg_target, weight=pgt_reg_weights_w, avg_factor=pgt_num_pos,
+                        prefix="det_pgt_", suffix=f"_{decoder_idx}", quality=pgt_qt, cls_target=pgt_cls_target_masked)
+
+                    if self.combine_layer_loss:
+                        if "det_pgt_loss_cls" not in output:
+                            output["det_pgt_loss_cls"] = 0.0
+                            output["det_pgt_loss_box"] = 0.0
+                            output["det_pgt_loss_cns"] = 0.0
+                            output["det_pgt_loss_yns"] = 0.0
+                        output["det_pgt_loss_cls"] += pgt_cls_loss
+                        output["det_pgt_loss_box"] += pgt_reg_loss[f"det_pgt_loss_box_{decoder_idx}"] * self.pseudo_gt_weight
+                        output["det_pgt_loss_cns"] += pgt_reg_loss[f"det_pgt_loss_cns_{decoder_idx}"] * self.pseudo_gt_weight
+                        output["det_pgt_loss_yns"] += pgt_reg_loss[f"det_pgt_loss_yns_{decoder_idx}"] * self.pseudo_gt_weight
+                    else:
+                        output[f"det_pgt_loss_cls_{decoder_idx}"] = pgt_cls_loss
+                        for k, v in pgt_reg_loss.items():
+                            output[k] = v * self.pseudo_gt_weight
+
+                    # Restore real GT matching (pseudo GT matching overwrote det_sampler.indices)
+                    self.det_sampler.sample(
+                        cls_raw, reg_raw, data["gt_labels_3d"], data["gt_bboxes_3d"])
 
         # Restore real GT indices for downstream tasks (motion, plan)
         # pseudo_gt matching produces indices relative to pseudo GT objects,

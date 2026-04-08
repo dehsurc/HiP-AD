@@ -11,6 +11,7 @@ __pycache__/
 data
 ckpts
 work_dirs
+work_dirs_archive
 wandb/
 *.png
 gradient_analysis_*/
