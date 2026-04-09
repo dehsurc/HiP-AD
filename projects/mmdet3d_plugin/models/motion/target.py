@@ -56,8 +56,8 @@ class MotionTarget():
         for i, (pred_idx, target_idx) in enumerate(indices):
             if len(gt_reg_target[i]) == 0:
                 continue
-            reg_target[i, pred_idx] = gt_reg_target[i][target_idx]
-            reg_weight[i, pred_idx] = gt_reg_mask[i][target_idx]
+            reg_target[i, pred_idx] = gt_reg_target[i][target_idx].to(reg_target.dtype)
+            reg_weight[i, pred_idx] = gt_reg_mask[i][target_idx].to(reg_weight.dtype)
             num_pos += len(pred_idx)
 
         cls_target = get_cls_target(reg_pred, reg_target, reg_weight)
@@ -89,8 +89,8 @@ class SparseMotionTarget():
         for i, (pred_idx, target_idx) in enumerate(indices):
             if len(gt_reg_target[i]) == 0:
                 continue
-            reg_target[i, pred_idx] = gt_reg_target[i][target_idx]
-            reg_weight[i, pred_idx] = gt_reg_mask[i][target_idx]
+            reg_target[i, pred_idx] = gt_reg_target[i][target_idx].to(reg_target.dtype)
+            reg_weight[i, pred_idx] = gt_reg_mask[i][target_idx].to(reg_weight.dtype)
             num_pos += len(pred_idx)
         
         cls_target = get_cls_target(reg_pred, reg_target, reg_weight)

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Must set CARLA_ROOT
-export WORK_DIR=/opt/data/private/project/HiP-AD
-export CARLA_ROOT=/opt/data/private/project/Carla
+export WORK_DIR=/home/yongjae/e2e/HiP-AD
+export CARLA_ROOT=/data/carla
 export CARLA_SERVER=${CARLA_ROOT}/CarlaUE4.sh
 export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI
 export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla

@@ -2,13 +2,25 @@
 """
 Gradient Conflict Analysis Script for HiP-AD Multi-Task Learning
 
-This script analyzes gradient conflicts between different tasks (planning, detection, map, motion)
-in the shared decoder parameters. It computes pairwise cosine similarity between task gradients
-to diagnose potential gradient conflicts before applying PCGrad or similar methods.
+This script analyzes gradient conflicts between different tasks (planning, detection, map,
+motion, ego) in the shared decoder parameters and activations. It computes pairwise cosine
+similarity between task gradients to diagnose potential gradient conflicts.
+
+Two levels of analysis:
+  1. Weight gradient: How tasks compete for shared parameter updates (optimizer perspective)
+  2. Activation gradient: How tasks want to change shared intermediate representations
+     (FPN features, deformable outputs, inter_gnn layers)
+
+Key metrics:
+  - Raw cosine similarity: Standard full-vector cosine between task gradients
+  - Active-overlap cosine: Weighted cosine on coordinates where both tasks have non-zero
+    gradient, distinguishing disjoint / true_orthogonal / hidden_conflict
+  - Interference: ||g_src|| * max(0, -cos(g_src, g_vic))
+  - Decomposition: Cooperative vs conflicting gradient components
 
 Analysis modes:
-  basic     - Overall pairwise cosine similarity across all shared parameters (original)
-  full      - Per-layer analysis + advanced metrics (interference, decomposition)
+  basic     - Overall pairwise cosine similarity across all shared parameters
+  full      - Per-layer analysis + advanced metrics + active-overlap
   direction - PCA-based gradient direction visualization + all of 'full'
 
 Usage:
@@ -18,6 +30,7 @@ Usage:
         --num-batches 50 \
         --batch-size 1 \
         --analysis-mode full \
+        --activation \
         --output-dir gradient_analysis_results
 """
 
@@ -63,6 +76,7 @@ TASK_GROUPS = {
     'det': ['det_loss_cls', 'det_loss_box', 'det_loss_cns', 'det_loss_yns'],
     'map': ['map_loss_cls', 'map_loss_line'],
     'motion': ['motion_loss_cls', 'motion_loss_reg'],
+    'ego': ['ego_loss_cls', 'ego_loss_reg', 'ego_loss_status'],
     'plan': ['plan_loss_temp_cls', 'plan_loss_temp_reg',
              'plan_loss_spat_cls', 'plan_loss_spat_reg',
              'plan_loss_speed_cls', 'plan_loss_speed_reg'],
@@ -72,6 +86,10 @@ TASK_PAIRS = [
     ('plan', 'det'),
     ('plan', 'map'),
     ('plan', 'motion'),
+    ('plan', 'ego'),
+    ('ego', 'det'),
+    ('ego', 'map'),
+    ('ego', 'motion'),
     ('det', 'map'),
     ('det', 'motion'),
     ('map', 'motion'),
@@ -81,6 +99,7 @@ TASK_COLORS = {
     'det': '#e74c3c',
     'map': '#2ecc71',
     'motion': '#3498db',
+    'ego': '#9b59b6',
     'plan': '#f39c12',
 }
 
@@ -124,6 +143,80 @@ def compute_cosine_similarity(grad1: torch.Tensor, grad2: torch.Tensor) -> float
     return (torch.dot(grad1, grad2) / (norm1 * norm2)).item()
 
 
+def compute_active_overlap_cosine(
+    grad1: torch.Tensor, grad2: torch.Tensor, quantile: float = 0.99,
+) -> Dict[str, float]:
+    """Compute active-overlap weighted cosine similarity.
+
+    Instead of treating zero-padded (unused) gradient coordinates as real zeros,
+    this identifies coordinates where both tasks have meaningful gradient activity
+    and computes cosine only on that overlap region.
+
+    Returns dict with:
+      - overlap_cosine: weighted cosine on active-overlap coordinates
+      - overlap_ratio: fraction of coordinates where both tasks are active
+      - raw_cosine: standard full-vector cosine (for comparison)
+      - interpretation: 'disjoint' | 'true_orthogonal' | 'hidden_conflict' | 'cooperative'
+    """
+    if grad1 is None or grad2 is None:
+        return {'overlap_cosine': float('nan'), 'overlap_ratio': 0.0,
+                'raw_cosine': float('nan'), 'interpretation': 'N/A'}
+
+    raw_cos = compute_cosine_similarity(grad1, grad2)
+
+    # Scale normalization: map each task's absolute gradient to [0, 1]
+    # using 99th percentile as reference to handle outliers.
+    # Use sampled quantile for large tensors (quantile() sorts internally → OOM).
+    abs1 = grad1.abs()
+    abs2 = grad2.abs()
+    _MAX_QUANTILE_ELEMS = 2_000_000
+    if abs1.numel() > _MAX_QUANTILE_ELEMS:
+        idx = torch.randint(abs1.numel(), (_MAX_QUANTILE_ELEMS,), device=abs1.device)
+        q1 = abs1.view(-1)[idx].quantile(quantile) + 1e-8
+        q2 = abs2.view(-1)[idx].quantile(quantile) + 1e-8
+    else:
+        q1 = abs1.quantile(quantile) + 1e-8
+        q2 = abs2.quantile(quantile) + 1e-8
+    norm1 = (abs1 / q1).clamp(max=1.0)
+    norm2 = (abs2 / q2).clamp(max=1.0)
+
+    # Soft-AND weighting: high weight only where both tasks are active
+    w = torch.min(norm1, norm2)
+
+    # Overlap ratio: fraction of coordinates with meaningful joint activity
+    # (threshold at 0.01 to count as "active")
+    active_mask = w > 0.01
+    overlap_ratio = active_mask.float().mean().item()
+
+    # Weighted cosine similarity
+    w_sum = w.sum()
+    if w_sum < 1e-8:
+        overlap_cos = float('nan')
+    else:
+        numerator = (grad1 * grad2 * w).sum()
+        denom = ((grad1 ** 2 * w).sum().sqrt() * (grad2 ** 2 * w).sum().sqrt() + 1e-8)
+        overlap_cos = (numerator / denom).item()
+
+    # Interpretation
+    if np.isnan(overlap_cos) or np.isnan(raw_cos):
+        interp = 'N/A'
+    elif overlap_ratio < 0.05:
+        interp = 'disjoint'
+    elif overlap_cos < -0.1:
+        interp = 'hidden_conflict' if abs(raw_cos) < 0.1 else 'conflict'
+    elif overlap_cos > 0.1:
+        interp = 'cooperative'
+    else:
+        interp = 'true_orthogonal'
+
+    return {
+        'overlap_cosine': float(overlap_cos),
+        'overlap_ratio': float(overlap_ratio),
+        'raw_cosine': float(raw_cos),
+        'interpretation': interp,
+    }
+
+
 def compute_interference(grad_source: torch.Tensor, grad_victim: torch.Tensor) -> float:
     """Interference of source on victim: ||g_src|| * max(0, -cos(g_src, g_vic))."""
     cos = compute_cosine_similarity(grad_source, grad_victim)
@@ -150,6 +243,95 @@ def compute_decomposition(grad_a: torch.Tensor, grad_b: torch.Tensor) -> Tuple[f
         return (proj_mag, 0.0)
     else:
         return (0.0, abs(proj_mag))
+
+
+def compute_subspace_principal_angles(
+    grad1: torch.Tensor, grad2: torch.Tensor, weight_shape: Tuple[int, int],
+    top_k: int = 5,
+) -> Dict[str, object]:
+    """Compute principal angles between gradient subspaces via SVD.
+
+    For FFN-like layers where weight W has shape (out_dim, in_dim), each task's
+    gradient dL/dW can be reshaped to the same 2D shape.  SVD of each gradient
+    matrix reveals the subspace that the task's update occupies.  Principal
+    angles between the top-k left singular vectors quantify how much these
+    subspaces overlap.
+
+    Large principal angles (~90 deg) → subspace separation (token-wise
+    independence masking true interaction).
+    Small angles → tasks compete in the same subspace.
+    """
+    out_dim, in_dim = weight_shape
+    if grad1.numel() != out_dim * in_dim or grad2.numel() != out_dim * in_dim:
+        return None
+
+    # Run SVD on CUDA to avoid Intel MKL DLASCL/SLASCL bugs with
+    # ill-conditioned gradient matrices.  Use float32 on GPU (sufficient
+    # precision, avoids double-precision GPU slowdown).
+    _svd_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    G1 = grad1.reshape(out_dim, in_dim).float().to(_svd_device)
+    G2 = grad2.reshape(out_dim, in_dim).float().to(_svd_device)
+
+    # Guard: skip if either gradient has NaN/Inf or is all-zero
+    if not torch.isfinite(G1).all() or not torch.isfinite(G2).all():
+        return None
+    if G1.abs().max() < 1e-12 or G2.abs().max() < 1e-12:
+        return None
+
+    try:
+        U1, S1, _ = torch.linalg.svd(G1, full_matrices=False)
+        U2, S2, _ = torch.linalg.svd(G2, full_matrices=False)
+    except (torch._C._LinAlgError, RuntimeError):
+        return None
+
+    k = min(top_k, U1.shape[1], U2.shape[1])
+    U1_k = U1[:, :k]
+    U2_k = U2[:, :k]
+
+    # Principal angles: arccos of singular values of U1_k^T @ U2_k
+    M = U1_k.T @ U2_k
+    try:
+        sigmas = torch.linalg.svdvals(M).clamp(-1.0, 1.0)
+    except (torch._C._LinAlgError, RuntimeError):
+        return None
+    angles_rad = torch.acos(sigmas)
+    angles_deg = torch.rad2deg(angles_rad)
+
+    total_var1 = (S1 ** 2).sum()
+    total_var2 = (S2 ** 2).sum()
+
+    return {
+        'principal_angles_deg': angles_deg.tolist(),
+        'mean_angle_deg': float(angles_deg.mean().item()),
+        'min_angle_deg': float(angles_deg.min().item()),
+        'max_angle_deg': float(angles_deg.max().item()),
+        'top_k': k,
+        'explained_var_ratio_1': (S1[:k] ** 2 / (total_var1 + 1e-12)).tolist(),
+        'explained_var_ratio_2': (S2[:k] ** 2 / (total_var2 + 1e-12)).tolist(),
+    }
+
+
+def get_group_weight_info(
+    param_groups: OrderedDict,
+) -> Dict[str, Dict]:
+    """For each parameter group, find the largest 2D weight and its offset in the flattened gradient.
+
+    Returns {group_key: {'shape': (out, in), 'offset': int, 'numel': int}}
+    Only includes groups that contain at least one 2D parameter.
+    """
+    info = {}
+    for gk, params in param_groups.items():
+        offset = 0
+        best = None  # (shape, offset, numel)
+        for name, param in params.items():
+            if param.dim() == 2:
+                numel = param.numel()
+                if best is None or numel > best[2]:
+                    best = (tuple(param.shape), offset, numel)
+            offset += param.numel()
+        if best is not None:
+            info[gk] = {'shape': best[0], 'offset': best[1], 'numel': best[2]}
+    return info
 
 
 def move_to_device(data: dict, device: str) -> dict:
@@ -201,18 +383,188 @@ def compute_decoder_layer_mapping(operation_order: List[str]) -> Dict[int, int]:
 # Grouped Parameter Extraction
 # ============================================================================
 
+def _split_submodule_params(
+    group_key: str, params: OrderedDict, op_type: str, meta: dict,
+) -> List[Tuple[str, OrderedDict, dict]]:
+    """Split an operation's params into MGCM-style fine-grained sub-modules.
+
+    Attention (gnn/temp_gnn/inter_gnn):
+      - Per sub-attention head: QKV (in_proj_weight/bias) and O (out_proj)
+    FFN (ffn):
+      - W1 (first linear + activation), W2 (second linear)
+      - pre_norm if present
+    Norm (norm):
+      - Single group (already minimal: gamma + beta)
+
+    Returns list of (sub_group_key, sub_params, sub_meta).
+    """
+    results = []
+
+    if op_type in ('gnn', 'temp_gnn', 'inter_gnn'):
+        # Attention modules: attns.{idx}.in_proj_weight/bias, attns.{idx}.out_proj.*
+        # Group by sub-attention index, then split QKV vs O
+        attn_subgroups = defaultdict(lambda: defaultdict(OrderedDict))
+        other_params = OrderedDict()
+        for name, param in params.items():
+            # name pattern: layers.{i}.attns.{attn_idx}.{in_proj_weight|out_proj.weight|...}
+            parts = name.split('.')
+            # Find 'attns' in parts
+            if 'attns' in parts:
+                attn_pos = parts.index('attns')
+                attn_idx = parts[attn_pos + 1]
+                remainder = '.'.join(parts[attn_pos + 2:])
+                if 'in_proj' in remainder:
+                    attn_subgroups[attn_idx]['qkv'][name] = param
+                elif 'out_proj' in remainder:
+                    attn_subgroups[attn_idx]['o'][name] = param
+                else:
+                    attn_subgroups[attn_idx]['other'][name] = param
+            else:
+                other_params[name] = param
+
+        for attn_idx in sorted(attn_subgroups.keys()):
+            for part_name, part_params in attn_subgroups[attn_idx].items():
+                if part_params:
+                    sub_key = f"{group_key}_attn{attn_idx}_{part_name}"
+                    sub_meta = {**meta, 'sub_module': f'attn{attn_idx}_{part_name}'}
+                    results.append((sub_key, part_params, sub_meta))
+        if other_params:
+            sub_key = f"{group_key}_other"
+            results.append((sub_key, other_params, {**meta, 'sub_module': 'other'}))
+
+    elif op_type == 'ffn':
+        # AsymmetricFFN param name patterns (after layer.named_parameters()):
+        #   layers.{global_op_idx}.pre_norm.weight/bias  -> pre_norm
+        #   layers.{global_op_idx}.layers.0.0.weight/bias -> W1 (Linear in Sequential)
+        #   layers.{global_op_idx}.layers.1.weight/bias   -> W2 (Linear)
+        # We split on the LAST "layers.{digit}" to find FFN-internal index.
+        import re
+        w1_params = OrderedDict()
+        w2_params = OrderedDict()
+        pre_norm_params = OrderedDict()
+        other_params = OrderedDict()
+        # Pattern to find FFN-internal layers index: last "layers.{N}" in path
+        ffn_layers_re = re.compile(r'\.layers\.(\d+)')
+        for name, param in params.items():
+            if 'pre_norm' in name:
+                pre_norm_params[name] = param
+            else:
+                matches = list(ffn_layers_re.finditer(name))
+                if len(matches) >= 2:
+                    # First match: decoder's layers[i], Second match: FFN's layers[j]
+                    ffn_idx = int(matches[-1].group(1))
+                elif len(matches) == 1:
+                    ffn_idx = int(matches[0].group(1))
+                else:
+                    ffn_idx = -1
+
+                if ffn_idx == 0:
+                    w1_params[name] = param
+                elif ffn_idx >= 1:
+                    w2_params[name] = param
+                else:
+                    other_params[name] = param
+
+        if pre_norm_params:
+            results.append((f"{group_key}_prenorm", pre_norm_params,
+                          {**meta, 'sub_module': 'pre_norm'}))
+        if w1_params:
+            results.append((f"{group_key}_w1", w1_params,
+                          {**meta, 'sub_module': 'w1'}))
+        if w2_params:
+            results.append((f"{group_key}_w2", w2_params,
+                          {**meta, 'sub_module': 'w2'}))
+        if other_params:
+            results.append((f"{group_key}_other", other_params,
+                          {**meta, 'sub_module': 'other'}))
+
+    else:
+        # norm, backbone stages, neck, etc. — already minimal or not worth splitting
+        results.append((group_key, params, meta))
+
+    return results
+
+
 def get_shared_parameters_grouped(
     model: nn.Module,
     shared_layer_names: List[str],
     last_n_layers: Optional[int] = None,
+    modular: bool = False,
 ) -> Tuple[OrderedDict, OrderedDict]:
     """Extract shared parameters grouped by (decoder_layer, operation_type).
+
+    Also includes non-decoder shared modules (backbone, neck) when specified
+    in shared_layer_names via 'backbone' or 'neck'.
+
+    Args:
+        modular: If True, further split each operation into MGCM-style
+            sub-modules (Attention Q/K/V vs O, FFN W1 vs W2, etc.).
 
     Returns:
         param_groups: OrderedDict[group_key -> OrderedDict[param_name -> Parameter]]
         group_meta:   OrderedDict[group_key -> dict] with keys:
-                        decoder_idx, op_type, global_layer_idx (or -1 for fc)
+                        decoder_idx, op_type, global_layer_idx (or -1 for non-decoder)
     """
+    raw_model = model.module if hasattr(model, 'module') else model
+
+    param_groups = OrderedDict()
+    group_meta = OrderedDict()
+
+    # ---- Non-decoder shared modules: backbone, neck ----
+    non_decoder_modules = {
+        'backbone': getattr(raw_model, 'img_backbone', None),
+        'neck': getattr(raw_model, 'img_neck', None),
+    }
+    for mod_name, mod in non_decoder_modules.items():
+        if mod_name not in shared_layer_names or mod is None:
+            continue
+        if mod_name == 'backbone':
+            # Split backbone by stage to avoid high-dimensional dilution
+            # ResNet: stem (conv1, bn1) + layer1~layer4
+            stage_names = ['layer1', 'layer2', 'layer3', 'layer4']
+            stage_prefixes = set(stage_names)
+            # Stem: parameters not belonging to any layer stage
+            stem_params = OrderedDict()
+            for name, param in mod.named_parameters():
+                if param.requires_grad and not any(name.startswith(s) for s in stage_prefixes):
+                    stem_params[f"backbone.{name}"] = param
+            if stem_params:
+                param_groups['backbone_stem'] = stem_params
+                group_meta['backbone_stem'] = {
+                    'decoder_idx': -1,
+                    'op_type': 'backbone_stem',
+                    'global_layer_idx': -1,
+                }
+            for stage_name in stage_names:
+                stage = getattr(mod, stage_name, None)
+                if stage is None:
+                    continue
+                stage_params = OrderedDict()
+                for name, param in stage.named_parameters():
+                    if param.requires_grad:
+                        stage_params[f"backbone.{stage_name}.{name}"] = param
+                if stage_params:
+                    gk = f"backbone_{stage_name}"
+                    param_groups[gk] = stage_params
+                    group_meta[gk] = {
+                        'decoder_idx': -1,
+                        'op_type': f'backbone_{stage_name}',
+                        'global_layer_idx': -1,
+                    }
+        else:
+            params = OrderedDict()
+            for name, param in mod.named_parameters():
+                if param.requires_grad:
+                    params[f"{mod_name}.{name}"] = param
+            if params:
+                param_groups[mod_name] = params
+                group_meta[mod_name] = {
+                    'decoder_idx': -1,
+                    'op_type': mod_name,
+                    'global_layer_idx': -1,
+                }
+
+    # ---- Decoder operation layers ----
     decoder = get_decoder(model)
     operation_order = decoder.operation_order
     dec_mapping = compute_decoder_layer_mapping(operation_order)
@@ -226,9 +578,6 @@ def get_shared_parameters_grouped(
     # Track how many times each op type appears within a decoder layer to disambiguate
     # e.g. two 'norm' ops in the same decoder layer -> dec0_norm_0, dec0_norm_1
     op_count_per_dec: Dict[Tuple[int, str], int] = defaultdict(int)
-
-    param_groups = OrderedDict()
-    group_meta = OrderedDict()
 
     for i, (op, layer) in enumerate(zip(operation_order, decoder.layers)):
         if layer is None or i < start_idx:
@@ -273,6 +622,19 @@ def get_shared_parameters_grouped(
                 'global_layer_idx': -1,
             }
 
+    if modular:
+        modular_groups = OrderedDict()
+        modular_meta = OrderedDict()
+        for gk, params in param_groups.items():
+            meta = group_meta[gk]
+            op_type = meta['op_type']
+            for sub_key, sub_params, sub_meta in _split_submodule_params(
+                gk, params, op_type, meta
+            ):
+                modular_groups[sub_key] = sub_params
+                modular_meta[sub_key] = sub_meta
+        return modular_groups, modular_meta
+
     return param_groups, group_meta
 
 
@@ -306,7 +668,10 @@ def compute_task_gradient_grouped(
     param_groups: OrderedDict,
     retain_graph: bool = True,
 ) -> Optional[Dict[str, torch.Tensor]]:
-    """Compute per-group gradient vectors for a task. Single autograd.grad call.
+    """Compute per-group gradient vectors for a task via .backward().
+
+    Uses .backward() instead of autograd.grad() to be compatible with
+    gradient checkpointing (torch.utils.checkpoint).
 
     Returns dict mapping group_key -> flattened gradient tensor (on same device).
     Also includes '_all' key for full concatenated gradient.
@@ -316,49 +681,43 @@ def compute_task_gradient_grouped(
     if task_loss is None:
         return None
 
-    # Build ordered list of all parameters across groups, tracking group boundaries
+    # Collect all parameters across groups
     all_params = []
-    group_boundaries = []  # (group_key, start_idx, end_idx)
     for gk, params in param_groups.items():
-        start = len(all_params)
         all_params.extend(params.values())
-        group_boundaries.append((gk, start, len(all_params)))
 
     if not all_params:
         return None
 
+    # Zero existing gradients to isolate this task's contribution
+    for p in all_params:
+        if p.grad is not None:
+            p.grad = None
+
     try:
-        grads = torch.autograd.grad(
-            outputs=task_loss,
-            inputs=all_params,
-            retain_graph=retain_graph,
-            allow_unused=True,
-            create_graph=False,
-        )
+        task_loss.backward(retain_graph=retain_graph)
     except RuntimeError as e:
         print(f"Warning: gradient computation failed for {task_name}: {e}")
         return None
 
-    # Replace None grads with zeros
+    # Read .grad from each parameter, replace None with zeros
     device = all_params[0].device
     dtype = all_params[0].dtype
-    grad_flat = []
-    for idx, g in enumerate(grads):
-        if g is not None:
-            grad_flat.append(g.detach().flatten())
-        else:
-            grad_flat.append(torch.zeros(all_params[idx].numel(), device=device, dtype=dtype))
-
-    full_grad = torch.cat(grad_flat)
 
     # Split into groups
     result = {}
-    cum = 0
     for gk, params in param_groups.items():
-        n = sum(p.numel() for p in params.values())
-        result[gk] = full_grad[cum:cum + n]
-        cum += n
-    result['_all'] = full_grad
+        group_grads = []
+        for p in params.values():
+            if p.grad is not None:
+                group_grads.append(p.grad.detach().flatten())
+            else:
+                group_grads.append(torch.zeros(p.numel(), device=device, dtype=dtype))
+        result[gk] = torch.cat(group_grads)
+
+    # Build '_all' excluding NaN-contaminated groups so valid groups aren't poisoned
+    valid_chunks = [v for v in result.values() if not torch.isnan(v).any()]
+    result['_all'] = torch.cat(valid_chunks) if valid_chunks else torch.cat(list(result.values()))
 
     return result
 
@@ -378,7 +737,7 @@ def compute_task_gradient(model, loss_dict, task_name, shared_params, retain_gra
 # ============================================================================
 
 def compute_per_group_metrics(task_grads_grouped, group_keys):
-    """Compute cosine, norms, interference, decomposition for all groups and task pairs.
+    """Compute cosine, norms, interference, decomposition, active-overlap for all groups and task pairs.
 
     Args:
         task_grads_grouped: dict[task_name -> dict[group_key -> tensor]]
@@ -390,6 +749,7 @@ def compute_per_group_metrics(task_grads_grouped, group_keys):
     per_group_conflict = {}
     per_group_interference = {}
     per_group_decomposition = {}
+    per_group_active_overlap = {}
 
     for gk in group_keys:
         cosines = {}
@@ -397,6 +757,7 @@ def compute_per_group_metrics(task_grads_grouped, group_keys):
         conflicts = {}
         interferences = {}
         decompositions = {}
+        active_overlaps = {}
 
         for task in tasks:
             g = task_grads_grouped[task].get(gk)
@@ -416,14 +777,17 @@ def compute_per_group_metrics(task_grads_grouped, group_keys):
                 decompositions[f"{t1}_wrt_{t2}"] = (coop, conf)
                 coop2, conf2 = compute_decomposition(g2, g1)
                 decompositions[f"{t2}_wrt_{t1}"] = (coop2, conf2)
+                active_overlaps[pk] = compute_active_overlap_cosine(g1, g2)
 
         per_group_cosine[gk] = cosines
         per_group_norms[gk] = norms
         per_group_conflict[gk] = conflicts
         per_group_interference[gk] = interferences
         per_group_decomposition[gk] = decompositions
+        per_group_active_overlap[gk] = active_overlaps
 
-    return per_group_cosine, per_group_norms, per_group_conflict, per_group_interference, per_group_decomposition
+    return (per_group_cosine, per_group_norms, per_group_conflict,
+            per_group_interference, per_group_decomposition, per_group_active_overlap)
 
 
 # ============================================================================
@@ -460,13 +824,15 @@ def analyze_single_batch(
 
         for i, task in enumerate(task_names):
             retain = (i < len(task_names) - 1)
+            model.zero_grad(set_to_none=True)
             grad_dict = compute_task_gradient_grouped(model, outputs, task, param_groups, retain_graph=retain)
             if grad_dict is not None:
                 # Move to CPU immediately to save GPU memory
                 task_grads_grouped[task] = {gk: g.cpu() for gk, g in grad_dict.items()}
                 results['gradient_norms'][task] = torch.norm(grad_dict['_all']).item()
 
-    # Overall pairwise cosine
+    # Overall pairwise cosine + active-overlap
+    active_overlap_results = {}
     for t1, t2 in TASK_PAIRS:
         pk = f"{t1}_vs_{t2}"
         g1 = task_grads_grouped.get(t1, {}).get('_all')
@@ -475,6 +841,8 @@ def analyze_single_batch(
             c = compute_cosine_similarity(g1, g2)
             results['pairwise_cosine'][pk] = c
             results['conflict_flags'][pk] = c < 0 if not np.isnan(c) else False
+            active_overlap_results[pk] = compute_active_overlap_cosine(g1, g2)
+    results['active_overlap'] = active_overlap_results
 
     # Overall interference & decomposition
     if analysis_mode in ('full', 'direction'):
@@ -493,14 +861,36 @@ def analyze_single_batch(
         results['interference'] = interference
         results['decomposition'] = decomposition
 
-    # Per-group metrics
+    # Per-group metrics (includes active-overlap)
     if analysis_mode in ('full', 'direction'):
-        pgc, pgn, pgf, pgi, pgd = compute_per_group_metrics(task_grads_grouped, group_keys)
+        pgc, pgn, pgf, pgi, pgd, pgao = compute_per_group_metrics(task_grads_grouped, group_keys)
         results['per_group_cosine'] = pgc
         results['per_group_norms'] = pgn
         results['per_group_conflict'] = pgf
         results['per_group_interference'] = pgi
         results['per_group_decomposition'] = pgd
+        results['per_group_active_overlap'] = pgao
+
+
+    # SVD subspace analysis for groups with 2D weight matrices
+    if analysis_mode in ('full', 'direction'):
+        weight_info = get_group_weight_info(param_groups)
+        subspace_results = {}
+        for gk, wi in weight_info.items():
+            gk_sub = {}
+            for t1, t2 in TASK_PAIRS:
+                pk = f"{t1}_vs_{t2}"
+                g1 = task_grads_grouped.get(t1, {}).get(gk)
+                g2 = task_grads_grouped.get(t2, {}).get(gk)
+                if g1 is not None and g2 is not None:
+                    g1_w = g1[wi['offset']:wi['offset'] + wi['numel']]
+                    g2_w = g2[wi['offset']:wi['offset'] + wi['numel']]
+                    sub = compute_subspace_principal_angles(g1_w, g2_w, wi['shape'])
+                    if sub is not None:
+                        gk_sub[pk] = sub
+            if gk_sub:
+                subspace_results[gk] = gk_sub
+        results['per_group_subspace'] = subspace_results
 
     # Store raw gradients for PCA
     if store_gradients:
@@ -512,6 +902,382 @@ def analyze_single_batch(
         }
 
     model.zero_grad(set_to_none=True)
+    return results
+
+
+# ============================================================================
+# Activation Gradient Analysis
+# ============================================================================
+
+class ActivationHookManager:
+    """Register forward hooks on specific modules to capture activation tensors.
+
+    Captured activations can then be used as inputs to torch.autograd.grad
+    for computing per-task activation gradients.
+
+    Supports two modes:
+      1. Module output hooks: capture the output tensor of an nn.Module
+      2. Sliced hooks: capture a module's output, then slice it by query_select
+         boundaries to produce per-task activation tensors (for concat-based ops
+         like inter_gnn where the module output is [det|map|ego|plan] concatenated)
+    """
+
+    def __init__(self):
+        self.activations = {}
+        self._handles = []
+
+    def register(self, name: str, module: nn.Module):
+        """Register a forward hook that stores the module's output tensor."""
+        def hook_fn(mod, inp, out, name=name):
+            if isinstance(out, torch.Tensor):
+                out.retain_grad()
+                self.activations[name] = out
+            elif isinstance(out, (list, tuple)) and len(out) > 0:
+                # For FPN-like modules that return a list/tuple of tensors
+                for i, o in enumerate(out):
+                    if isinstance(o, torch.Tensor):
+                        o.retain_grad()
+                        self.activations[f"{name}_scale{i}"] = o
+        handle = module.register_forward_hook(hook_fn)
+        self._handles.append(handle)
+
+    def register_input(self, name: str, module: nn.Module):
+        """Register a forward hook that stores the module's *input* tensor (first positional arg)."""
+        def hook_fn(mod, inp, out, name=name):
+            # inp is a tuple of positional args; the first is typically query/instance_feature
+            if isinstance(inp, tuple) and len(inp) > 0:
+                tensor = inp[0]
+                if isinstance(tensor, torch.Tensor):
+                    tensor.retain_grad()
+                    self.activations[name] = tensor
+        handle = module.register_forward_hook(hook_fn)
+        self._handles.append(handle)
+
+    def register_sliced(self, base_name: str, module: nn.Module,
+                        query_select: List[str], anchor_section: Dict[str, List[int]],
+                        capture_input: bool = False):
+        """Register a hook that slices concat-format tensor into per-task segments.
+
+        For inter_gnn: the input/output is [det|map|ego|plan] concatenated along dim=1.
+        This hook produces separate activation entries like 'inter_gnn_dec0_in_det',
+        'inter_gnn_dec0_out_plan', etc.
+        """
+        def hook_fn(mod, inp, out, base_name=base_name, qs=query_select,
+                    sections=anchor_section, cap_in=capture_input):
+            # Slice output
+            if isinstance(out, torch.Tensor):
+                out.retain_grad()
+                self.activations[f"{base_name}_out"] = out
+                for q in qs:
+                    if q in sections:
+                        start, end = sections[q]
+                        sliced = out[:, start:end]
+                        sliced.retain_grad()
+                        self.activations[f"{base_name}_out_{q}"] = sliced
+
+            # Slice input
+            if cap_in and isinstance(inp, tuple) and len(inp) > 0:
+                in_tensor = inp[0]
+                if isinstance(in_tensor, torch.Tensor):
+                    in_tensor.retain_grad()
+                    self.activations[f"{base_name}_in"] = in_tensor
+                    for q in qs:
+                        if q in sections:
+                            start, end = sections[q]
+                            sliced = in_tensor[:, start:end]
+                            sliced.retain_grad()
+                            self.activations[f"{base_name}_in_{q}"] = sliced
+
+        handle = module.register_forward_hook(hook_fn)
+        self._handles.append(handle)
+
+    def clear(self):
+        self.activations = {}
+
+    def remove_hooks(self):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+
+def _get_decoder(model: nn.Module):
+    """Get the unified decoder from a (possibly wrapped) model."""
+    if hasattr(model, 'module'):
+        model = model.module
+    head = model.head
+    if hasattr(head, 'onedecoder_head'):
+        return head.onedecoder_head
+    if hasattr(head, 'sparse_head'):
+        return head.sparse_head
+    if hasattr(head, 'operation_order'):
+        return head
+    return None
+
+
+def _setup_activation_hooks(model: nn.Module, hook_manager: ActivationHookManager):
+    """Set up activation hooks for all analysis points.
+
+    Hook points (from Section 8 of the analysis spec):
+      1. FPN multi-scale feature map
+      2. inter_gnn input (det/map query) and output (plan/ego query) — per decoder layer
+      3. deformable output query features — per task per decoder layer
+      4. gnn / temp_gnn layers — as additional reference
+
+    For inter_gnn, uses sliced hooks to split the concatenated instance_feature
+    into per-task query segments using decoder.num_anchor_section.
+    """
+    raw_model = model.module if hasattr(model, 'module') else model
+
+    # 1. FPN neck
+    if hasattr(raw_model, 'img_neck'):
+        hook_manager.register('fpn', raw_model.img_neck)
+
+    # 2-4. Decoder internals
+    decoder = _get_decoder(model)
+    if decoder is None:
+        return
+
+    # Deformable modules per task (output = task-specific query after feature sampling)
+    for task_prefix in ['det', 'map', 'ego', 'plan']:
+        deform_attr = f'{task_prefix}_deformable'
+        if hasattr(decoder, deform_attr):
+            deform_list = getattr(decoder, deform_attr)
+            for i, deform_mod in enumerate(deform_list):
+                hook_manager.register(f'{task_prefix}_deformable_{i}', deform_mod)
+
+    # inter_gnn / gnn / temp_gnn layers with per-task slicing
+    if hasattr(decoder, 'operation_order') and hasattr(decoder, 'layers'):
+        dec_mapping = compute_decoder_layer_mapping(decoder.operation_order)
+
+        # Get query_select and anchor_section from decoder
+        # These define how the concatenated instance_feature is split into per-task segments
+        query_select = getattr(decoder, 'query_select', [])
+        # num_anchor_section is populated during forward — we read it lazily in hook
+        # Instead, for static analysis, we use num_anchor_list if available
+        # Note: num_anchor_section is set during forward, so we pass it to sliced hooks
+        # The section boundaries depend on runtime query counts, which vary.
+        # We use a forward pre-hook to capture the live section info.
+
+        for i, op in enumerate(decoder.operation_order):
+            if decoder.layers[i] is None:
+                continue
+            dec_idx = dec_mapping.get(i, -1)
+
+            if op == 'inter_gnn':
+                # inter_gnn operates on concatenated [det|map|ego|plan] features
+                # Use sliced hook to capture per-task input/output
+                # NOTE: anchor_section is set dynamically in forward(), so we
+                # register a hook that reads it at call time
+                _register_dynamic_sliced_hook(
+                    hook_manager, f'inter_gnn_dec{dec_idx}',
+                    decoder.layers[i], decoder, query_select,
+                    capture_input=True,
+                )
+            elif op in ('gnn', 'temp_gnn'):
+                # gnn/temp_gnn also operate on concatenated features
+                _register_dynamic_sliced_hook(
+                    hook_manager, f'{op}_dec{dec_idx}',
+                    decoder.layers[i], decoder, query_select,
+                    capture_input=False,
+                )
+
+
+def _register_dynamic_sliced_hook(
+    hook_manager: ActivationHookManager,
+    base_name: str,
+    layer_module: nn.Module,
+    decoder: nn.Module,
+    query_select: List[str],
+    capture_input: bool = False,
+):
+    """Register a forward hook that dynamically reads decoder.num_anchor_section
+    at hook time (populated during forward pass) to slice the concatenated tensor.
+    """
+    def hook_fn(mod, inp, out):
+        # Read live anchor section boundaries from decoder
+        section = getattr(decoder, 'num_anchor_section', None)
+        if section is None:
+            # Fallback: store full tensor only
+            if isinstance(out, torch.Tensor):
+                out.retain_grad()
+                hook_manager.activations[f"{base_name}_out"] = out
+            return
+
+        # Output slicing
+        if isinstance(out, torch.Tensor):
+            out.retain_grad()
+            hook_manager.activations[f"{base_name}_out"] = out
+            for q in query_select:
+                if q in section:
+                    start, end = section[q]
+                    sliced = out[:, start:end]
+                    sliced.retain_grad()
+                    hook_manager.activations[f"{base_name}_out_{q}"] = sliced
+
+        # Input slicing (for inter_gnn: captures query before cross-attention)
+        if capture_input and isinstance(inp, tuple) and len(inp) > 0:
+            # graph_model calls: self.layers[i](query, key, value, ...)
+            # But the hook fires on self.layers[i], so inp[0] is query
+            in_tensor = inp[0]
+            if isinstance(in_tensor, torch.Tensor):
+                in_tensor.retain_grad()
+                hook_manager.activations[f"{base_name}_in"] = in_tensor
+                for q in query_select:
+                    if q in section:
+                        start, end = section[q]
+                        sliced = in_tensor[:, start:end]
+                        sliced.retain_grad()
+                        hook_manager.activations[f"{base_name}_in_{q}"] = sliced
+
+    handle = layer_module.register_forward_hook(hook_fn)
+    hook_manager._handles.append(handle)
+
+
+def compute_activation_gradients(
+    model: nn.Module,
+    loss_dict: Dict[str, torch.Tensor],
+    activation_tensors: Dict[str, torch.Tensor],
+    task_name: str,
+    retain_graph: bool = True,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Compute gradients of a task's loss w.r.t. captured activation tensors.
+
+    Uses .backward() + .grad instead of autograd.grad() to avoid
+    "dependency not found" errors caused by overlapping tensor views
+    (e.g. sliced per-task segments from the same concatenated tensor).
+
+    Returns dict mapping activation_name -> gradient tensor (flattened).
+    """
+    task_loss = _sum_task_loss(loss_dict, task_name)
+    if task_loss is None:
+        return None
+
+    # Filter to only tensors that require grad and have retain_grad() set
+    valid_tensors = {}
+    for name, tensor in activation_tensors.items():
+        if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+            valid_tensors[name] = tensor
+
+    if not valid_tensors:
+        return None
+
+    # Clear previous .grad on activation tensors (avoid accumulation across tasks)
+    for tensor in valid_tensors.values():
+        if tensor.grad is not None:
+            tensor.grad = None
+
+    try:
+        task_loss.backward(retain_graph=retain_graph)
+    except RuntimeError as e:
+        print(f"Warning: activation gradient failed for {task_name}: {e}")
+        print(f"  task_loss device={task_loss.device}, dtype={task_loss.dtype}, "
+              f"requires_grad={task_loss.requires_grad}")
+        return None
+
+    result = {}
+    for name, tensor in valid_tensors.items():
+        if tensor.grad is not None:
+            result[name] = tensor.grad.detach().flatten().cpu()
+        else:
+            result[name] = torch.zeros(tensor.numel(), dtype=torch.float32)
+
+    return result
+
+
+def analyze_activation_gradients_single_batch(
+    model, data, device, fp16=False, selective_eval=True,
+):
+    """Run a single batch with activation hooks and compute per-task activation gradients.
+
+    Hook points:
+      - fpn_scale{0-3}: FPN multi-scale feature maps
+      - inter_gnn_dec{N}_in_{task}: query before inter_gnn (det/map as key/value source)
+      - inter_gnn_dec{N}_out_{task}: query after inter_gnn (plan/ego updated)
+      - {task}_deformable_{N}: deformable aggregation output per task
+      - gnn_dec{N}_out: intra-task GNN output
+      - temp_gnn_dec{N}_out: temporal GNN output
+
+    Returns dict with:
+      - activation_cosine: {hook_point: {pair_key: cosine}}
+      - activation_active_overlap: {hook_point: {pair_key: overlap_dict}}
+      - activation_norms: {hook_point: {task: norm}}
+    """
+    results = {
+        'activation_cosine': {},
+        'activation_active_overlap': {},
+        'activation_norms': {},
+    }
+
+    data = move_to_device(data, device)
+    model.train()
+
+    # Set up hooks
+    hook_manager = ActivationHookManager()
+    _setup_activation_hooks(model, hook_manager)
+
+    _ctx = _selective_eval(model) if selective_eval else contextlib.nullcontext()
+    try:
+        with _ctx:
+            # Activation analysis MUST run WITHOUT autocast.
+            # autocast inserts dtype-casting nodes that break the autograd
+            # graph path between the loss and hooked intermediate tensors,
+            # causing "dependency not found" errors in torch.autograd.grad().
+            img = data.pop('img')
+            outputs = model(img=img, **data)
+
+            if not isinstance(outputs, dict):
+                return results
+
+            # Debug: verify hooks captured tensors and they require grad
+            if not hook_manager.activations:
+                print("Warning: No activations captured by hooks")
+                return results
+
+            task_names = list(TASK_GROUPS.keys())
+            task_act_grads = {}  # task -> {hook_point_name -> flattened_grad}
+
+            for i, task in enumerate(task_names):
+                retain = (i < len(task_names) - 1)
+                # Zero model param grads to avoid accumulation from .backward()
+                model.zero_grad(set_to_none=True)
+                act_grads = compute_activation_gradients(
+                    model, outputs, hook_manager.activations, task, retain_graph=retain,
+                )
+                if act_grads is not None:
+                    task_act_grads[task] = act_grads
+
+        # Compute pairwise metrics per hook point
+        all_hook_names = set()
+        for task_grads in task_act_grads.values():
+            all_hook_names.update(task_grads.keys())
+
+        for hp in sorted(all_hook_names):
+            cosines = {}
+            active_overlaps = {}
+            norms = {}
+
+            for task in task_act_grads:
+                g = task_act_grads[task].get(hp)
+                norms[task] = torch.norm(g).item() if g is not None else 0.0
+
+            for t1, t2 in TASK_PAIRS:
+                pk = f"{t1}_vs_{t2}"
+                g1 = task_act_grads.get(t1, {}).get(hp)
+                g2 = task_act_grads.get(t2, {}).get(hp)
+                if g1 is not None and g2 is not None:
+                    cosines[pk] = compute_cosine_similarity(g1, g2)
+                    active_overlaps[pk] = compute_active_overlap_cosine(g1, g2)
+
+            if cosines:
+                results['activation_cosine'][hp] = cosines
+                results['activation_active_overlap'][hp] = active_overlaps
+                results['activation_norms'][hp] = norms
+
+    finally:
+        hook_manager.remove_hooks()
+        hook_manager.clear()
+        model.zero_grad(set_to_none=True)
+
     return results
 
 
@@ -571,6 +1337,27 @@ def aggregate_results(all_results, analysis_mode='basic'):
     for pk, vals in flag_agg.items():
         ratio = sum(vals) / len(vals)
         stats['conflict_frequency'][pk] = {'ratio': ratio, 'count': sum(vals), 'total': len(vals)}
+
+    # Overall active-overlap
+    ao_overlap_cos_agg = defaultdict(list)
+    ao_overlap_ratio_agg = defaultdict(list)
+    ao_interp_agg = defaultdict(lambda: defaultdict(int))
+    for r in all_results:
+        for pk, ao in r.get('active_overlap', {}).items():
+            oc = ao.get('overlap_cosine', float('nan'))
+            if not np.isnan(oc):
+                ao_overlap_cos_agg[pk].append(oc)
+            oratio = ao.get('overlap_ratio', 0.0)
+            ao_overlap_ratio_agg[pk].append(oratio)
+            interp = ao.get('interpretation', 'N/A')
+            ao_interp_agg[pk][interp] += 1
+    stats['active_overlap'] = {}
+    for pk in ao_overlap_cos_agg:
+        stats['active_overlap'][pk] = {
+            'overlap_cosine': _stats_from_values(ao_overlap_cos_agg[pk]),
+            'overlap_ratio': _stats_from_values(ao_overlap_ratio_agg[pk]),
+            'interpretation_counts': dict(ao_interp_agg[pk]),
+        }
 
     if analysis_mode in ('full', 'direction'):
         # Interference
@@ -648,6 +1435,96 @@ def aggregate_results(all_results, analysis_mode='basic'):
                     'conflicting': _stats_from_values(pg_conf_agg[gk][dk]),
                 }
 
+        # Per-group active-overlap
+        pg_ao_cos_agg = defaultdict(lambda: defaultdict(list))
+        pg_ao_ratio_agg = defaultdict(lambda: defaultdict(list))
+        pg_ao_interp_agg = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        for r in all_results:
+            for gk, aos in r.get('per_group_active_overlap', {}).items():
+                for pk, ao in aos.items():
+                    oc = ao.get('overlap_cosine', float('nan'))
+                    if not np.isnan(oc):
+                        pg_ao_cos_agg[gk][pk].append(oc)
+                    pg_ao_ratio_agg[gk][pk].append(ao.get('overlap_ratio', 0.0))
+                    pg_ao_interp_agg[gk][pk][ao.get('interpretation', 'N/A')] += 1
+        stats['per_group_active_overlap'] = {}
+        for gk in pg_ao_cos_agg:
+            stats['per_group_active_overlap'][gk] = {}
+            for pk in pg_ao_cos_agg[gk]:
+                stats['per_group_active_overlap'][gk][pk] = {
+                    'overlap_cosine': _stats_from_values(pg_ao_cos_agg[gk][pk]),
+                    'overlap_ratio': _stats_from_values(pg_ao_ratio_agg[gk][pk]),
+                    'interpretation_counts': dict(pg_ao_interp_agg[gk][pk]),
+                }
+
+        # Per-group SVD subspace principal angles
+        pg_sub_angle_agg = defaultdict(lambda: defaultdict(list))  # gk -> pk -> [mean_angle]
+        pg_sub_min_agg = defaultdict(lambda: defaultdict(list))
+        pg_sub_max_agg = defaultdict(lambda: defaultdict(list))
+        pg_sub_ev1_agg = defaultdict(lambda: defaultdict(list))  # explained variance ratio (task1 top-k)
+        pg_sub_ev2_agg = defaultdict(lambda: defaultdict(list))
+        for r in all_results:
+            for gk, pks in r.get('per_group_subspace', {}).items():
+                for pk, sub in pks.items():
+                    pg_sub_angle_agg[gk][pk].append(sub['mean_angle_deg'])
+                    pg_sub_min_agg[gk][pk].append(sub['min_angle_deg'])
+                    pg_sub_max_agg[gk][pk].append(sub['max_angle_deg'])
+                    ev1 = sub.get('explained_var_ratio_1', [])
+                    ev2 = sub.get('explained_var_ratio_2', [])
+                    if ev1:
+                        pg_sub_ev1_agg[gk][pk].append(sum(ev1))
+                    if ev2:
+                        pg_sub_ev2_agg[gk][pk].append(sum(ev2))
+        if pg_sub_angle_agg:
+            stats['per_group_subspace'] = {}
+            for gk in pg_sub_angle_agg:
+                stats['per_group_subspace'][gk] = {}
+                for pk in pg_sub_angle_agg[gk]:
+                    stats['per_group_subspace'][gk][pk] = {
+                        'mean_angle_deg': _stats_from_values(pg_sub_angle_agg[gk][pk]),
+                        'min_angle_deg': _stats_from_values(pg_sub_min_agg[gk][pk]),
+                        'max_angle_deg': _stats_from_values(pg_sub_max_agg[gk][pk]),
+                        'explained_var_sum_1': _stats_from_values(pg_sub_ev1_agg[gk][pk]),
+                        'explained_var_sum_2': _stats_from_values(pg_sub_ev2_agg[gk][pk]),
+                    }
+
+    # Activation gradient results (from activation analysis pass)
+    act_cos_agg = defaultdict(lambda: defaultdict(list))
+    act_ao_cos_agg = defaultdict(lambda: defaultdict(list))
+    act_ao_ratio_agg = defaultdict(lambda: defaultdict(list))
+    act_norm_agg = defaultdict(lambda: defaultdict(list))
+    for r in all_results:
+        for hp, cosines in r.get('activation_cosine', {}).items():
+            for pk, c in cosines.items():
+                if not np.isnan(c):
+                    act_cos_agg[hp][pk].append(c)
+        for hp, aos in r.get('activation_active_overlap', {}).items():
+            for pk, ao in aos.items():
+                oc = ao.get('overlap_cosine', float('nan'))
+                if not np.isnan(oc):
+                    act_ao_cos_agg[hp][pk].append(oc)
+                act_ao_ratio_agg[hp][pk].append(ao.get('overlap_ratio', 0.0))
+        for hp, norms in r.get('activation_norms', {}).items():
+            for t, n in norms.items():
+                act_norm_agg[hp][t].append(n)
+    if act_cos_agg:
+        stats['activation_cosine'] = {
+            hp: {pk: _stats_from_values(vals) for pk, vals in pks.items()}
+            for hp, pks in act_cos_agg.items()
+        }
+        stats['activation_active_overlap'] = {}
+        for hp in act_ao_cos_agg:
+            stats['activation_active_overlap'][hp] = {}
+            for pk in act_ao_cos_agg[hp]:
+                stats['activation_active_overlap'][hp][pk] = {
+                    'overlap_cosine': _stats_from_values(act_ao_cos_agg[hp][pk]),
+                    'overlap_ratio': _stats_from_values(act_ao_ratio_agg[hp][pk]),
+                }
+        stats['activation_norms'] = {
+            hp: {t: _stats_from_values(vals) for t, vals in ts.items()}
+            for hp, ts in act_norm_agg.items()
+        }
+
     # Gradient directions (for PCA)
     if analysis_mode == 'direction':
         grad_dirs = defaultdict(list)
@@ -685,14 +1562,22 @@ def save_results(stats, output_dir, analysis_mode='basic'):
     with open(os.path.join(output_dir, 'gradient_conflict_stats.json'), 'w') as f:
         json.dump(strip_values(stats), f, indent=2, default=str)
 
-    # Overall CSV
+    # Overall CSV (with active-overlap columns)
     with open(os.path.join(output_dir, 'gradient_conflict_details.csv'), 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['Task Pair', 'Mean Cosine', 'Std Cosine', 'Min', 'Max', 'Conflict Ratio'])
+        w.writerow(['Task Pair', 'Mean Cosine', 'Std Cosine', 'Min', 'Max', 'Conflict Ratio',
+                     'Overlap Cosine', 'Overlap Ratio', 'Top Interpretation'])
         for pk, cs in stats.get('pairwise_cosine', {}).items():
             cf = stats.get('conflict_frequency', {}).get(pk, {})
+            ao = stats.get('active_overlap', {}).get(pk, {})
+            ao_cos = ao.get('overlap_cosine', {})
+            ao_ratio = ao.get('overlap_ratio', {})
+            ao_interp = ao.get('interpretation_counts', {})
+            top_interp = max(ao_interp, key=ao_interp.get) if ao_interp else 'N/A'
             w.writerow([pk, f"{cs['mean']:.4f}", f"{cs['std']:.4f}",
-                        f"{cs['min']:.4f}", f"{cs['max']:.4f}", f"{cf.get('ratio', 0):.4f}"])
+                        f"{cs['min']:.4f}", f"{cs['max']:.4f}", f"{cf.get('ratio', 0):.4f}",
+                        f"{ao_cos.get('mean', float('nan')):.4f}",
+                        f"{ao_ratio.get('mean', 0):.4f}", top_interp])
 
     with open(os.path.join(output_dir, 'gradient_norms.csv'), 'w', newline='') as f:
         w = csv.writer(f)
@@ -700,17 +1585,66 @@ def save_results(stats, output_dir, analysis_mode='basic'):
         for t, ns in stats.get('gradient_norms', {}).items():
             w.writerow([t, f"{ns['mean']:.4f}", f"{ns['std']:.4f}", f"{ns['min']:.4f}", f"{ns['max']:.4f}"])
 
-    # Per-layer CSV
+    # Per-layer CSV (with active-overlap)
     if analysis_mode in ('full', 'direction') and 'per_group_cosine' in stats:
         layer_dir = os.path.join(output_dir, 'per_layer')
         os.makedirs(layer_dir, exist_ok=True)
         with open(os.path.join(layer_dir, 'per_layer_details.csv'), 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['Group', 'Task Pair', 'Mean Cosine', 'Std Cosine', 'Conflict Ratio'])
+            w.writerow(['Group', 'Task Pair', 'Mean Cosine', 'Std Cosine', 'Conflict Ratio',
+                         'Overlap Cosine', 'Overlap Ratio', 'Top Interpretation'])
             for gk, pks in sorted(stats['per_group_cosine'].items()):
                 for pk, cs in sorted(pks.items()):
                     cf = stats.get('per_group_conflict_frequency', {}).get(gk, {}).get(pk, {})
-                    w.writerow([gk, pk, f"{cs['mean']:.4f}", f"{cs['std']:.4f}", f"{cf.get('ratio', 0):.4f}"])
+                    ao = stats.get('per_group_active_overlap', {}).get(gk, {}).get(pk, {})
+                    ao_cos = ao.get('overlap_cosine', {})
+                    ao_ratio = ao.get('overlap_ratio', {})
+                    ao_interp = ao.get('interpretation_counts', {})
+                    top_interp = max(ao_interp, key=ao_interp.get) if ao_interp else 'N/A'
+                    w.writerow([gk, pk, f"{cs['mean']:.4f}", f"{cs['std']:.4f}",
+                                f"{cf.get('ratio', 0):.4f}",
+                                f"{ao_cos.get('mean', float('nan')):.4f}",
+                                f"{ao_ratio.get('mean', 0):.4f}", top_interp])
+
+    # SVD subspace CSV
+    pg_sub = stats.get('per_group_subspace', {})
+    if pg_sub:
+        sub_dir = os.path.join(output_dir, 'per_layer')
+        os.makedirs(sub_dir, exist_ok=True)
+        with open(os.path.join(sub_dir, 'subspace_principal_angles.csv'), 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['Group', 'Task Pair', 'Mean Angle (deg)', 'Std Angle',
+                         'Min Angle', 'Max Angle', 'Explained Var Sum 1', 'Explained Var Sum 2'])
+            for gk in sorted(pg_sub.keys()):
+                for pk in sorted(pg_sub[gk].keys()):
+                    sub = pg_sub[gk][pk]
+                    ma = sub['mean_angle_deg']
+                    mi = sub['min_angle_deg']
+                    mx = sub['max_angle_deg']
+                    ev1 = sub.get('explained_var_sum_1', {})
+                    ev2 = sub.get('explained_var_sum_2', {})
+                    w.writerow([gk, pk,
+                                f"{ma['mean']:.2f}", f"{ma['std']:.2f}",
+                                f"{mi['mean']:.2f}", f"{mx['mean']:.2f}",
+                                f"{ev1.get('mean', 0):.4f}", f"{ev2.get('mean', 0):.4f}"])
+
+    # Activation gradient CSV
+    act_cos = stats.get('activation_cosine', {})
+    if act_cos:
+        act_dir = os.path.join(output_dir, 'activation')
+        os.makedirs(act_dir, exist_ok=True)
+        with open(os.path.join(act_dir, 'activation_gradient_details.csv'), 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['Hook Point', 'Task Pair', 'Mean Cosine', 'Std Cosine',
+                         'Overlap Cosine', 'Overlap Ratio'])
+            for hp in sorted(act_cos.keys()):
+                for pk, cs in sorted(act_cos[hp].items()):
+                    act_ao = stats.get('activation_active_overlap', {}).get(hp, {}).get(pk, {})
+                    ao_cos = act_ao.get('overlap_cosine', {})
+                    ao_ratio = act_ao.get('overlap_ratio', {})
+                    w.writerow([hp, pk, f"{cs['mean']:.4f}", f"{cs['std']:.4f}",
+                                f"{ao_cos.get('mean', float('nan')):.4f}",
+                                f"{ao_ratio.get('mean', 0):.4f}"])
 
     print(f"Results saved to {output_dir}")
 
@@ -722,12 +1656,22 @@ def print_summary(stats, analysis_mode='basic', focus_task='plan'):
     print(f"\nAnalyzed {stats['num_batches']} batches")
 
     print("\n--- Pairwise Cosine Similarity (Mean +/- Std) ---")
+    print(f"  {'Pair':20s}  {'Raw Cosine':>16s}  {'Overlap Cosine':>16s}  {'Overlap%':>8s}  {'Interp':>18s}")
+    print(f"  {'-'*20}  {'-'*16}  {'-'*16}  {'-'*8}  {'-'*18}")
     for pk, cs in sorted(stats.get('pairwise_cosine', {}).items()):
         cf = stats.get('conflict_frequency', {}).get(pk, {})
         ratio = cf.get('ratio', 0)
         marker = " << CONFLICT" if ratio > 0.3 else ""
-        print(f"  {pk:20s}: {cs['mean']:+.4f} +/- {cs['std']:.4f}  "
-              f"(conflict rate: {ratio * 100:.1f}%){marker}")
+        ao = stats.get('active_overlap', {}).get(pk, {})
+        ao_cos = ao.get('overlap_cosine', {})
+        ao_ratio = ao.get('overlap_ratio', {})
+        ao_interp = ao.get('interpretation_counts', {})
+        # Most common interpretation
+        top_interp = max(ao_interp, key=ao_interp.get) if ao_interp else 'N/A'
+        ao_cos_str = f"{ao_cos['mean']:+.4f}" if ao_cos and 'mean' in ao_cos else "N/A"
+        ao_ratio_str = f"{ao_ratio['mean']*100:.1f}%" if ao_ratio and 'mean' in ao_ratio else "N/A"
+        print(f"  {pk:20s}  {cs['mean']:+.4f} +/- {cs['std']:.4f}"
+              f"  {ao_cos_str:>16s}  {ao_ratio_str:>8s}  {top_interp:>18s}{marker}")
 
     print("\n--- Gradient Norms (Mean +/- Std) ---")
     for t, ns in sorted(stats.get('gradient_norms', {}).items()):
@@ -748,7 +1692,7 @@ def print_summary(stats, analysis_mode='basic', focus_task='plan'):
         intf = stats.get('interference', {})
         if intf:
             print(f"\n--- Interference on '{focus_task}' (higher = worse) ---")
-            for t in ['det', 'map', 'motion']:
+            for t in ['det', 'map', 'motion', 'ego']:
                 key = f"{t}_on_{focus_task}"
                 if key in intf:
                     print(f"  {t:10s} -> {focus_task}: {intf[key]['mean']:.4f} +/- {intf[key]['std']:.4f}")
@@ -767,6 +1711,61 @@ def print_summary(stats, analysis_mode='basic', focus_task='plan'):
                 ratio = cf.get('ratio', 0)
                 print(f"  {gk:25s} | {pk:20s} | cos={mean_cos:+.4f} | conflict={ratio * 100:.1f}%")
 
+    # SVD subspace principal angle summary
+    pg_sub = stats.get('per_group_subspace', {})
+    if pg_sub:
+        print(f"\n--- SVD Subspace Principal Angles (top-k singular vectors) ---")
+        print(f"  {'Group':25s}  {'Pair':20s}  {'Mean Angle':>10s}  {'Min':>6s}  {'Max':>6s}  {'EV%_1':>6s}  {'EV%_2':>6s}  {'Interpretation'}")
+        print(f"  {'-'*25}  {'-'*20}  {'-'*10}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*20}")
+        # Sort by mean angle descending to show most separated first
+        entries = []
+        for gk, pks in pg_sub.items():
+            for pk, sub in pks.items():
+                ma = sub['mean_angle_deg']['mean']
+                entries.append((gk, pk, sub))
+        entries.sort(key=lambda x: -x[2]['mean_angle_deg']['mean'])
+        for gk, pk, sub in entries[:15]:
+            ma = sub['mean_angle_deg']['mean']
+            mi = sub['min_angle_deg']['mean']
+            mx = sub['max_angle_deg']['mean']
+            ev1 = sub.get('explained_var_sum_1', {}).get('mean', 0)
+            ev2 = sub.get('explained_var_sum_2', {}).get('mean', 0)
+            if ma > 75:
+                interp = 'SEPARATED'
+            elif ma > 45:
+                interp = 'partial_overlap'
+            else:
+                interp = 'shared_subspace'
+            print(f"  {gk:25s}  {pk:20s}  {ma:>8.1f}°  {mi:>5.1f}°  {mx:>5.1f}°  {ev1*100:>5.1f}%  {ev2*100:>5.1f}%  {interp}")
+
+        # Diagnostic: high angle + low cosine → token-wise independence masking
+        high_angle_low_cos = []
+        for gk, pks in pg_sub.items():
+            for pk, sub in pks.items():
+                ma = sub['mean_angle_deg']['mean']
+                cos_stats = stats.get('per_group_cosine', {}).get(gk, {}).get(pk, {})
+                cos_mean = cos_stats.get('mean', float('nan')) if cos_stats else float('nan')
+                if ma > 60 and abs(cos_mean) < 0.15:
+                    high_angle_low_cos.append((gk, pk, ma, cos_mean))
+        if high_angle_low_cos:
+            print(f"\n  DIAGNOSTIC: Subspace separation may explain near-zero cosine:")
+            for gk, pk, angle, cos in high_angle_low_cos:
+                print(f"    - {gk} | {pk}: angle={angle:.1f}°, cos={cos:+.4f} → likely token-wise independence")
+
+    # Activation gradient summary
+    act_cos = stats.get('activation_cosine', {})
+    if act_cos:
+        print(f"\n--- Activation Gradient Cosine (representation-level conflict) ---")
+        for hp in sorted(act_cos.keys()):
+            pks = act_cos[hp]
+            print(f"  [{hp}]")
+            act_ao = stats.get('activation_active_overlap', {}).get(hp, {})
+            for pk, cs in sorted(pks.items()):
+                ao = act_ao.get(pk, {})
+                ao_cos = ao.get('overlap_cosine', {})
+                ao_cos_str = f"  overlap_cos={ao_cos['mean']:+.4f}" if ao_cos and 'mean' in ao_cos else ""
+                print(f"    {pk:20s}: cos={cs['mean']:+.4f} +/- {cs['std']:.4f}{ao_cos_str}")
+
     print("\n--- Conflict Assessment ---")
     high = [(k, v['ratio']) for k, v in stats.get('conflict_frequency', {}).items() if v['ratio'] > 0.3]
     if high:
@@ -775,6 +1774,28 @@ def print_summary(stats, analysis_mode='basic', focus_task='plan'):
             print(f"    - {pair}: {ratio * 100:.1f}%")
     else:
         print("  No significant gradient conflicts detected.")
+
+    # Active-overlap diagnostic
+    ao_stats = stats.get('active_overlap', {})
+    if ao_stats:
+        hidden = [(pk, ao) for pk, ao in ao_stats.items()
+                  if ao.get('interpretation_counts', {}).get('hidden_conflict', 0) > 0]
+        if hidden:
+            print("\n  DIAGNOSTIC: Hidden conflicts detected (raw cosine ~0 but overlap cosine < 0):")
+            for pk, ao in hidden:
+                hc = ao['interpretation_counts']['hidden_conflict']
+                total = sum(ao['interpretation_counts'].values())
+                print(f"    - {pk}: hidden_conflict in {hc}/{total} batches "
+                      f"(overlap_cos={ao['overlap_cosine']['mean']:+.4f})")
+        disjoint = [(pk, ao) for pk, ao in ao_stats.items()
+                    if ao.get('interpretation_counts', {}).get('disjoint', 0) > 0]
+        if disjoint:
+            print("\n  DIAGNOSTIC: Disjoint gradient support (tasks update different coordinates):")
+            for pk, ao in disjoint:
+                dc = ao['interpretation_counts']['disjoint']
+                total = sum(ao['interpretation_counts'].values())
+                print(f"    - {pk}: disjoint in {dc}/{total} batches "
+                      f"(overlap_ratio={ao['overlap_ratio']['mean']*100:.1f}%)")
 
     print("=" * 70 + "\n")
 
@@ -794,11 +1815,11 @@ def create_basic_visualizations(stats, output_dir):
         return
 
     os.makedirs(output_dir, exist_ok=True)
-    task_names = ['plan', 'det', 'map', 'motion']
+    task_names = ['plan', 'det', 'map', 'motion', 'ego']
 
     # 1. Heatmap
     n = len(task_names)
-    mat = np.ones((n, n))
+    mat = np.eye(n)
     for i, t1 in enumerate(task_names):
         for j, t2 in enumerate(task_names):
             if i != j:
@@ -1002,7 +2023,7 @@ def create_per_layer_visualizations(stats, group_meta, output_dir):
 
     # --- Plot 7: Per-Layer Gradient Norm Dominance ---
     if pg_norms:
-        task_names = ['det', 'map', 'motion', 'plan']
+        task_names = ['det', 'map', 'motion', 'ego', 'plan']
         available_tasks = set()
         for gk in sorted_gks:
             available_tasks.update(pg_norms.get(gk, {}).keys())
@@ -1067,7 +2088,7 @@ def create_advanced_visualizations(stats, group_meta, output_dir, focus_task='pl
     adv_dir = os.path.join(output_dir, 'advanced')
     os.makedirs(adv_dir, exist_ok=True)
 
-    task_names = ['det', 'map', 'motion', 'plan']
+    task_names = ['det', 'map', 'motion', 'ego', 'plan']
 
     # --- Plot 9: Interference Magnitude (asymmetric heatmap) ---
     intf = stats.get('interference', {})
@@ -1269,6 +2290,343 @@ def create_advanced_visualizations(stats, group_meta, output_dir, focus_task='pl
         plt.close()
 
     print(f"Advanced visualizations saved to {adv_dir}")
+
+
+# ============================================================================
+# Visualizations — Active-Overlap & Activation Gradient
+# ============================================================================
+
+def create_active_overlap_visualizations(stats, group_meta, output_dir):
+    """Visualize active-overlap analysis results."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        print("Warning: matplotlib/seaborn not installed.")
+        return
+
+    ao_dir = os.path.join(output_dir, 'active_overlap')
+    os.makedirs(ao_dir, exist_ok=True)
+
+    # --- Overall Active-Overlap Comparison ---
+    ao_stats = stats.get('active_overlap', {})
+    cos_stats = stats.get('pairwise_cosine', {})
+    if ao_stats and cos_stats:
+        pairs = sorted(ao_stats.keys())
+        raw_means = [cos_stats.get(pk, {}).get('mean', 0) for pk in pairs]
+        overlap_means = [ao_stats[pk].get('overlap_cosine', {}).get('mean', 0) for pk in pairs]
+        overlap_ratios = [ao_stats[pk].get('overlap_ratio', {}).get('mean', 0) for pk in pairs]
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Panel 1: Raw vs Overlap cosine
+        x = np.arange(len(pairs))
+        width = 0.35
+        axes[0].bar(x - width/2, raw_means, width, label='Raw Cosine', color='steelblue', alpha=0.7)
+        axes[0].bar(x + width/2, overlap_means, width, label='Overlap Cosine', color='coral', alpha=0.7)
+        axes[0].axhline(0, color='k', linewidth=0.5)
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(pairs, rotation=45, ha='right', fontsize=7)
+        axes[0].set_ylabel('Cosine Similarity')
+        axes[0].set_title('Raw vs Active-Overlap Cosine')
+        axes[0].legend(fontsize=8)
+
+        # Panel 2: Overlap ratio
+        colors = ['#e74c3c' if r < 0.1 else '#f39c12' if r < 0.3 else '#2ecc71' for r in overlap_ratios]
+        axes[1].bar(x, overlap_ratios, color=colors, alpha=0.7)
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(pairs, rotation=45, ha='right', fontsize=7)
+        axes[1].set_ylabel('Overlap Ratio')
+        axes[1].set_title('Active Coordinate Overlap Ratio\n(Low = disjoint gradient support)')
+        axes[1].set_ylim(0, 1)
+
+        # Panel 3: Interpretation distribution
+        interp_types = ['cooperative', 'true_orthogonal', 'disjoint', 'hidden_conflict', 'conflict']
+        interp_colors = {'cooperative': '#2ecc71', 'true_orthogonal': '#3498db',
+                         'disjoint': '#f39c12', 'hidden_conflict': '#e74c3c', 'conflict': '#c0392b'}
+        bottom = np.zeros(len(pairs))
+        for it in interp_types:
+            vals = []
+            for pk in pairs:
+                counts = ao_stats[pk].get('interpretation_counts', {})
+                total = max(sum(counts.values()), 1)
+                vals.append(counts.get(it, 0) / total)
+            axes[2].bar(x, vals, bottom=bottom, label=it,
+                        color=interp_colors.get(it, 'gray'), alpha=0.8)
+            bottom += np.array(vals)
+        axes[2].set_xticks(x)
+        axes[2].set_xticklabels(pairs, rotation=45, ha='right', fontsize=7)
+        axes[2].set_ylabel('Fraction')
+        axes[2].set_title('Interpretation Distribution')
+        axes[2].legend(fontsize=7, loc='upper right')
+
+        plt.suptitle('Active-Overlap Gradient Analysis', fontsize=13)
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
+        plt.savefig(os.path.join(ao_dir, 'active_overlap_summary.png'), dpi=150)
+        plt.close()
+
+    # --- Per-Group Active-Overlap Heatmap ---
+    pg_ao = stats.get('per_group_active_overlap', {})
+    pg_cos = stats.get('per_group_cosine', {})
+    if pg_ao and pg_cos:
+        sorted_gks = sorted(pg_cos.keys(), key=lambda gk: (
+            group_meta.get(gk, {}).get('decoder_idx', 99),
+            group_meta.get(gk, {}).get('global_layer_idx', 99),
+        ))
+        pair_keys = [f"{t1}_vs_{t2}" for t1, t2 in TASK_PAIRS]
+
+        # Raw cosine heatmap vs overlap cosine heatmap side by side
+        mat_raw = np.full((len(sorted_gks), len(pair_keys)), np.nan)
+        mat_overlap = np.full((len(sorted_gks), len(pair_keys)), np.nan)
+        mat_ratio = np.full((len(sorted_gks), len(pair_keys)), np.nan)
+
+        for i, gk in enumerate(sorted_gks):
+            for j, pk in enumerate(pair_keys):
+                cs = pg_cos.get(gk, {}).get(pk)
+                if cs:
+                    mat_raw[i, j] = cs['mean']
+                ao = pg_ao.get(gk, {}).get(pk, {})
+                ao_cos = ao.get('overlap_cosine', {})
+                ao_ratio_d = ao.get('overlap_ratio', {})
+                if ao_cos and 'mean' in ao_cos:
+                    mat_overlap[i, j] = ao_cos['mean']
+                if ao_ratio_d and 'mean' in ao_ratio_d:
+                    mat_ratio[i, j] = ao_ratio_d['mean']
+
+        fig, axes = plt.subplots(1, 3, figsize=(24, max(6, len(sorted_gks) * 0.35)))
+        sns.heatmap(mat_raw, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
+                    xticklabels=pair_keys, yticklabels=sorted_gks,
+                    vmin=-1, vmax=1, ax=axes[0], linewidths=0.5)
+        axes[0].set_title('Raw Cosine Similarity')
+
+        sns.heatmap(mat_overlap, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
+                    xticklabels=pair_keys, yticklabels=sorted_gks,
+                    vmin=-1, vmax=1, ax=axes[1], linewidths=0.5)
+        axes[1].set_title('Active-Overlap Cosine')
+
+        sns.heatmap(mat_ratio, annot=True, fmt='.2f', cmap='YlOrRd_r',
+                    xticklabels=pair_keys, yticklabels=sorted_gks,
+                    vmin=0, vmax=1, ax=axes[2], linewidths=0.5)
+        axes[2].set_title('Overlap Ratio (low = disjoint)')
+
+        plt.suptitle('Per-Operation: Raw vs Overlap Cosine & Overlap Ratio', fontsize=13)
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
+        plt.savefig(os.path.join(ao_dir, 'per_operation_active_overlap.png'), dpi=150)
+        plt.close()
+
+    print(f"Active-overlap visualizations saved to {ao_dir}")
+
+
+def create_subspace_visualizations(stats, group_meta, output_dir):
+    """Visualize SVD subspace principal angle analysis."""
+    pg_sub = stats.get('per_group_subspace', {})
+    if not pg_sub:
+        return
+
+    sub_dir = os.path.join(output_dir, 'subspace')
+    os.makedirs(sub_dir, exist_ok=True)
+
+    # 1. Heatmap: mean principal angle per (group, pair)
+    groups = sorted(pg_sub.keys())
+    all_pairs = set()
+    for gk in groups:
+        all_pairs.update(pg_sub[gk].keys())
+    pairs = sorted(all_pairs)
+
+    if not groups or not pairs:
+        return
+
+    angle_matrix = np.full((len(groups), len(pairs)), np.nan)
+    for i, gk in enumerate(groups):
+        for j, pk in enumerate(pairs):
+            sub = pg_sub[gk].get(pk, {})
+            ma = sub.get('mean_angle_deg', {})
+            if ma and 'mean' in ma:
+                angle_matrix[i, j] = ma['mean']
+
+    fig, ax = plt.subplots(figsize=(max(10, len(pairs) * 1.2), max(6, len(groups) * 0.4)))
+    im = ax.imshow(angle_matrix, cmap='RdYlBu_r', aspect='auto', vmin=0, vmax=90)
+    ax.set_xticks(range(len(pairs)))
+    ax.set_xticklabels(pairs, rotation=45, ha='right', fontsize=8)
+    ax.set_yticks(range(len(groups)))
+    ax.set_yticklabels(groups, fontsize=8)
+    ax.set_title('SVD Subspace Principal Angles (degrees)\n'
+                 '0°=shared subspace, 90°=fully separated')
+    plt.colorbar(im, ax=ax, label='Mean Principal Angle (°)')
+
+    # Annotate cells
+    for i in range(len(groups)):
+        for j in range(len(pairs)):
+            val = angle_matrix[i, j]
+            if not np.isnan(val):
+                color = 'white' if val > 60 or val < 20 else 'black'
+                ax.text(j, i, f'{val:.0f}°', ha='center', va='center',
+                        fontsize=7, color=color)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(sub_dir, 'principal_angles_heatmap.png'), dpi=150)
+    plt.close()
+
+    # 2. Per-pair bar chart: angle by group, grouped by decoder layer
+    for pk in pairs:
+        fig, ax = plt.subplots(figsize=(max(8, len(groups) * 0.5), 5))
+        angles = []
+        labels = []
+        colors_list = []
+        for gk in groups:
+            sub = pg_sub[gk].get(pk, {})
+            ma = sub.get('mean_angle_deg', {})
+            if ma and 'mean' in ma:
+                angles.append(ma['mean'])
+                labels.append(gk)
+                meta = group_meta.get(gk, {})
+                op = meta.get('op_type', 'other')
+                # Color by op type
+                op_colors = {'ffn': '#e74c3c', 'norm': '#3498db', 'gnn': '#2ecc71',
+                             'inter_gnn': '#9b59b6', 'temp_gnn': '#f39c12',
+                             'fc_before': '#95a5a6', 'fc_after': '#7f8c8d'}
+                colors_list.append(op_colors.get(op, '#bdc3c7'))
+
+        if angles:
+            x = range(len(angles))
+            ax.bar(x, angles, color=colors_list, edgecolor='black', linewidth=0.5)
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=60, ha='right', fontsize=7)
+            ax.set_ylabel('Mean Principal Angle (°)')
+            ax.set_title(f'Subspace Separation: {pk}')
+            ax.axhline(y=45, color='orange', linestyle='--', alpha=0.7, label='45° (partial)')
+            ax.axhline(y=75, color='red', linestyle='--', alpha=0.7, label='75° (separated)')
+            ax.set_ylim(0, 95)
+            ax.legend(fontsize=8)
+            plt.tight_layout()
+            safe_pk = pk.replace(' ', '_')
+            plt.savefig(os.path.join(sub_dir, f'principal_angles_{safe_pk}.png'), dpi=150)
+            plt.close()
+
+    # 3. Scatter: cosine vs principal angle (diagnostic)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for gk in groups:
+        for pk in pairs:
+            sub = pg_sub[gk].get(pk, {})
+            ma = sub.get('mean_angle_deg', {})
+            cos_stats = stats.get('per_group_cosine', {}).get(gk, {}).get(pk, {})
+            if ma and 'mean' in ma and cos_stats and 'mean' in cos_stats:
+                angle = ma['mean']
+                cos_val = cos_stats['mean']
+                ax.scatter(cos_val, angle, alpha=0.6, s=20)
+    ax.set_xlabel('Weight Gradient Cosine Similarity')
+    ax.set_ylabel('SVD Principal Angle (°)')
+    ax.set_title('Cosine vs Subspace Angle\n'
+                 '(high angle + low cosine → token-wise independence)')
+    ax.axhline(y=60, color='red', linestyle='--', alpha=0.5)
+    ax.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
+
+    # Annotate quadrants
+    ax.text(0.05, 85, 'Separated subspaces\n(disjoint update)', fontsize=8,
+            color='red', alpha=0.7)
+    ax.text(-0.4, 20, 'Conflict in\nshared subspace', fontsize=8,
+            color='blue', alpha=0.7)
+    ax.text(0.2, 20, 'Cooperative in\nshared subspace', fontsize=8,
+            color='green', alpha=0.7)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(sub_dir, 'cosine_vs_angle_scatter.png'), dpi=150)
+    plt.close()
+
+    print(f"Subspace visualizations saved to {sub_dir}")
+
+
+def create_activation_visualizations(stats, output_dir):
+    """Visualize activation gradient analysis results."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        print("Warning: matplotlib/seaborn not installed.")
+        return
+
+    act_cos = stats.get('activation_cosine', {})
+    if not act_cos:
+        return
+
+    act_dir = os.path.join(output_dir, 'activation')
+    os.makedirs(act_dir, exist_ok=True)
+
+    hook_points = sorted(act_cos.keys())
+    pair_keys = sorted(set(pk for hp in hook_points for pk in act_cos[hp].keys()))
+
+    # --- Activation Cosine Heatmap ---
+    mat = np.full((len(hook_points), len(pair_keys)), np.nan)
+    for i, hp in enumerate(hook_points):
+        for j, pk in enumerate(pair_keys):
+            cs = act_cos.get(hp, {}).get(pk)
+            if cs:
+                mat[i, j] = cs['mean']
+
+    fig, ax = plt.subplots(figsize=(max(10, len(pair_keys) * 1.2), max(6, len(hook_points) * 0.4)))
+    sns.heatmap(mat, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
+                xticklabels=pair_keys, yticklabels=hook_points,
+                vmin=-1, vmax=1, ax=ax, linewidths=0.5)
+    ax.set_title('Activation Gradient Cosine Similarity\n(representation-level conflict)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(act_dir, 'activation_cosine_heatmap.png'), dpi=150)
+    plt.close()
+
+    # --- Weight vs Activation comparison (bar chart for each pair) ---
+    weight_cos = stats.get('pairwise_cosine', {})
+    if weight_cos:
+        # Compare weight-level and activation-level cosine for key pairs
+        fig, ax = plt.subplots(figsize=(12, 6))
+        all_pairs = sorted(weight_cos.keys())
+        x = np.arange(len(all_pairs))
+        width = 0.8 / (len(hook_points) + 1)
+
+        # Weight-level bar
+        w_means = [weight_cos.get(pk, {}).get('mean', 0) for pk in all_pairs]
+        ax.bar(x, w_means, width, label='Weight gradient', color='steelblue', alpha=0.8)
+
+        # Activation-level bars (one per hook point)
+        act_colors = plt.cm.Set2(np.linspace(0, 1, len(hook_points)))
+        for hi, hp in enumerate(hook_points):
+            a_means = [act_cos.get(hp, {}).get(pk, {}).get('mean', 0) for pk in all_pairs]
+            ax.bar(x + (hi + 1) * width, a_means, width, label=f'Act: {hp}',
+                   color=act_colors[hi], alpha=0.8)
+
+        ax.axhline(0, color='k', linewidth=0.5)
+        ax.set_xticks(x + width * len(hook_points) / 2)
+        ax.set_xticklabels(all_pairs, rotation=45, ha='right', fontsize=7)
+        ax.set_ylabel('Mean Cosine Similarity')
+        ax.set_title('Weight Gradient vs Activation Gradient Cosine')
+        ax.legend(fontsize=7, loc='best', ncol=2)
+        plt.tight_layout()
+        plt.savefig(os.path.join(act_dir, 'weight_vs_activation_cosine.png'), dpi=150)
+        plt.close()
+
+    # --- Activation Norms per Hook Point ---
+    act_norms = stats.get('activation_norms', {})
+    if act_norms:
+        task_names = sorted(set(t for hp in act_norms for t in act_norms[hp].keys()))
+        fig, ax = plt.subplots(figsize=(max(12, len(hook_points) * 1.5), 6))
+        x = np.arange(len(hook_points))
+        width = 0.8 / len(task_names)
+        for ti, task in enumerate(task_names):
+            means = [act_norms.get(hp, {}).get(task, {}).get('mean', 0) for hp in hook_points]
+            ax.bar(x + ti * width, means, width, label=task,
+                   color=TASK_COLORS.get(task, 'gray'), alpha=0.8)
+        ax.set_xticks(x + width * len(task_names) / 2)
+        ax.set_xticklabels(hook_points, rotation=45, ha='right', fontsize=8)
+        ax.set_ylabel('Activation Gradient Norm')
+        ax.set_title('Per-Hook-Point Activation Gradient Magnitude')
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(act_dir, 'activation_norm_per_hookpoint.png'), dpi=150)
+        plt.close()
+
+    print(f"Activation gradient visualizations saved to {act_dir}")
 
 
 # ============================================================================
@@ -2653,13 +4011,73 @@ def generate_recommendations(stats, output_dir, focus_task='plan', baseline_resu
     lines.append("-" * 40)
     intf = stats.get('interference', {})
     if intf:
-        for t in ['det', 'map', 'motion']:
+        for t in ['det', 'map', 'motion', 'ego']:
             key = f"{t}_on_{focus_task}"
             if key in intf:
                 v = intf[key]['mean']
                 severity = "HIGH" if v > 1.0 else "MODERATE" if v > 0.3 else "LOW"
                 lines.append(f"  {t:10s} -> {focus_task}: {v:.4f} ({severity})")
     lines.append("")
+
+    # 3.5 Active-overlap diagnostic
+    ao_stats = stats.get('active_overlap', {})
+    if ao_stats:
+        lines.append("3.5 ACTIVE-OVERLAP DIAGNOSTIC")
+        lines.append("-" * 40)
+        lines.append("  Distinguishes: disjoint (separate coordinates) vs true_orthogonal vs hidden_conflict")
+        lines.append("")
+        for pk in sorted(ao_stats.keys()):
+            ao = ao_stats[pk]
+            ao_cos = ao.get('overlap_cosine', {})
+            ao_ratio = ao.get('overlap_ratio', {})
+            interp = ao.get('interpretation_counts', {})
+            top_interp = max(interp, key=interp.get) if interp else 'N/A'
+            ao_cos_str = f"{ao_cos['mean']:+.4f}" if ao_cos and 'mean' in ao_cos else 'N/A'
+            ao_ratio_str = f"{ao_ratio['mean']*100:.1f}%" if ao_ratio and 'mean' in ao_ratio else 'N/A'
+            lines.append(f"  {pk:20s}: overlap_cos={ao_cos_str}, overlap_ratio={ao_ratio_str}, "
+                         f"dominant={top_interp}")
+        lines.append("")
+
+        hidden = [pk for pk, ao in ao_stats.items()
+                  if ao.get('interpretation_counts', {}).get('hidden_conflict', 0) > 0]
+        if hidden:
+            lines.append("  WARNING: Hidden conflicts found (zero-padded gradients masking real conflict):")
+            for pk in hidden:
+                lines.append(f"    - {pk}")
+            lines.append("  → Weight-level cosine underestimates conflict for these pairs.")
+            lines.append("  → Focus gradient surgery on the active-overlap region.")
+        lines.append("")
+
+    # 3.7 Activation gradient diagnostic
+    act_cos = stats.get('activation_cosine', {})
+    if act_cos:
+        lines.append("3.7 ACTIVATION GRADIENT DIAGNOSTIC (representation-level)")
+        lines.append("-" * 40)
+        lines.append("  Measures how tasks want to change shared intermediate representations.")
+        lines.append("")
+        for hp in sorted(act_cos.keys()):
+            lines.append(f"  [{hp}]")
+            for pk, cs in sorted(act_cos[hp].items()):
+                severity = "CONFLICT" if cs['mean'] < -0.1 else "COOPERATIVE" if cs['mean'] > 0.1 else "NEUTRAL"
+                lines.append(f"    {pk:20s}: cos={cs['mean']:+.4f} +/- {cs['std']:.4f} ({severity})")
+        lines.append("")
+
+        # Check for weight-activation discrepancy
+        weight_cos = stats.get('pairwise_cosine', {})
+        discrepancies = []
+        for hp in act_cos:
+            for pk in act_cos[hp]:
+                w_cos = weight_cos.get(pk, {}).get('mean', 0)
+                a_cos = act_cos[hp][pk].get('mean', 0)
+                if abs(w_cos - a_cos) > 0.15:
+                    discrepancies.append((hp, pk, w_cos, a_cos))
+        if discrepancies:
+            lines.append("  FINDING: Weight vs activation gradient discrepancies:")
+            for hp, pk, w, a in sorted(discrepancies, key=lambda x: abs(x[2]-x[3]), reverse=True)[:10]:
+                lines.append(f"    {hp} / {pk}: weight_cos={w:+.4f}, act_cos={a:+.4f} (delta={a-w:+.4f})")
+            lines.append("  → Activation-level conflict may exist even when weight gradients appear aligned.")
+            lines.append("  → Consider representation-level interventions (e.g., stop-gradient, task-specific heads).")
+        lines.append("")
 
     # 4. Per-layer hotspots
     lines.append("4. PER-LAYER CONFLICT HOTSPOTS")
@@ -2788,6 +4206,7 @@ def _gpu_worker(
     seed: int,
     batch_offset: int,
     result_path: str,
+    modular: bool = False,
 ):
     """Worker function for multi-GPU gradient analysis.
 
@@ -2813,7 +4232,8 @@ def _gpu_worker(
     model = model.to(device)
     model = MMDataParallel(model, device_ids=[gpu_id])
 
-    param_groups, group_meta = get_shared_parameters_grouped(model, shared_layers, last_n_layers)
+    param_groups, group_meta = get_shared_parameters_grouped(
+        model, shared_layers, last_n_layers, modular=modular)
 
     dataset = custom_build_dataset(cfg.data.train)
     dataloader = DataLoader(
@@ -2907,6 +4327,7 @@ def run_multi_gpu_analysis(args):
                 not args.no_selective_eval, args.seed + gpu_id * 1000,
                 batch_offset, result_paths[gpu_id],
             ),
+            kwargs={'modular': getattr(args, 'modular', False)},
         )
         processes.append(p)
         batch_offset += n
@@ -2963,13 +4384,14 @@ def parse_args():
     parser.add_argument('--num-gpus', type=int, default=1,
                         help='Number of GPUs for parallel analysis. Uses GPU 0..N-1. '
                              'Overrides --device when > 1.')
-    parser.add_argument('--fp16', action='store_true', default=True,
-                        help='Use FP16 (default: True, matching training config)')
+    parser.add_argument('--fp16', action='store_true', default=False,
+                        help='Use FP16 (default: False — GradScaler not available, '
+                             'FP16 backward produces NaN for deeper layers)')
     parser.add_argument('--no-fp16', dest='fp16', action='store_false',
                         help='Disable FP16')
     parser.add_argument('--shared-layers', type=str, nargs='+',
-                        default=['gnn', 'temp_gnn', 'inter_gnn', 'ffn', 'norm', 'fc_before', 'fc_after'],
-                        help='Names of shared layers to analyze')
+                        default=['backbone', 'neck', 'inter_gnn', 'ffn', 'norm', 'fc_before', 'fc_after'],
+                        help='Names of shared layers to analyze (includes backbone/neck and decoder ops)')
     parser.add_argument('--last-n-layers', type=int, default=None,
                         help='Only analyze last N decoder layers (default: all)')
     parser.add_argument('--seed', type=int, default=42,
@@ -2987,6 +4409,22 @@ def parse_args():
                         help='Disable selective eval (keep original train mode behavior)')
     parser.add_argument('--random-baseline', action='store_true',
                         help='Run random baseline comparison with statistical tests and bimodality analysis')
+    parser.add_argument('--activation', action='store_true',
+                        help='Run activation gradient analysis (hooks FPN, deformable, inter_gnn). '
+                             'Requires extra forward pass with hooks. Single-GPU only.')
+    parser.add_argument('--activation-batches', type=int, default=None,
+                        help='Number of batches for activation analysis (default: same as --num-batches). '
+                             'Activation analysis uses more GPU memory, so fewer batches may be needed.')
+    parser.add_argument('--modular', action='store_true', default=True,
+                        help='MGCM-style fine-grained module decomposition: split attention '
+                             'into QKV/O, FFN into W1/W2, etc. Reveals conflicts masked at '
+                             'operation level.')
+    parser.add_argument('--no-modular', dest='modular', action='store_false',
+                        help='Disable MGCM-style modular decomposition')
+    parser.add_argument('--num-splits', type=int, default=1,
+                        help='Split collected batches into N equal sets and produce separate '
+                             'statistics for each (e.g., --num-batches 128 --num-splits 2 → '
+                             '2 sets of 64-batch statistics for reproducibility check)')
     parser.add_argument('--checkpoints', type=str, nargs='+', default=None,
                         help='Multiple checkpoint paths for epoch-wise dynamics analysis')
     parser.add_argument('--checkpoint-labels', type=str, nargs='+', default=None,
@@ -3081,7 +4519,8 @@ def main():
 
         # Get grouped shared parameters
         param_groups, group_meta = get_shared_parameters_grouped(
-            model, args.shared_layers, args.last_n_layers
+            model, args.shared_layers, args.last_n_layers,
+            modular=getattr(args, 'modular', False),
         )
 
         total_groups = len(param_groups)
@@ -3143,54 +4582,148 @@ def main():
 
         stats = aggregate_results(all_results, analysis_mode=args.analysis_mode)
 
-    print_summary(stats, analysis_mode=args.analysis_mode, focus_task=args.focus_task)
-    save_results(stats, args.output_dir, analysis_mode=args.analysis_mode)
+    # Activation gradient analysis (separate pass with hooks, single-GPU only)
+    if args.activation and args.num_gpus <= 1:
+        act_batches = args.activation_batches or args.num_batches
+        print(f"\n{'='*60}")
+        print(f"ACTIVATION GRADIENT ANALYSIS ({act_batches} batches)")
+        print(f"{'='*60}")
 
-    if not args.no_plots:
-        try:
-            create_basic_visualizations(stats, args.output_dir)
-        except Exception as e:
-            print(f"Warning: Failed to create basic visualizations: {e}")
+        act_results = []
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        data_iter = iter(dataloader)
+        for batch_idx in range(act_batches):
+            try:
+                data = next(data_iter)
+            except StopIteration:
+                break
+            print(f"  Activation batch {batch_idx + 1}/{act_batches}...", end='\r')
+            try:
+                act_result = analyze_activation_gradients_single_batch(
+                    model, data, args.device,
+                    fp16=args.fp16, selective_eval=not args.no_selective_eval,
+                )
+                act_results.append(act_result)
+            except Exception as e:
+                print(f"\n  Warning: Activation batch {batch_idx} failed: {e}")
+                continue
+            if (batch_idx + 1) % 3 == 0:
+                torch.cuda.empty_cache()
 
+        print(f"\n  Processed {len(act_results)} activation batches")
+
+        # Merge activation results into all_results for aggregation
+        # (pad the shorter list with empty dicts)
+        for i, ar in enumerate(act_results):
+            if i < len(all_results):
+                all_results[i].update(ar)
+            else:
+                all_results.append(ar)
+
+        # Re-aggregate with activation data
+        stats = aggregate_results(all_results, analysis_mode=args.analysis_mode)
+    elif args.activation and args.num_gpus > 1:
+        print("Warning: --activation is only supported in single-GPU mode. Skipping.")
+
+    # Split all_results into N sets for reproducibility analysis
+    num_splits = getattr(args, 'num_splits', 1)
+    if num_splits > 1:
+        split_size = len(all_results) // num_splits
+        splits = []
+        for s in range(num_splits):
+            start = s * split_size
+            end = start + split_size if s < num_splits - 1 else len(all_results)
+            splits.append(all_results[start:end])
+        print(f"\n{'='*60}")
+        print(f"SPLIT ANALYSIS: {num_splits} sets of ~{split_size} batches each")
+        print(f"{'='*60}")
+    else:
+        splits = [all_results]
+
+    for split_idx, split_results in enumerate(splits):
+        if num_splits > 1:
+            split_label = f"split{split_idx+1}"
+            split_output_dir = os.path.join(args.output_dir, split_label)
+            print(f"\n{'='*60}")
+            print(f"[{split_label}] Aggregating batches {split_idx*split_size+1}~"
+                  f"{split_idx*split_size+len(split_results)} "
+                  f"({len(split_results)} batches)")
+            print(f"{'='*60}")
+        else:
+            split_label = None
+            split_output_dir = args.output_dir
+
+        split_stats = aggregate_results(split_results, analysis_mode=args.analysis_mode)
+
+        print_summary(split_stats, analysis_mode=args.analysis_mode, focus_task=args.focus_task)
+        save_results(split_stats, split_output_dir, analysis_mode=args.analysis_mode)
+
+        if not args.no_plots:
+            try:
+                create_basic_visualizations(split_stats, split_output_dir)
+            except Exception as e:
+                print(f"Warning: Failed to create basic visualizations: {e}")
+
+            if args.analysis_mode in ('full', 'direction'):
+                try:
+                    create_per_layer_visualizations(split_stats, group_meta, split_output_dir)
+                except Exception as e:
+                    print(f"Warning: Failed to create per-layer visualizations: {e}")
+
+                try:
+                    create_advanced_visualizations(split_stats, group_meta, split_output_dir, focus_task=args.focus_task)
+                except Exception as e:
+                    print(f"Warning: Failed to create advanced visualizations: {e}")
+
+                # Active-overlap visualizations
+                try:
+                    create_active_overlap_visualizations(split_stats, group_meta, split_output_dir)
+                except Exception as e:
+                    print(f"Warning: Failed to create active-overlap visualizations: {e}")
+
+                # SVD subspace visualizations
+                if split_stats.get('per_group_subspace'):
+                    try:
+                        create_subspace_visualizations(split_stats, group_meta, split_output_dir)
+                    except Exception as e:
+                        print(f"Warning: Failed to create subspace visualizations: {e}")
+
+            # Activation gradient visualizations
+            if split_stats.get('activation_cosine'):
+                try:
+                    create_activation_visualizations(split_stats, split_output_dir)
+                except Exception as e:
+                    print(f"Warning: Failed to create activation visualizations: {e}")
+
+            if args.analysis_mode == 'direction':
+                try:
+                    create_direction_visualizations(split_stats, split_output_dir, group_meta=group_meta)
+                except Exception as e:
+                    print(f"Warning: Failed to create direction visualizations: {e}")
+
+        # Random baseline comparison & bimodality analysis
+        baseline_results = None
+        if args.random_baseline:
+            try:
+                baseline_results = run_random_baseline_analysis(split_stats, split_output_dir)
+                if not args.no_plots:
+                    create_baseline_visualizations(split_stats, baseline_results, split_output_dir)
+            except Exception as e:
+                print(f"Warning: Failed to run random baseline analysis: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Generate recommendations
         if args.analysis_mode in ('full', 'direction'):
             try:
-                create_per_layer_visualizations(stats, group_meta, args.output_dir)
+                rec = generate_recommendations(
+                    split_stats, split_output_dir, focus_task=args.focus_task,
+                    baseline_results=baseline_results,
+                )
+                print("\n" + rec)
             except Exception as e:
-                print(f"Warning: Failed to create per-layer visualizations: {e}")
-
-            try:
-                create_advanced_visualizations(stats, group_meta, args.output_dir, focus_task=args.focus_task)
-            except Exception as e:
-                print(f"Warning: Failed to create advanced visualizations: {e}")
-
-        if args.analysis_mode == 'direction':
-            try:
-                create_direction_visualizations(stats, args.output_dir, group_meta=group_meta)
-            except Exception as e:
-                print(f"Warning: Failed to create direction visualizations: {e}")
-
-    # Random baseline comparison & bimodality analysis
-    baseline_results = None
-    if args.random_baseline:
-        try:
-            baseline_results = run_random_baseline_analysis(stats, args.output_dir)
-            if not args.no_plots:
-                create_baseline_visualizations(stats, baseline_results, args.output_dir)
-        except Exception as e:
-            print(f"Warning: Failed to run random baseline analysis: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # Generate recommendations
-    if args.analysis_mode in ('full', 'direction'):
-        try:
-            rec = generate_recommendations(
-                stats, args.output_dir, focus_task=args.focus_task,
-                baseline_results=baseline_results,
-            )
-            print("\n" + rec)
-        except Exception as e:
-            print(f"Warning: Failed to generate recommendations: {e}")
+                print(f"Warning: Failed to generate recommendations: {e}")
 
     print(f"\nAnalysis complete! Results saved to: {args.output_dir}")
 
