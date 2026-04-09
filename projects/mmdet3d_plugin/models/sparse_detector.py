@@ -12,7 +12,17 @@ from mmdet.models import (
     build_head,
     build_neck,
 )
+from mmdet.core import multi_apply
 from .grid_mask import GridMask
+
+# Task-to-loss-prefix mapping for PCGrad per-task loss grouping
+TASK_LOSS_PREFIXES = {
+    'det': ['det_loss'],
+    'map': ['map_loss'],
+    'motion': ['motion_loss'],
+    'ego': ['ego_loss'],
+    'plan': ['plan_loss'],
+}
 
 try:
     from ..ops import feature_maps_format
@@ -143,6 +153,47 @@ class SparseDetector(BaseDetector):
                 depths, data["gt_depth"]
             )
         return output
+
+    def train_step(self, data, optimizer):
+        """Override train_step to expose per-task losses for PCGrad.
+
+        The standard BaseDetector.train_step() calls _parse_losses() which
+        sums all losses into a single scalar. Here we additionally group
+        individual loss terms by task so that PCGradOptimizerHook can
+        perform per-task backward passes.
+        """
+        losses = self(**data)
+
+        # Group losses by task using prefix matching
+        task_losses = {}
+        for task, prefixes in TASK_LOSS_PREFIXES.items():
+            task_sum = None
+            for key, val in losses.items():
+                if isinstance(val, torch.Tensor) and val.requires_grad:
+                    if any(key.startswith(p) for p in prefixes):
+                        task_sum = val if task_sum is None else task_sum + val
+            if task_sum is not None:
+                task_losses[task] = task_sum
+
+        # Standard _parse_losses for logging (creates 'loss' scalar + log_vars)
+        loss, log_vars = self._parse_losses(losses)
+
+        # Determine batch size safely
+        if 'img_metas' in data:
+            num_samples = len(data['img_metas'])
+        elif 'img' in data:
+            img = data['img']
+            num_samples = img.data.shape[0] if hasattr(img, 'data') else img.shape[0]
+        else:
+            num_samples = 1
+
+        outputs = dict(
+            loss=loss,
+            log_vars=log_vars,
+            num_samples=num_samples,
+            task_losses=task_losses,
+        )
+        return outputs
 
     def forward_test(self, img, **data):
         if isinstance(img, list):
