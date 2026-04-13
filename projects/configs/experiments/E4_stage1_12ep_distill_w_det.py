@@ -16,7 +16,7 @@ checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
 wandb_project = "hipad"
-wandb_name = "E4_stage1_distill_w_det"
+wandb_name = "E4_stage1_12ep_distill_w_det"
 log_config = dict(
     interval=50,
     hooks=[
@@ -114,11 +114,19 @@ plan_anchor_types = [("temp", "2hz")]
 
 
 # ================== distillation config ========================
+# Real-GT + Pseudo-GT distillation (w_det). The teacher cache is converted from
+# BEVFusion convention to HiP-AD convention at dataset load time (see
+# NuScenes3DDataset._convert_teacher_cache_convention) so the boxes match
+# student gt_bboxes_3d layout exactly: [x, y, z_gravity, l, w, h, yaw_nusc, vx, vy].
+# det_gt_loss_weight=1.0 keeps the real-GT detection loss on alongside the KD
+# loss path, so the student is supervised by real labels + teacher soft targets.
+# distill_score_thr=0.3 keeps only confident teacher proposals so weak/noisy
+# ones don't pollute supervision.
 teacher_cache_path = "data/cache/det/bevfusion_teacher_train.pkl"
 distill_alpha_cls = 0.2
 distill_alpha_reg = 0.4
 distill_temperature = 4.0
-distill_score_thr = 0.1
+distill_score_thr = 0.3
 distill_last_layer_only = True
 
 model = dict(
@@ -730,7 +738,7 @@ eval_mode = dict(
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch * num_epochs,
+    interval=num_iters_per_epoch * 3,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
 )

@@ -14,7 +14,7 @@ num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
 num_epochs = 6
 checkpoint_epoch_interval = 3
 
-checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
 import datetime
 wandb_project = "hipad"
 wandb_name = "E6_E5_stage2_distill_wo_det"
@@ -734,7 +734,7 @@ eval_mode = dict(
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval,
+    interval=num_iters_per_epoch * 3,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
     out_dir="val_vis",

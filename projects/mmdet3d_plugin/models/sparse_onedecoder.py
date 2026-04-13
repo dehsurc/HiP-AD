@@ -1348,13 +1348,15 @@ class SparseOneDecoder(BaseModule):
     def _build_pseudo_gt(self, data):
         """Build pseudo GT from teacher predictions for pseudo_gt distill mode.
 
-        Filters teacher proposals by score threshold and converts them to
-        the same format as gt_labels_3d / gt_bboxes_3d.
+        Filters teacher proposals by score threshold. The teacher boxes have
+        already been converted to HiP-AD student convention at dataset load
+        time (see NuScenes3DDataset._convert_teacher_cache_convention), so the
+        layout matches gt_bboxes_3d / gt_labels_3d exactly:
+            [x, y, z_gravity, l, w, h, yaw_nusc, vx, vy]
 
         Returns:
             pseudo_gt_labels: list of [N_valid] int64 tensors (class indices)
             pseudo_gt_bboxes: list of [N_valid, 9] float tensors
-                              (x, y, z, w, l, h, yaw, vx, vy)
         """
         teacher_logits = data["teacher_logits"]   # [B, 200, 10]
         teacher_boxes = data["teacher_boxes"]     # [B, 200, 9]
@@ -1446,18 +1448,23 @@ class SparseOneDecoder(BaseModule):
                 # Regression KD loss (L1 on converted box)
                 if self.distill_alpha_reg > 0:
                     s_reg = student_reg[b, student_q]  # [D]
-                    t_box = t_boxes[teacher_idx]        # [9]: x,y,z,x_size,y_size,z_size,yaw,vx,vy
+                    t_box = t_boxes[teacher_idx]        # [9]
 
-                    # Convert teacher box to student format
-                    # Teacher (LiDAR): [x, y, z, x_size(w), y_size(l), z_size(h), yaw, vx, vy]
-                    # Student (encoded): [x, y, z, log(w), log(l), log(h), sin(yaw), cos(yaw), vx, vy, vz]
+                    # Teacher boxes are already in HiP-AD convention after the
+                    # cache-load conversion (see NuScenes3DDataset). Layout:
+                    #   t_box: [x, y, z_gravity, l, w, h, yaw_nusc, vx, vy]
+                    # Student regression target (encode_reg_target convention):
+                    #   [x, y, z, log(dim0), log(dim1), log(dim2),
+                    #    sin(yaw), cos(yaw), vx, vy, vz]
+                    # The dim slots [3:6] are indexed positionally; both teacher
+                    # and student have [l, w, h] there, so a direct log() works.
                     t_converted = torch.stack([
-                        t_box[0], t_box[1], t_box[2],           # x, y, z
-                        torch.log(t_box[3].clamp(min=1e-5)),    # log(w) = log(x_size)
-                        torch.log(t_box[4].clamp(min=1e-5)),    # log(l) = log(y_size)
-                        torch.log(t_box[5].clamp(min=1e-5)),    # log(h) = log(z_size)
-                        torch.sin(t_box[6]),                     # sin(yaw)
-                        torch.cos(t_box[6]),                     # cos(yaw)
+                        t_box[0], t_box[1], t_box[2],           # x, y, z_gravity
+                        torch.log(t_box[3].clamp(min=1e-5)),    # log(l)
+                        torch.log(t_box[4].clamp(min=1e-5)),    # log(w)
+                        torch.log(t_box[5].clamp(min=1e-5)),    # log(h)
+                        torch.sin(t_box[6]),                     # sin(yaw_nusc)
+                        torch.cos(t_box[6]),                     # cos(yaw_nusc)
                         t_box[7], t_box[8],                      # vx, vy
                     ])
                     # Match dims: only use shared dims

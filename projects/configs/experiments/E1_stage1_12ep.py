@@ -710,7 +710,7 @@ eval_mode = dict(
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch * num_epochs,
+    interval=num_iters_per_epoch * 3,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
 )

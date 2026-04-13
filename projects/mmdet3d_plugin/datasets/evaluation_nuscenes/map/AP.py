@@ -48,11 +48,12 @@ def average_precision(recalls, precisions, mode='area'):
     
     return ap
 
-def instance_match(pred_lines: NDArray, 
-                   scores: NDArray, 
-                   gt_lines: NDArray, 
-                   thresholds: Union[Tuple, List], 
-                   metric: str='chamfer') -> List:
+def instance_match(pred_lines: NDArray,
+                   scores: NDArray,
+                   gt_lines: NDArray,
+                   thresholds: Union[Tuple, List],
+                   metric: str='chamfer',
+                   device: str='cpu') -> List:
     """Compute whether detected lines are true positive or false positive.
 
     Args:
@@ -105,7 +106,7 @@ def instance_match(pred_lines: NDArray,
     #     for j in range(num_gts):
     #         matrix[i, j] = distance_fn(pred_lines[i], gt_lines[j])
     
-    matrix = chamfer_distance_batch(pred_lines, gt_lines)
+    matrix = chamfer_distance_batch(pred_lines, gt_lines, device=device)
     # for each det, the min distance with all gts
     matrix_min = matrix.min(axis=1)
 

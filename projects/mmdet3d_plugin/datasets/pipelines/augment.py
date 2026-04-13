@@ -120,6 +120,13 @@ class BBoxRotation(object):
             results["gt_bboxes_3d"] = self.box_rotate(
                 results["gt_bboxes_3d"], angle
             )
+        # Teacher pseudo-GT must follow the same rotation as student GT,
+        # otherwise distillation supervises with stale frame coordinates
+        # whenever rot3d_range != 0.
+        if "teacher_boxes" in results and angle != 0:
+            results["teacher_boxes"] = self.box_rotate(
+                results["teacher_boxes"], angle
+            )
         return results
 
     @staticmethod
