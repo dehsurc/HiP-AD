@@ -166,14 +166,22 @@ class SparseDetector(BaseDetector):
 
         # Group losses by task using prefix matching
         task_losses = {}
+        matched_keys = set()
         for task, prefixes in TASK_LOSS_PREFIXES.items():
             task_sum = None
             for key, val in losses.items():
                 if isinstance(val, torch.Tensor) and val.requires_grad:
                     if any(key.startswith(p) for p in prefixes):
                         task_sum = val if task_sum is None else task_sum + val
+                        matched_keys.add(key)
             if task_sum is not None:
                 task_losses[task] = task_sum
+
+        # Warn about grad-requiring losses not captured by any task prefix
+        for key, val in losses.items():
+            if isinstance(val, torch.Tensor) and val.requires_grad and key not in matched_keys:
+                import warnings
+                warnings.warn(f"[PCGrad] Loss key '{key}' not matched by any task prefix", stacklevel=2)
 
         # Standard _parse_losses for logging (creates 'loss' scalar + log_vars)
         loss, log_vars = self._parse_losses(losses)

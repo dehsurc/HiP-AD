@@ -9,9 +9,11 @@ Reference: Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020.
 import random
 import logging
 from collections import OrderedDict, defaultdict
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from mmcv.runner import HOOKS, OptimizerHook
 
@@ -111,11 +113,47 @@ def get_shared_parameters_grouped(
         dec_idx = dec_mapping[i]
         count = op_count_per_dec[(dec_idx, op)]
         op_count_per_dec[(dec_idx, op)] += 1
-        group_key = f"dec{dec_idx}_{op}_{count}"
+        base_key = f"dec{dec_idx}_{op}_{count}"
 
-        params = [p for _, p in layer.named_parameters() if p.requires_grad]
-        if params:
-            param_groups[group_key] = params
+        if op == 'ffn':
+            # AsymmetricFFN sub-module split:
+            #   pre_norm (LayerNorm) | layers[0]=fc1 (Linear+act+drop)
+            #   layers[1]=fc2 (Linear) | identity_fc (Linear or Identity)
+            sub_added = False
+            pre_norm = getattr(layer, 'pre_norm', None)
+            if pre_norm is not None and not isinstance(pre_norm, nn.Identity):
+                params = [p for p in pre_norm.parameters() if p.requires_grad]
+                if params:
+                    param_groups[f'{base_key}_pre_norm'] = params
+                    sub_added = True
+            inner = getattr(layer, 'layers', None)
+            if inner is not None:
+                inner_list = list(inner.children())
+                if len(inner_list) >= 1:
+                    params = [p for p in inner_list[0].parameters() if p.requires_grad]
+                    if params:
+                        param_groups[f'{base_key}_fc1'] = params
+                        sub_added = True
+                if len(inner_list) >= 2:
+                    params = [p for p in inner_list[1].parameters() if p.requires_grad]
+                    if params:
+                        param_groups[f'{base_key}_fc2'] = params
+                        sub_added = True
+            identity_fc = getattr(layer, 'identity_fc', None)
+            if identity_fc is not None and not isinstance(identity_fc, nn.Identity):
+                params = [p for p in identity_fc.parameters() if p.requires_grad]
+                if params:
+                    param_groups[f'{base_key}_identity_fc'] = params
+                    sub_added = True
+            if not sub_added:
+                # Fallback: whole-layer grouping
+                params = [p for _, p in layer.named_parameters() if p.requires_grad]
+                if params:
+                    param_groups[base_key] = params
+        else:
+            params = [p for _, p in layer.named_parameters() if p.requires_grad]
+            if params:
+                param_groups[base_key] = params
 
     # fc_before / fc_after
     for fc_name in ['fc_before', 'fc_after']:
@@ -159,6 +197,7 @@ class PCGradOptimizerHook(OptimizerHook):
         warmup_iters: int = 500,
         grad_clip: Optional[dict] = None,
         log_interval: int = 50,
+        primary_task: Optional[str] = None,
     ):
         # Pass grad_clip to parent OptimizerHook
         super().__init__(grad_clip=grad_clip)
@@ -168,6 +207,7 @@ class PCGradOptimizerHook(OptimizerHook):
         self.normalize_grads = normalize_grads
         self.warmup_iters = warmup_iters
         self.log_interval = log_interval
+        self.primary_task = primary_task
 
         # Lazy initialized
         self._param_groups = None
@@ -195,6 +235,8 @@ class PCGradOptimizerHook(OptimizerHook):
         if self.pcgrad_groups is not None:
             active = [g for g in self.pcgrad_groups if g in self._param_groups]
             logger.info(f"[PCGrad] Active PCGrad groups: {active}")
+        if self.primary_task is not None:
+            logger.info(f"[PCGrad] Primary task (protected): {self.primary_task}")
         self._initialized = True
 
     def _should_use_pcgrad(self, runner) -> bool:
@@ -227,17 +269,23 @@ class PCGradOptimizerHook(OptimizerHook):
                 p.grad.data.copy_(flat_grad[offset:offset + numel].reshape(p.shape))
             offset += numel
 
-    def _pcgrad_project(self, task_grads: List[torch.Tensor]) -> List[torch.Tensor]:
+    def _pcgrad_project(self, task_grads: List[torch.Tensor],
+                        seed: int = 0,
+                        primary_idx: int = -1) -> List[torch.Tensor]:
         """Apply PCGrad projection with optional norm normalization.
 
         For each task gradient g_i, project away conflicting components
-        from other task gradients (random order).
+        from other task gradients (random order, deterministic across GPUs).
+
+        If primary_idx >= 0, that task's gradient is protected (never
+        projected).  Other tasks still project against it normally.
         """
         T = len(task_grads)
         if T <= 1:
             return task_grads
 
         eps = 1e-8
+        rng = random.Random(seed)
 
         # Save original norms for restoration
         if self.normalize_grads:
@@ -250,9 +298,11 @@ class PCGradOptimizerHook(OptimizerHook):
         projected = [g.clone() for g in normed]
 
         for i in range(T):
+            if i == primary_idx:
+                continue  # primary task gradient is protected
             order = list(range(T))
             order.remove(i)
-            random.shuffle(order)
+            rng.shuffle(order)
             for j in order:
                 dot = torch.dot(projected[i], normed[j])
                 if dot < 0:
@@ -355,11 +405,42 @@ class PCGradOptimizerHook(OptimizerHook):
 
         return stats, pair_conflicts, group_conflicts
 
+    def _is_distributed(self, model) -> bool:
+        """Check if model is wrapped with DDP."""
+        return hasattr(model, 'no_sync')
+
+    def _allreduce_grads(self, model):
+        """Manually all-reduce gradients across DDP processes."""
+        world_size = dist.get_world_size()
+        for p in model.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
+                p.grad.data /= world_size
+
+    def before_train_iter(self, runner):
+        """Disable DDP reducer hooks for PCGrad iterations.
+
+        DDP's train_step checks require_backward_grad_sync before calling
+        reducer.prepare_for_backward. Setting it to False BEFORE forward
+        prevents DDP from registering autograd hooks, so multiple .backward()
+        calls work without "marked ready twice" errors.
+        We manually all-reduce gradients after projection.
+        """
+        model = runner.model
+        if not self._is_distributed(model):
+            return
+
+        if self._should_use_pcgrad(runner):
+            model.require_backward_grad_sync = False
+        else:
+            model.require_backward_grad_sync = True
+
     def after_train_iter(self, runner):
         """Main hook: either standard backward or PCGrad backward.
 
         Standard mmcv OptimizerHook flow: zero_grad -> backward -> clip -> step.
-        PCGrad flow: zero_grad -> T backward passes -> project -> clip -> step.
+        PCGrad flow: T backward passes (reducer disabled) -> project ->
+                     allreduce -> clip -> step.
         """
         # Standard path: warmup or non-pcgrad iterations
         if not self._should_use_pcgrad(runner):
@@ -381,7 +462,6 @@ class PCGradOptimizerHook(OptimizerHook):
         T = len(tasks)
 
         if T <= 1:
-            # Fallback to standard if only 0-1 tasks have loss
             runner.optimizer.zero_grad()
             runner.outputs['loss'].backward()
             if self.grad_clip is not None:
@@ -395,13 +475,13 @@ class PCGradOptimizerHook(OptimizerHook):
         model = runner.model
 
         # ---- Step 1: Per-task backward passes, collect shared grads ----
+        # Forward was done via model.module (no DDP hooks), so multiple
+        # .backward() calls work without "marked ready twice" errors.
         runner.optimizer.zero_grad()
 
         per_task_grads = {task: {} for task in tasks}
 
         for i, task in enumerate(tasks):
-            # Zero only shared params before each task backward
-            # (non-shared params accumulate naturally = sum of task grads)
             for params in self._param_groups.values():
                 for p in params:
                     if p.grad is not None:
@@ -428,19 +508,45 @@ class PCGradOptimizerHook(OptimizerHook):
         # ---- Step 3: PCGrad projection per group ----
         projection_mag_sum = 0.0
         projection_count = 0
+        total_projections = 0    # number of actual conflict projections applied
+        total_dot_products = 0   # number of task-pair checks
+        cosine_before_list = []  # per-group overall cosine before projection
+        cosine_after_list = []   # per-group overall cosine after projection
+
+        primary_idx = tasks.index(self.primary_task) if self.primary_task in tasks else -1
 
         for gk, params in self._param_groups.items():
             task_grad_list = [per_task_grads[t][gk] for t in tasks]
 
             if gk in pcgrad_set:
                 original = [g.clone() for g in task_grad_list]
-                projected = self._pcgrad_project(task_grad_list)
+                projected = self._pcgrad_project(task_grad_list,
+                                                 seed=runner.iter,
+                                                 primary_idx=primary_idx)
 
                 for orig, proj in zip(original, projected):
                     projection_mag_sum += (proj - orig).norm().item()
                     projection_count += 1
 
-                merged = torch.stack(projected).mean(dim=0)
+                # Count how many projections actually happened (before vs after differ)
+                for orig, proj in zip(original, projected):
+                    if not torch.equal(orig, proj):
+                        total_projections += 1
+                    total_dot_products += 1
+
+                # Measure cosine between merged gradient before/after projection
+                merged_before = torch.stack(original).sum(dim=0)
+                merged_after = torch.stack(projected).sum(dim=0)
+                nb = merged_before.norm()
+                na = merged_after.norm()
+                eps = 1e-8
+                if nb > eps and na > eps:
+                    cos_ba = torch.dot(merged_before, merged_after) / (nb * na)
+                    cosine_before_list.append(cos_ba.item())
+                    # Cosine between before/after tells how much direction changed
+                    # 1.0 = no change, <1.0 = projection altered direction
+
+                merged = merged_after
             else:
                 merged = torch.stack(task_grad_list).sum(dim=0)
 
@@ -449,7 +555,11 @@ class PCGradOptimizerHook(OptimizerHook):
         # Non-shared params accumulated naturally across T backward passes.
         # sum of per-task grads = grad of total loss, so no adjustment needed.
 
-        # ---- Step 4: Grad clip + optimizer step ----
+        # ---- Step 4: All-reduce gradients across GPUs ----
+        if self._is_distributed(model):
+            self._allreduce_grads(model)
+
+        # ---- Step 5: Grad clip + optimizer step ----
         if self.grad_clip is not None:
             grad_norm = self.clip_grads(model.parameters())
             if grad_norm is not None:
@@ -458,16 +568,25 @@ class PCGradOptimizerHook(OptimizerHook):
 
         runner.optimizer.step()
 
-        # ---- Step 5: Logging ----
+        # ---- Step 6: Logging ----
         avg_proj_mag = projection_mag_sum / max(projection_count, 1)
+        proj_ratio = total_projections / max(total_dot_products, 1)
+        avg_direction_change = (
+            1.0 - sum(cosine_before_list) / len(cosine_before_list)
+            if cosine_before_list else 0.0
+        )
+
+        # Always log these lightweight PCGrad metrics (every PCGrad iter)
+        pcgrad_log = {
+            'pcgrad/projection_magnitude': avg_proj_mag,
+            'pcgrad/projection_ratio': proj_ratio,
+            'pcgrad/direction_change': avg_direction_change,
+            'pcgrad/num_tasks': T,
+        }
 
         if should_log_detail:
-            # Detailed per-pair, per-task, per-group logging
-            stats['pcgrad/projection_magnitude'] = avg_proj_mag
+            # Add full conflict stats on detail iterations
+            stats.update(pcgrad_log)
             runner.log_buffer.update(stats, runner.outputs['num_samples'])
         else:
-            # Lightweight logging on non-detail iterations
-            runner.log_buffer.update({
-                'pcgrad/projection_magnitude': avg_proj_mag,
-                'pcgrad/num_tasks': T,
-            }, runner.outputs['num_samples'])
+            runner.log_buffer.update(pcgrad_log, runner.outputs['num_samples'])
