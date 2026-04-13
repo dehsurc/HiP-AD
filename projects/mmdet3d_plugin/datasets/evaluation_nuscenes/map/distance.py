@@ -34,34 +34,39 @@ def frechet_distance(line1: NDArray, line2: NDArray) -> float:
     
     raise NotImplementedError
 
-def chamfer_distance_batch(pred_lines, gt_lines):
-    ''' Calculate chamfer distance between two group of lines. Make sure the 
+def chamfer_distance_batch(pred_lines, gt_lines, device='cpu'):
+    ''' Calculate chamfer distance between two group of lines. Make sure the
     lines are interpolated.
 
     Args:
         pred_lines (array or tensor): shape (m, num_pts, 2 or 3)
         gt_lines (array or tensor): shape (n, num_pts, 2 or 3)
-    
+        device (str): torch device, e.g. 'cpu', 'cuda:2'
+
     Returns:
         distance (array): chamfer distance
     '''
     _, num_pts, coord_dims = pred_lines.shape
-    
+
     if not isinstance(pred_lines, torch.Tensor):
-        pred_lines = torch.tensor(pred_lines)
+        pred_lines = torch.tensor(pred_lines, device=device)
+    elif pred_lines.device != torch.device(device):
+        pred_lines = pred_lines.to(device)
     if not isinstance(gt_lines, torch.Tensor):
-        gt_lines = torch.tensor(gt_lines)
-    dist_mat = torch.cdist(pred_lines.view(-1, coord_dims), 
-                    gt_lines.view(-1, coord_dims), p=2) 
+        gt_lines = torch.tensor(gt_lines, device=device)
+    elif gt_lines.device != torch.device(device):
+        gt_lines = gt_lines.to(device)
+    dist_mat = torch.cdist(pred_lines.view(-1, coord_dims),
+                    gt_lines.view(-1, coord_dims), p=2)
     # (num_query*num_points, num_gt*num_points)
-    dist_mat = torch.stack(torch.split(dist_mat, num_pts)) 
+    dist_mat = torch.stack(torch.split(dist_mat, num_pts))
     # (num_query, num_points, num_gt*num_points)
-    dist_mat = torch.stack(torch.split(dist_mat, num_pts, dim=-1)) 
+    dist_mat = torch.stack(torch.split(dist_mat, num_pts, dim=-1))
     # (num_gt, num_q, num_pts, num_pts)
 
     dist1 = dist_mat.min(-1)[0].sum(-1)
     dist2 = dist_mat.min(-2)[0].sum(-1)
 
     dist_matrix = (dist1 + dist2).transpose(0, 1) / (2 * num_pts)
-    
-    return dist_matrix.numpy()
+
+    return dist_matrix.cpu().numpy()

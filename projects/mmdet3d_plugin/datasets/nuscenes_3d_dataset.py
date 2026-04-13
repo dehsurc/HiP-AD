@@ -165,6 +165,55 @@ class NuScenes3DDataset(Dataset):
             with open(teacher_cache_path, "rb") as f:
                 self.teacher_cache = pickle.load(f)
             print_log(f"Loaded teacher cache: {len(self.teacher_cache)} samples", logger='root')
+            self._convert_teacher_cache_convention()
+
+    def _convert_teacher_cache_convention(self):
+        """Convert BEVFusion teacher cache box format to HiP-AD student convention.
+
+        BEVFusion's TransFusionHead decoder emits boxes with the BEVFusion-internal
+        convention, which differs from HiP-AD/mmdet3d v1+ in three places:
+
+          1. dim order:  cache stores [w, l, h] (raw nuScenes wlh, no swap)
+                         student expects [l, w, h] (mmdet3d standard, after swap)
+          2. yaw:        cache stores SECOND format (-yaw_nusc - pi/2)
+                         student expects raw nuScenes yaw
+          3. z origin:   cache stores z_top  ( = z_gravity + h/2 )
+                         student expects z_gravity (b.center from nuScenes)
+
+        These three offsets were verified empirically against HiP-AD GT for ~500
+        matched car pairs (mean errors after fix: xy 0.20m, z 0.02m, dim 0.16m,
+        yaw 0.003 rad). See cache_teacher_logits.py for the upstream source.
+
+        Conversion is applied IN-PLACE on self.teacher_cache, exactly once at
+        load time, so the per-sample loading path stays trivial. The "boxes"
+        entry is upgraded to float32 with the corrected layout:
+            [x, y, z_gravity, l, w, h, yaw_nusc, vx, vy]
+        """
+        print_log(
+            "Converting teacher cache box convention "
+            "(BEVFusion [w,l,h]+SECOND yaw+z_top -> HiP-AD [l,w,h]+raw yaw+z_gravity)...",
+            logger='root',
+        )
+        for token in self.teacher_cache:
+            entry = self.teacher_cache[token]
+            boxes = entry["boxes"].astype(np.float32)
+            # 1) dim swap [3] <-> [4]:  [w, l, h] -> [l, w, h]
+            boxes[:, [3, 4]] = boxes[:, [4, 3]]
+            # 2) z offset: cache z is z_gravity + h/2 (z_top), student wants z_gravity
+            #    box[5] is h regardless of the [3,4] swap, so use post-swap dim[5]
+            boxes[:, 2] = boxes[:, 2] - boxes[:, 5] * 0.5
+            # 3) yaw: SECOND format (-yaw_nusc - pi/2) -> raw nuScenes yaw
+            #    Inverse: yaw_nusc = -(yaw_second + pi/2) = -yaw_second - pi/2
+            yaw = -boxes[:, 6] - np.pi / 2
+            # Normalize yaw to (-pi, pi] to match the limit_period that
+            # NuScenesSparse4DAdaptor applies to gt_bboxes_3d. The encoded
+            # regression target uses sin/cos so this is mathematically a no-op
+            # for the loss, but it keeps debug output and any downstream
+            # consumer that assumes a bounded yaw range happy.
+            yaw = yaw - np.floor(yaw / (2 * np.pi) + 0.5) * (2 * np.pi)
+            boxes[:, 6] = yaw
+            entry["boxes"] = boxes
+        print_log("Teacher cache convention conversion done.", logger='root')
 
     def __len__(self):
         return len(self.data_infos)
@@ -382,13 +431,19 @@ class NuScenes3DDataset(Dataset):
         annos = self.get_ann_info(index)
         input_dict.update(annos)
 
-        # Load teacher cache for distillation
+        # Load teacher cache for distillation.
+        # NOTE: teacher["boxes"] is already float32 with HiP-AD convention applied
+        # at cache load time (see _convert_teacher_cache_convention). Layout per row:
+        #   [x, y, z_gravity, l, w, h, yaw_nusc, vx, vy]
+        # which matches student gt_bboxes_3d (info["gt_boxes"] + gt_velocity).
+        # We .copy() teacher_boxes so any in-place mutation in the pipeline
+        # (e.g. BBoxRotation when rot3d_range != 0) does not corrupt the cache.
         if self.teacher_cache is not None:
             token = info["token"]
             teacher = self.teacher_cache.get(token, None)
             if teacher is not None:
                 input_dict["teacher_logits"] = teacher["logits"].astype(np.float32)  # [200, 10]
-                input_dict["teacher_boxes"] = teacher["boxes"].astype(np.float32)    # [200, 9]
+                input_dict["teacher_boxes"] = teacher["boxes"].copy()                # [200, 9] float32
                 input_dict["teacher_scores"] = teacher["scores"].astype(np.float32)  # [200]
             else:
                 # Fallback: zeros if token not found in cache
