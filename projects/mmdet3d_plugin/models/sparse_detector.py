@@ -177,11 +177,12 @@ class SparseDetector(BaseDetector):
             if task_sum is not None:
                 task_losses[task] = task_sum
 
-        # Warn about grad-requiring losses not captured by any task prefix
+        # Auxiliary losses: trained normally but excluded from PCGrad
+        # projection / conflict analysis (e.g., loss_dense_depth).
+        aux_losses = {}
         for key, val in losses.items():
             if isinstance(val, torch.Tensor) and val.requires_grad and key not in matched_keys:
-                import warnings
-                warnings.warn(f"[PCGrad] Loss key '{key}' not matched by any task prefix", stacklevel=2)
+                aux_losses[key] = val
 
         # Standard _parse_losses for logging (creates 'loss' scalar + log_vars)
         loss, log_vars = self._parse_losses(losses)
@@ -200,6 +201,7 @@ class SparseDetector(BaseDetector):
             log_vars=log_vars,
             num_samples=num_samples,
             task_losses=task_losses,
+            aux_losses=aux_losses,
         )
         return outputs
 

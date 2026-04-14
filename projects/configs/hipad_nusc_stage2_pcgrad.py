@@ -40,7 +40,6 @@ data = dict(
 
 # Disable gradient checkpointing — incompatible with multiple .backward()
 # calls needed for PCGrad (DDP "marked ready twice" error)
-# Disable depth_branch — its loss doesn't fit any PCGrad task prefix and would
 # silently lose supervision during PCGrad iters.
 model = dict(
     img_backbone=dict(with_cp=False),

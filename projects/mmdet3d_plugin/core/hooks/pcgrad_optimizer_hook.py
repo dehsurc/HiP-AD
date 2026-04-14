@@ -213,6 +213,7 @@ class PCGradOptimizerHook(OptimizerHook):
         self._param_groups = None
         self._shared_param_ids = None
         self._initialized = False
+        self._aux_keys_logged = False
 
     def _lazy_init(self, model):
         """Initialize parameter groups on first PCGrad iteration."""
@@ -461,6 +462,21 @@ class PCGradOptimizerHook(OptimizerHook):
         tasks = list(task_losses.keys())
         T = len(tasks)
 
+        # Auxiliary losses (e.g., loss_dense_depth): backpropagated normally
+        # after PCGrad projection, so they accumulate onto the projected
+        # shared grads without participating in conflict analysis.
+        aux_losses = runner.outputs.get('aux_losses', {})
+        has_aux = len(aux_losses) > 0
+
+        if not self._aux_keys_logged:
+            if has_aux:
+                logger.info(
+                    f"[PCGrad] Aux losses (excluded from projection, "
+                    f"normal backward): {list(aux_losses.keys())}")
+            else:
+                logger.info("[PCGrad] No aux losses detected")
+            self._aux_keys_logged = True
+
         if T <= 1:
             runner.optimizer.zero_grad()
             runner.outputs['loss'].backward()
@@ -487,7 +503,7 @@ class PCGradOptimizerHook(OptimizerHook):
                     if p.grad is not None:
                         p.grad.zero_()
 
-            retain = (i < T - 1)
+            retain = (i < T - 1) or has_aux
             task_losses[task].backward(retain_graph=retain)
 
             for gk, params in self._param_groups.items():
@@ -554,6 +570,29 @@ class PCGradOptimizerHook(OptimizerHook):
 
         # Non-shared params accumulated naturally across T backward passes.
         # sum of per-task grads = grad of total loss, so no adjustment needed.
+
+        # ---- Step 3.5: Auxiliary losses (skip projection, accumulate) ----
+        if has_aux:
+            aux_total = sum(aux_losses.values())
+
+            if should_log_detail:
+                pre_norm_sq = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        pre_norm_sq += p.grad.detach().float().pow(2).sum().item()
+
+            aux_total.backward()
+
+            if should_log_detail:
+                post_norm_sq = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        post_norm_sq += p.grad.detach().float().pow(2).sum().item()
+                runner.log_buffer.update({
+                    'pcgrad/aux/loss': float(aux_total.detach().item()),
+                    'pcgrad/aux/grad_norm_pre': pre_norm_sq ** 0.5,
+                    'pcgrad/aux/grad_norm_post': post_norm_sq ** 0.5,
+                }, runner.outputs['num_samples'])
 
         # ---- Step 4: All-reduce gradients across GPUs ----
         if self._is_distributed(model):
