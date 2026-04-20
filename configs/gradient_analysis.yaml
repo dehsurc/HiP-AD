@@ -1,0 +1,47 @@
+# MTL gradient analysis configuration. All quantities are user-adjustable.
+
+tasks: [det, map, motion, ego, plan]
+
+ckpt_root: data/ckpts/E2_E1_stage2_18ep
+model_config: projects/configs/hipad_nusc_stage2.py  # matches nusc/pcgrad training config for E2_E1_stage2_18ep
+
+checkpoints:
+  1ep:  iter_2344.pth
+  3ep:  iter_7032.pth
+  6ep:  iter_14064.pth
+  18ep: iter_42192.pth
+
+primary:
+  batch_size: 12
+  num_batches: 100
+
+supplementary:
+  enabled: true
+  batch_size: 1
+  num_samples: 500
+  checkpoint: 1ep
+
+probe:
+  alpha: 0.001
+  steps: [1, 2]
+  variants: [raw, normalized]
+
+binning:
+  cosine_bins: [-1.0, -0.3, -0.1, 0.1, 0.3, 1.0]
+
+shared_param_groups:
+  - backbone
+  - neck
+  - norm
+  - ffn
+  - gnn
+  - inter_gnn
+  - fc_before
+  - fc_after
+
+output_root: gradient_analysis_results
+
+seed: 42
+deterministic: true
+fp16: true
+device: cuda:0
