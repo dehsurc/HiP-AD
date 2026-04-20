@@ -12,9 +12,9 @@ num_gpus = 2
 batch_size = 6
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
 num_epochs = 18
-checkpoint_epoch_interval = 3
+checkpoint_epoch_interval = 1
 
-checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
+checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
 wandb_project = "hipad"
 wandb_name = "E2_E1_stage2_18ep"
 log_config = dict(
@@ -28,7 +28,7 @@ log_config = dict(
         ),
     ],
 )
-load_from = "./work_dirs/exp/E1_stage1_12ep/latest.pth"
+load_from = "/home/yongjae/e2e/HiP-AD/ckpts/nusc_stage1_e1.pth"
 resume_from = None
 workflow = [("train", 1)]
 fp16 = dict(loss_scale=32.0)
@@ -103,12 +103,12 @@ operation_order = single_frame_layer * num_single_frame_decoder + \
 
 # anchors
 anchor_paths = {
-    "det": "data/kmeans/kmeans_det_900.npy",
-    "map": "data/kmeans/kmeans_map_100.npy",
-    "motion": f"data/kmeans/kmeans_motion_{fut_mode}.npy",
+    "det": "data_nusc/kmeans/kmeans_det_900.npy",
+    "map": "data_nusc/kmeans/kmeans_map_100.npy",
+    "motion": f"data_nusc/kmeans/kmeans_motion_{fut_mode}.npy",
 }
 
-plan_anchor_paths = f"data/kmeans/kmeans_plan_{ego_fut_mode}.npy"
+plan_anchor_paths = f"data_nusc/kmeans/kmeans_plan_{ego_fut_mode}.npy"
 plan_speed_refer = None
 plan_anchor_refer = ("temp", "2hz")
 plan_anchor_types = [("temp", "2hz")]
@@ -502,9 +502,9 @@ model = dict(
 
 # ================== data ========================
 dataset_type = "NuScenes3DDataset"
-data_root = "data/nuscenes/"
-eval_data_root = "data/infos/nuscenes/"
-anno_root = "data/infos/" if version == 'trainval' else "data/infos/mini/"
+data_root = "data_nusc/nuscenes/"
+eval_data_root = "data_nusc/infos/nuscenes/"
+anno_root = "data_nusc/infos/" if version == 'trainval' else "data_nusc/infos/mini/"
 file_client_args = dict(backend="disk")
 
 img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
@@ -711,7 +711,7 @@ eval_mode = dict(
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch * 3,
+    interval=num_iters_per_epoch * checkpoint_epoch_interval * 2,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
     out_dir="val_vis",
@@ -727,4 +727,4 @@ custom_hooks = [
     )
 ]
 
-load_from = "./work_dirs/exp/E1_stage1_12ep/latest.pth"
+load_from = "/home/yongjae/e2e/HiP-AD/ckpts/nusc_stage1_e1.pth"
