@@ -273,6 +273,11 @@ def main() -> int:
         print(f"[supplementary] batch_size=1 probe on {cfg_ana['supplementary']['checkpoint']}")
         run_supplementary(rt, cfg_ana, sup_dir)
 
+    # Generate markdown summary
+    from tools.gradient_analysis.summary import generate_summary
+    generate_summary(out_root, tags)
+    print(f"summary: {out_root / 'summary_report.md'}")
+
     print("done.")
     return 0
 
