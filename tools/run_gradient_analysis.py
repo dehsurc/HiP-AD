@@ -62,7 +62,25 @@ def set_seeds(seed: int, deterministic: bool) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+def _load_plugins(cfg) -> None:
+    """Honor cfg.custom_imports and cfg.plugin/plugin_dir so HiP-AD's custom modules
+    (SparseDetector, custom heads, datasets, etc.) register with mmcv DETECTORS."""
+    import importlib
+    import os
+    if cfg.get("custom_imports", None):
+        from mmcv.utils import import_modules_from_strings  # type: ignore
+        import_modules_from_strings(**cfg["custom_imports"])
+    if getattr(cfg, "plugin", False):
+        if hasattr(cfg, "plugin_dir"):
+            plugin_dir = cfg.plugin_dir
+        else:
+            plugin_dir = os.path.dirname(cfg.filename) + "/"
+        module_path = ".".join(p for p in os.path.dirname(plugin_dir).split("/") if p)
+        importlib.import_module(module_path)
+
+
 def load_model(rt, cfg, ckpt_path: Path, device: str, fp16: bool):
+    _load_plugins(cfg)
     model = rt["build_detector"](cfg.model, train_cfg=cfg.get("train_cfg"), test_cfg=cfg.get("test_cfg"))
     model.init_weights()
     if fp16:
