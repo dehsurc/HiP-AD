@@ -31,7 +31,7 @@ def _import_runtime():
     from mmcv import Config  # type: ignore
     from mmcv.parallel import MMDataParallel  # type: ignore
     from mmcv.runner import load_checkpoint, wrap_fp16_model  # type: ignore
-    from mmdet3d.models import build_detector  # type: ignore
+    from mmdet.models import build_detector  # type: ignore  # HiP-AD convention; mmdet3d not installed
 
     from tools.gradient_analysis.collector import GradientCollector, build_dataloader
     from tools.gradient_analysis.conflict import run_m2, analyze_pair_batches
