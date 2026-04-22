@@ -9,6 +9,7 @@ build/
 __pycache__/
 .idea/
 data
+data_nusc
 ckpts
 work_dirs
 work_dirs_archive

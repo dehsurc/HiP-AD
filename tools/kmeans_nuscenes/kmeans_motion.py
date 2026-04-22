@@ -41,7 +41,7 @@ def lidar2agent(trajs_offset, boxes):
 K = 6
 DIS_THRESH = 55
 
-fp = 'data/infos/nuscenes_infos_train.pkl'
+fp = 'data_nusc/infos/nuscenes_infos_train.pkl'
 data = mmcv.load(fp)
 data_infos = list(sorted(data["infos"], key=lambda e: e["timestamp"]))
 intention = dict()
@@ -98,4 +98,4 @@ for i in range(len(CLASSES)):
     plt.close()
 
 clusters = np.stack(clusters, axis=0)
-np.save(f'data/kmeans/kmeans_motion_{K}.npy', clusters)
+np.save(f'data_nusc/kmeans/kmeans_motion_{K}.npy', clusters)

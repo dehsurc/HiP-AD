@@ -8,13 +8,13 @@ from sklearn.cluster import KMeans
 
 import mmcv
 
-os.makedirs('data/kmeans', exist_ok=True)
+os.makedirs('data_nusc/kmeans', exist_ok=True)
 os.makedirs('vis/kmeans', exist_ok=True)
 
 K = 900
 DIS_THRESH = 55
 
-fp = 'data/infos/nuscenes_infos_train.pkl'
+fp = 'data_nusc/infos/nuscenes_infos_train.pkl'
 data = mmcv.load(fp)
 data_infos = list(sorted(data["infos"], key=lambda e: e["timestamp"]))
 center = []
@@ -31,4 +31,4 @@ plt.scatter(cluster[:,0], cluster[:,1])
 plt.savefig(f'vis/kmeans/det_anchor_{K}', bbox_inches='tight')
 others = np.array([1,1,1,1,0,0,0,0])[np.newaxis].repeat(K, axis=0)
 cluster = np.concatenate([cluster, others], axis=1)
-np.save(f'data/kmeans/kmeans_det_{K}.npy', cluster)
+np.save(f'data_nusc/kmeans/kmeans_det_{K}.npy', cluster)

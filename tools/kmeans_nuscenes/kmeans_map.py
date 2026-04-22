@@ -11,7 +11,7 @@ import mmcv
 K = 100
 num_sample = 20
 
-fp = 'data/infos/nuscenes_infos_train.pkl'
+fp = 'data_nusc/infos/nuscenes_infos_train.pkl'
 data = mmcv.load(fp)
 data_infos = list(sorted(data["infos"], key=lambda e: e["timestamp"]))
 center = []
@@ -31,4 +31,4 @@ for i in range(K):
     y = vecs[i, :, 1]
     plt.plot(x, y, linewidth=1, marker='o', linestyle='-', markersize=2)
 plt.savefig(f'vis/kmeans/map_anchor_{K}', bbox_inches='tight')
-np.save(f'data/kmeans/kmeans_map_{K}.npy', vecs)
+np.save(f'data_nusc/kmeans/kmeans_map_{K}.npy', vecs)

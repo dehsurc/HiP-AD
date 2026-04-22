@@ -14,7 +14,7 @@ runner = dict(type="IterBasedRunner", max_iters=num_iters_per_epoch * num_epochs
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
 
 # Override work_dir and wandb name
-work_dir = "/home/yongjae/e2e/HiP-AD/data_nusc/nuscenes/yong/hipad_nusc_pcgrad-e1"
+work_dir = "/home/yongjae/e2e/HiP-AD/data/nuscenes/yong/hipad_nusc_pcgrad-e1"
 wandb_name = "hipad_nusc_stage2_pcgrad-e1"
 
 log_config = dict(

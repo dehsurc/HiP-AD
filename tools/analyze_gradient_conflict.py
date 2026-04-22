@@ -1637,7 +1637,8 @@ def create_basic_visualizations(stats, output_dir):
                     mat[i, j] = stats['pairwise_cosine'][pk]['mean']
     plt.figure(figsize=(8, 6))
     sns.heatmap(mat, annot=True, fmt='.3f', cmap='RdYlGn', center=0,
-                xticklabels=task_names, yticklabels=task_names, vmin=-1, vmax=1)
+                xticklabels=task_names, yticklabels=task_names, vmin=-0.5, vmax=0.5,
+                annot_kws={'size': 12})
     plt.title('Mean Cosine Similarity between Task Gradients\n(Negative = Conflict)')
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'cosine_similarity_heatmap.png'), dpi=150)
@@ -2205,14 +2206,16 @@ def create_active_overlap_visualizations(stats, group_meta, output_dir):
                     mat_ratio[i, j] = ao_ratio_d['mean']
 
         fig, axes = plt.subplots(1, 3, figsize=(24, max(6, len(sorted_gks) * 0.35)))
-        sns.heatmap(mat_raw, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
+        sns.heatmap(mat_raw, annot=True, fmt='.2f', cmap='RdBu', center=0,
                     xticklabels=pair_keys, yticklabels=sorted_gks,
-                    vmin=-1, vmax=1, ax=axes[0], linewidths=0.5)
+                    vmin=-0.4, vmax=0.4, ax=axes[0], linewidths=0.5,
+                    annot_kws={'size': 10})
         axes[0].set_title('Raw Cosine Similarity')
 
-        sns.heatmap(mat_overlap, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
+        sns.heatmap(mat_overlap, annot=True, fmt='.2f', cmap='RdBu', center=0,
                     xticklabels=pair_keys, yticklabels=sorted_gks,
-                    vmin=-1, vmax=1, ax=axes[1], linewidths=0.5)
+                    vmin=-0.4, vmax=0.4, ax=axes[1], linewidths=0.5,
+                    annot_kws={'size': 10})
         axes[1].set_title('Active-Overlap Cosine')
 
         sns.heatmap(mat_ratio, annot=True, fmt='.2f', cmap='YlOrRd_r',

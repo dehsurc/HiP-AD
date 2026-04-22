@@ -10,7 +10,7 @@ import mmcv
 
 K = 6
 
-fp = 'data/infos/nuscenes_infos_train.pkl'
+fp = 'data_nusc/infos/nuscenes_infos_train.pkl'
 data = mmcv.load(fp)
 data_infos = list(sorted(data["infos"], key=lambda e: e["timestamp"]))
 navi_trajs = [[], [], []]
@@ -36,4 +36,4 @@ plt.savefig(f'vis/kmeans/plan_{K}', bbox_inches='tight')
 plt.close()
 
 clusters = np.stack(clusters, axis=0)
-np.save(f'data/kmeans/kmeans_plan_{K}.npy', clusters)
+np.save(f'data_nusc/kmeans/kmeans_plan_{K}.npy', clusters)
