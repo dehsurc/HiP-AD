@@ -2,7 +2,7 @@
 
 tasks: [det, map, motion, ego, plan]
 
-ckpt_root: data/ckpts/E2_E1_stage2_18ep
+ckpt_root: ckpts/E2_E1_stage2_18ep
 model_config: projects/configs/hipad_nusc_stage2.py  # matches nusc/pcgrad training config for E2_E1_stage2_18ep
 
 checkpoints:
@@ -12,7 +12,7 @@ checkpoints:
   18ep: iter_42192.pth
 
 primary:
-  batch_size: 12
+  batch_size: 6
   num_batches: 100
 
 supplementary:

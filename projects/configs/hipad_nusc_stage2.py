@@ -103,12 +103,12 @@ operation_order = single_frame_layer * num_single_frame_decoder + \
 
 # anchors
 anchor_paths = {
-    "det": "data/kmeans/kmeans_det_900.npy",
-    "map": "data/kmeans/kmeans_map_100.npy",
-    "motion": f"data/kmeans/kmeans_motion_{fut_mode}.npy",
+    "det": "data_nusc/kmeans/kmeans_det_900.npy",
+    "map": "data_nusc/kmeans/kmeans_map_100.npy",
+    "motion": f"data_nusc/kmeans/kmeans_motion_{fut_mode}.npy",
 }
 
-plan_anchor_paths = f"data/kmeans/kmeans_plan_{ego_fut_mode}.npy"
+plan_anchor_paths = f"data_nusc/kmeans/kmeans_plan_{ego_fut_mode}.npy"
 plan_speed_refer = None
 plan_anchor_refer = ("temp", "2hz")
 plan_anchor_types = [("temp", "2hz")]
@@ -125,7 +125,7 @@ model = dict(
         frozen_stages=-1,
         norm_eval=False,
         style="pytorch",
-        with_cp=True,
+        with_cp=False,
         out_indices=(0, 1, 2, 3),
         norm_cfg=dict(type="BN", requires_grad=True),
         pretrained="ckpts/resnet50-19c8e357.pth",
@@ -502,9 +502,9 @@ model = dict(
 
 # ================== data ========================
 dataset_type = "NuScenes3DDataset"
-data_root = "data/nuscenes/"
-eval_data_root = "data/infos/nuscenes/"
-anno_root = "data/infos/" if version == 'trainval' else "data/infos/mini/"
+data_root = "data_nusc/nuscenes/"
+eval_data_root = "data_nusc/infos/nuscenes/"
+anno_root = "data_nusc/infos/" if version == 'trainval' else "data_nusc/infos/mini/"
 file_client_args = dict(backend="disk")
 
 img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)

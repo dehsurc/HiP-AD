@@ -57,7 +57,7 @@ class SparsePoint3DTarget(BaseTargetWithDenoising):
             permute_idx = gt_permute_index[pred_idx, target_idx]
             output_cls_target[i, pred_idx] = cls_targets[i][target_idx]
             output_box_target[i, pred_idx] = pts_targets[i][target_idx, permute_idx]
-            output_reg_weights[i, pred_idx] = 1
+            output_reg_weights[i, pred_idx] = torch.ones_like(output_reg_weights[i, pred_idx])
 
         return output_cls_target, output_box_target, output_reg_weights
 
