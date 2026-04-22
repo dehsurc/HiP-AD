@@ -86,8 +86,12 @@ def analyze_pair_batches(
 
 
 def summarize_pair(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate per-(task_pair, group) across batches."""
-    grouped = df.groupby("group").agg(
+    """Aggregate per-(task_pair, group) across batches.
+
+    Adds conflict-conditional norm stats: when cos < 0, what are ||g_a||, ||g_b||,
+    and the ratio ||g_a||/||g_b||? (cooperative counterparts included for contrast.)
+    """
+    base = df.groupby("group").agg(
         mean_cos=("cos", "mean"),
         std_cos=("cos", "std"),
         median_cos=("cos", "median"),
@@ -95,7 +99,35 @@ def summarize_pair(df: pd.DataFrame) -> pd.DataFrame:
         conflict_ratio=("cos", lambda s: float((s < 0).mean())),
         mean_coop_mag=("coop_mag", "mean"),
         mean_conf_mag=("conf_mag", "mean"),
-    ).reset_index()
+    )
+
+    def _cond_stats(sub: pd.DataFrame) -> pd.Series:
+        conf = sub[sub["cos"] < 0]
+        coop = sub[sub["cos"] >= 0]
+        def _stats(frame: pd.DataFrame, suffix: str) -> Dict[str, float]:
+            if frame.empty:
+                return {
+                    f"mean_norm_a_{suffix}": float("nan"),
+                    f"mean_norm_b_{suffix}": float("nan"),
+                    f"mean_norm_ratio_{suffix}": float("nan"),
+                    f"median_norm_ratio_{suffix}": float("nan"),
+                    f"n_{suffix}": 0,
+                }
+            ratio = frame["norm_a"] / frame["norm_b"].where(frame["norm_b"] > EPS)
+            return {
+                f"mean_norm_a_{suffix}": float(frame["norm_a"].mean()),
+                f"mean_norm_b_{suffix}": float(frame["norm_b"].mean()),
+                f"mean_norm_ratio_{suffix}": float(ratio.mean()),
+                f"median_norm_ratio_{suffix}": float(ratio.median()),
+                f"n_{suffix}": int(len(frame)),
+            }
+        out = {}
+        out.update(_stats(conf, "conflict"))
+        out.update(_stats(coop, "coop"))
+        return pd.Series(out)
+
+    cond = df.groupby("group").apply(_cond_stats)
+    grouped = base.join(cond).reset_index()
     return grouped
 
 
