@@ -28,6 +28,9 @@ from .attention import gen_sineembed_for_position
 
 from typing import List, Optional, Tuple, Union
 from projects.mmdet3d_plugin.core.box3d import *
+from projects.mmdet3d_plugin.core.gradnorm.shared_params import (
+    collect_last_linear_weights,
+)
 from projects.mmdet3d_plugin.models.utils import *
 
 __all__ = ["SparseOneDecoder"]
@@ -1118,6 +1121,13 @@ class SparseOneDecoder(BaseModule):
         self.run_step += 1
 
         return det_output, map_output, ego_output, plan_output, motion_output, scenes_output
+
+    def collect_ffn_last_fc_params(self):
+        """Return the list of nn.Parameter (weight only) taken from the last
+        nn.Linear of every AsymmetricFFN that appears at an "ffn" position in
+        ``self.operation_order``. Used as the shared W for GradNorm.
+        """
+        return collect_last_linear_weights(self.operation_order, self.layers)
 
     @force_fp32(apply_to=("model_outs"))
     def loss(self, det_output, map_output, ego_output, plan_output, motion_output, scenes_output, data):
