@@ -9,6 +9,28 @@ import warnings
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.utils.checkpoint as _cp
+
+# ──────────────────────────────────────────────────────────────
+# Force non-reentrant gradient checkpointing.
+#
+# mmdet's ResNet calls `cp.checkpoint(fn, x)` without `use_reentrant`,
+# so PyTorch 1.13 falls back to the reentrant implementation. Reentrant
+# checkpointing re-runs forward during backward, which is incompatible
+# with `find_unused_parameters=True` (DDP marks the same parameter ready
+# twice). Non-reentrant mode is compatible and saves the activation
+# memory we need on 48 GB cards.
+# ──────────────────────────────────────────────────────────────
+if not getattr(_cp, "_hipad_non_reentrant_patched", False):
+    _original_cp_checkpoint = _cp.checkpoint
+
+    def _cp_checkpoint_non_reentrant(function, *args, use_reentrant=False, **kwargs):
+        return _original_cp_checkpoint(
+            function, *args, use_reentrant=use_reentrant, **kwargs
+        )
+
+    _cp.checkpoint = _cp_checkpoint_non_reentrant
+    _cp._hipad_non_reentrant_patched = True
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (
     HOOKS,
@@ -92,6 +114,7 @@ def custom_train_detector(
     # put model on gpus
     if distributed:
         find_unused_parameters = cfg.get("find_unused_parameters", False)
+        static_graph = cfg.get("static_graph", False)
         # Sets the `find_unused_parameters` parameter in
         # torch.nn.parallel.DistributedDataParallel
         model = MMDistributedDataParallel(
@@ -100,6 +123,12 @@ def custom_train_detector(
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters,
         )
+        if static_graph:
+            # Required when combining `find_unused_parameters=True` with
+            # gradient checkpointing (`with_cp=True` in backbone). Without
+            # this flag, reentrant checkpoint reruns forward during backward
+            # and DDP marks the same parameter ready twice.
+            model._set_static_graph()
 
     else:
         model = MMDataParallel(

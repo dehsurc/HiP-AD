@@ -14,12 +14,24 @@
 log_level = "INFO"
 dist_params = dict(backend="nccl")
 
+# DDP flags:
+#   - find_unused_parameters=True: the last decoder layer's inter_gnn
+#     FlashMHA has an attn.in_proj_bias that reaches the loss only on some
+#     samples (sample-dependent Gain/gating path). This makes the DDP graph
+#     dynamic, so static_graph=True cannot be used.
+# `mmdet_train.py` monkey-patches `torch.utils.checkpoint.checkpoint` to
+# run non-reentrant, which is compatible with FUP=True. This lets us keep
+# `with_cp=True` on the backbone (below) for activation memory savings.
+find_unused_parameters = True
+
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 work_dir = "work_dirs/exp/E9_E2_E1_stage2_18ep_GN"
 
 version = 'trainval'
-length = {'trainval': 28130, 'mini': 323}
+# 1/3 stratified-by-scene subset (seed 0). Full trainval = 28130 infos; subset = 9360.
+# Matched to E2_E1_stage2_18ep_1_3_seed0 baseline so iter/LR schedule align.
+length = {'trainval': 9360, 'mini': 323}
 
 num_gpus = 2
 batch_size = 6
@@ -27,8 +39,7 @@ num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
 num_epochs = 18
 checkpoint_epoch_interval = 1
 
-checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval,
-                         max_keep_ckpts=-1)
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
 wandb_project = "hipad"
 wandb_name = "E9_E2_E1_stage2_18ep_GN"
 log_config = dict(
@@ -106,12 +117,12 @@ operation_order = single_frame_layer * num_single_frame_decoder + \
 
 # anchors
 anchor_paths = {
-    "det": "data_nusc/kmeans/kmeans_det_900.npy",
-    "map": "data_nusc/kmeans/kmeans_map_100.npy",
-    "motion": f"data_nusc/kmeans/kmeans_motion_{fut_mode}.npy",
+    "det": "data/kmeans/kmeans_det_900.npy",
+    "map": "data/kmeans/kmeans_map_100.npy",
+    "motion": f"data/kmeans/kmeans_motion_{fut_mode}.npy",
 }
 
-plan_anchor_paths = f"data_nusc/kmeans/kmeans_plan_{ego_fut_mode}.npy"
+plan_anchor_paths = f"data/kmeans/kmeans_plan_{ego_fut_mode}.npy"
 plan_speed_refer = None
 plan_anchor_refer = ("temp", "2hz")
 plan_anchor_types = [("temp", "2hz")]
@@ -427,9 +438,9 @@ model = dict(
 
 # ================== data ========================
 dataset_type = "NuScenes3DDataset"
-data_root = "data_nusc/nuscenes/"
-eval_data_root = "data_nusc/infos/nuscenes/"
-anno_root = "data_nusc/infos/" if version == 'trainval' else "data_nusc/infos/mini/"
+data_root = "data/nuscenes/"
+eval_data_root = "data/infos/nuscenes/"
+anno_root = "data/infos/" if version == 'trainval' else "data/infos/mini/"
 file_client_args = dict(backend="disk")
 
 img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
