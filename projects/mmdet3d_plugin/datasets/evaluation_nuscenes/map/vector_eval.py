@@ -16,6 +16,8 @@ from mmdet.datasets import build_dataset, build_dataloader
 
 from .AP import instance_match, average_precision
 
+import multiprocessing as mp
+
 INTERP_NUM = 200 # number of points to interpolate during evaluation
 THRESHOLDS = [0.5, 1.0, 1.5] # AP thresholds
 N_WORKERS = 16 # num workers to parallel
@@ -197,7 +199,8 @@ class VectorEvaluate(object):
         print(f'\nevaluating {len(self.id2cat)} categories...')
         start = time()
         if self.n_workers > 0:
-            pool = Pool(self.n_workers)
+            ctx = mp.get_context('spawn')
+            pool = ctx.Pool(self.n_workers)
         
         sum_mAP = 0
         pbar = mmcv.ProgressBar(len(self.id2cat))
