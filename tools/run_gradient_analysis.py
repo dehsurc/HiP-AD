@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Orchestrate the gradient analysis pipeline across checkpoints and modules.
-
+cd /home/yongjae/e2e/HiP-AD && CUDA_VISIBLE_DEVICES=3 CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONPATH=. /home/yongjae/miniconda3/envs/hipad/bin/python tools/run_gradient_analysis.py --config configs/gradient_analysis.yaml --checkpoints 1ep --modules M3,M4 2>&1 | tee gradient_analysis_results/supplementary.log
 Usage:
     python tools/run_gradient_analysis.py --config configs/gradient_analysis.yaml --all
     python tools/run_gradient_analysis.py --config ... --modules M2,M3,M4
@@ -11,10 +11,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -40,6 +41,15 @@ def _import_runtime():
     from tools.gradient_analysis.gradnorm import run_m5
     from tools.gradient_analysis.asymmetry import run_m7
     from tools.gradient_analysis.dynamics import run_m6
+    from tools.gradient_analysis.landscape import run_m8
+    # Apply runtime fixes for HiP-AD sampler / CUDA-kernel quirks. Idempotent;
+    # safe to call before the first forward.
+    from tools.gradient_analysis.compat import (
+        apply_index_put_fix,
+        apply_use_reentrant_false,
+    )
+    apply_use_reentrant_false()
+    apply_index_put_fix()
 
     return {
         "Config": Config, "MMDataParallel": MMDataParallel,
@@ -48,7 +58,7 @@ def _import_runtime():
         "GradientCollector": GradientCollector, "build_dataloader": build_dataloader,
         "run_m2": run_m2, "analyze_pair_batches": analyze_pair_batches,
         "run_m3": run_m3, "run_m4": run_m4, "run_m5": run_m5,
-        "run_m7": run_m7, "run_m6": run_m6,
+        "run_m7": run_m7, "run_m6": run_m6, "run_m8": run_m8,
     }
 
 
@@ -57,9 +67,12 @@ def set_seeds(seed: int, deterministic: bool) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    # cudnn.benchmark=True lets cuDNN search for a workable algorithm; without
+    # it, deterministic mode often fails with "Unable to find a valid cuDNN
+    # algorithm". Reproducibility for our probe comes from RNG seeding +
+    # per-forward seed pinning, not from torch.use_deterministic_algorithms.
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = bool(deterministic)
 
 
 def _load_plugins(cfg) -> None:
@@ -81,6 +94,12 @@ def _load_plugins(cfg) -> None:
 
 def load_model(rt, cfg, ckpt_path: Path, device: str, fp16: bool):
     _load_plugins(cfg)
+    # Keep `img_backbone.with_cp=True` enabled — we monkey-patch
+    # `torch.utils.checkpoint.checkpoint` to use_reentrant=False (see
+    # compat.apply_use_reentrant_false), which makes activation
+    # checkpointing compatible with `torch.autograd.grad(inputs=...)`.
+    # That preserves ~70% backbone-activation memory savings that we
+    # otherwise lose when running per-task backward passes.
     model = rt["build_detector"](cfg.model, train_cfg=cfg.get("train_cfg"), test_cfg=cfg.get("test_cfg"))
     model.init_weights()
     if fp16:
@@ -97,6 +116,9 @@ def load_model(rt, cfg, ckpt_path: Path, device: str, fp16: bool):
 def run_primary_for_checkpoint(
     rt, cfg_ana, ckpt_tag: str, ckpt_path: Path, out_dir: Path,
     modules: List[str], smoke: bool,
+    target_layers: Optional[List[str]] = None,
+    freeze_matching: bool = False,
+    reset_temporal_state: bool = False,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     model_cfg = rt["Config"].fromfile(cfg_ana["model_config"])
@@ -136,20 +158,37 @@ def run_primary_for_checkpoint(
     if "M2" in modules:
         rt["run_m2"](cached, cfg_ana["tasks"], groups, out_dir / "conflict")
 
-    # M3 probe — rebuild a fresh dataloader (iterator state reset)
+    # M3 probe — rebuild a fresh dataloader (iterator state reset). Free any
+    # residual autograd graphs / cached tensors from the M2 collect loop so
+    # cuDNN has room to pick a workspace-hungry conv algorithm.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     probe_df = None
     if "M3" in modules:
         dl2 = rt["build_dataloader"](model_cfg, cfg_ana["primary"]["batch_size"], True, cfg_ana["seed"])
+        forward_seed = cfg_ana.get("probe", {}).get("forward_seed", cfg_ana.get("seed"))
         probe_df = rt["run_m3"](
             collector, dl2, num_batches,
             alpha=cfg_ana["probe"]["alpha"],
             steps_list=cfg_ana["probe"]["steps"],
             variants=cfg_ana["probe"]["variants"],
             out_dir=out_dir / "probe",
+            target_layers=target_layers,
+            freeze_matching=freeze_matching,
+            forward_seed=forward_seed,
+            reset_temporal_state=reset_temporal_state,
         )
 
+    # M4/M5/M7 assume probe_df aggregates over the full param set (one ΔL per
+    # (source, target) pair). Per-layer probes produce one row per layer and
+    # would silently double-count, so we skip these modules and tell the user.
+    per_layer = bool(target_layers)
+    if per_layer and any(m in modules for m in ("M4", "M5", "M7")):
+        print(f"[{ckpt_tag}] per-layer probe active (layers={target_layers}); "
+              f"skipping M4/M5/M7 (full-update probe required for those).")
+
     # M4 correlation (needs M2 + M3)
-    if "M4" in modules and probe_df is not None:
+    if "M4" in modules and probe_df is not None and not per_layer:
         cos_dfs = {}
         for a_idx, a in enumerate(cfg_ana["tasks"]):
             for b in cfg_ana["tasks"][a_idx + 1:]:
@@ -167,17 +206,60 @@ def run_primary_for_checkpoint(
             )
 
     # M5 gradnorm
-    if "M5" in modules and probe_df is not None:
+    if "M5" in modules and probe_df is not None and not per_layer:
         rt["run_m5"](cached, cfg_ana["tasks"], groups, probe_df,
                steps_list=cfg_ana["probe"]["steps"], out_dir=out_dir / "gradnorm")
 
     # M7 asymmetry (depends on M3)
-    if "M7" in modules and probe_df is not None:
+    if "M7" in modules and probe_df is not None and not per_layer:
         rt["run_m7"](probe_df, cfg_ana["tasks"],
                steps=1, variant="raw", out_dir=out_dir / "asymmetry")
 
+    # M8 gradient surface (1D line probe; independent of M2/M3)
+    if "M8" in modules:
+        ls_cfg = cfg_ana.get("landscape", {})
+        if not ls_cfg.get("enabled", True):
+            print(f"[{ckpt_tag}] M8 disabled in config (landscape.enabled=false); skipping")
+        else:
+            num_ls = 3 if smoke else ls_cfg.get("num_batches", 5)
+            t_grid = ls_cfg.get("t_grid") or [
+                -3.0, -2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0, 3.0
+            ]
+            ls_bs = ls_cfg.get("batch_size") or cfg_ana["primary"]["batch_size"]
+            dl3 = rt["build_dataloader"](model_cfg, ls_bs, True, cfg_ana["seed"])
+            rt["run_m8"](
+                collector, dl3, num_ls,
+                alpha=cfg_ana["probe"]["alpha"],
+                t_grid=t_grid,
+                out_dir=out_dir / "landscape",
+                target_layers=target_layers,
+                freeze_matching=freeze_matching,
+                forward_seed=cfg_ana.get("probe", {}).get("forward_seed", cfg_ana.get("seed")),
+                reset_temporal_state=reset_temporal_state,
+            )
 
-def run_supplementary(rt, cfg_ana, out_dir: Path) -> None:
+def _release_gpu_resources(label: str = "") -> None:
+    """Force a Python GC pass + CUDA cache release. Call this from the
+    OUTER caller after a function that built a model/collector returns —
+    by that point the function-frame locals are unreferenced and gc.collect
+    can actually reclaim them, freeing the underlying GPU tensors."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            free, total = torch.cuda.mem_get_info()
+            print(f"[cleanup{':' + label if label else ''}] "
+                  f"gpu free={free/2**30:.2f}GiB / {total/2**30:.2f}GiB")
+        except Exception:
+            pass
+
+
+def run_supplementary(
+    rt, cfg_ana, out_dir: Path,
+    target_layers: Optional[List[str]] = None,
+    freeze_matching: bool = False,
+    reset_temporal_state: bool = False,
+) -> None:
     sup = cfg_ana["supplementary"]
     if not sup["enabled"]:
         return
@@ -192,12 +274,17 @@ def run_supplementary(rt, cfg_ana, out_dir: Path) -> None:
         device=cfg_ana["device"],
     )
     dataloader = rt["build_dataloader"](model_cfg, sup["batch_size"], True, cfg_ana["seed"])
+    forward_seed = cfg_ana.get("probe", {}).get("forward_seed", cfg_ana.get("seed"))
     probe_df = rt["run_m3"](
         collector, dataloader, sup["num_samples"],
         alpha=cfg_ana["probe"]["alpha"],
         steps_list=cfg_ana["probe"]["steps"],
         variants=cfg_ana["probe"]["variants"],
         out_dir=out_dir,
+        target_layers=target_layers,
+        freeze_matching=freeze_matching,
+        forward_seed=forward_seed,
+        reset_temporal_state=reset_temporal_state,
     )
     # Collect shared grads on same batches for cos joining
     dl2 = rt["build_dataloader"](model_cfg, sup["batch_size"], True, cfg_ana["seed"])
@@ -233,6 +320,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-supplementary", action="store_true")
     p.add_argument("--smoke", action="store_true",
                    help="Use only 3 batches per checkpoint (quick end-to-end test)")
+    p.add_argument("--probe-layers", default=None,
+                   help="Comma-separated shared_param group keys (e.g. 'dec3_ffn_0,fc_after'). "
+                        "When set, M3 applies the virtual update to ONLY those layers and "
+                        "produces per-layer ΔL matrices. Overrides probe.target_layers in YAML.")
+    p.add_argument("--freeze-matching", dest="freeze_matching", action="store_true",
+                   default=None,
+                   help="Pin Hungarian matching (det/map) and mode-selection argmin "
+                        "(motion/plan) across baseline/grad/stepped forwards. Overrides "
+                        "probe.freeze_matching in YAML.")
+    p.add_argument("--no-freeze-matching", dest="freeze_matching", action="store_false",
+                   help="Disable matching freeze even if YAML enables it.")
+    p.add_argument("--reset-temporal-state", dest="reset_temporal_state",
+                   action="store_true", default=None,
+                   help="Restore InstanceBank cache + run_step before each forward "
+                        "in the probe cycle (default: follow probe.reset_temporal_state). "
+                        "Eliminates cache drift between baseline / grad / stepped forwards.")
+    p.add_argument("--no-reset-temporal-state", dest="reset_temporal_state",
+                   action="store_false",
+                   help="Disable temporal-state reset even if YAML enables it.")
+    p.add_argument("--output-root", default=None,
+                   help="Override `output_root` in YAML — useful for parking each "
+                        "experiment in its own folder (e.g. exp_perlayer_fc). "
+                        "Created if missing.")
     return p.parse_args()
 
 
@@ -242,15 +352,39 @@ def main() -> int:
         cfg_ana = yaml.safe_load(f)
 
     set_seeds(cfg_ana["seed"], cfg_ana.get("deterministic", True))
-    if cfg_ana.get("deterministic"):
+    # `torch.use_deterministic_algorithms(True)` forces every CUDA op into a
+    # deterministic kernel. In practice cuDNN conv often has no such kernel
+    # at probe input shapes ("Unable to find a valid cuDNN algorithm") and
+    # several map/motion ops also lack deterministic implementations. Skip
+    # it; same-seed reproducibility is already covered by `set_seeds` above
+    # and `per_forward_seed` inside the probe cycle.
+    if cfg_ana.get("strict_deterministic"):
         torch.use_deterministic_algorithms(True, warn_only=True)
 
     # Now import HiP-AD runtime (deferred so --help works without env)
     rt = _import_runtime()
 
     modules = args.modules.split(",")
-    out_root = Path(cfg_ana["output_root"])
+    out_root = Path(args.output_root or cfg_ana["output_root"])
     out_root.mkdir(parents=True, exist_ok=True)
+    print(f"[output] writing results under {out_root.resolve()}")
+
+    # Resolve probe variance-control options (CLI overrides YAML).
+    probe_cfg = cfg_ana.get("probe", {})
+    if args.probe_layers is not None:
+        target_layers = [s for s in args.probe_layers.split(",") if s]
+    else:
+        target_layers = probe_cfg.get("target_layers") or None
+    if args.freeze_matching is None:
+        freeze_matching = bool(probe_cfg.get("freeze_matching", False))
+    else:
+        freeze_matching = bool(args.freeze_matching)
+    if args.reset_temporal_state is None:
+        yaml_reset = probe_cfg.get("reset_temporal_state", None)
+        # null/missing in YAML → mirror freeze_matching; explicit true/false → use it.
+        reset_temporal_state = freeze_matching if yaml_reset is None else bool(yaml_reset)
+    else:
+        reset_temporal_state = bool(args.reset_temporal_state)
 
     tags = list(cfg_ana["checkpoints"].keys())
     if args.checkpoints:
@@ -261,8 +395,18 @@ def main() -> int:
         ckpt_path = Path(cfg_ana["ckpt_root"]) / cfg_ana["checkpoints"][tag]
         out_dir = out_root / f"ckpt_{tag}"
         per_ckpt_dirs[tag] = out_dir
-        print(f"[{tag}] running modules {modules} → {out_dir}")
-        run_primary_for_checkpoint(rt, cfg_ana, tag, ckpt_path, out_dir, modules, smoke=args.smoke)
+        print(f"[{tag}] running modules {modules} → {out_dir} "
+              f"(layers={target_layers or 'ALL'}, freeze_matching={freeze_matching}, "
+              f"reset_temporal_state={reset_temporal_state})")
+        run_primary_for_checkpoint(
+            rt, cfg_ana, tag, ckpt_path, out_dir, modules, smoke=args.smoke,
+            target_layers=target_layers, freeze_matching=freeze_matching,
+            reset_temporal_state=reset_temporal_state,
+        )
+        # The function frame just exited, so its local model/collector/cached
+        # are now unreferenced. Force a gc + cuda cache release before the
+        # next ckpt builds a fresh model.
+        _release_gpu_resources(label=f"after_{tag}")
 
     if "M6" in modules and len(per_ckpt_dirs) >= 2:
         print(f"[M6] aggregating dynamics across {list(per_ckpt_dirs.keys())}")
@@ -270,8 +414,15 @@ def main() -> int:
 
     if not args.no_supplementary and not args.smoke:
         sup_dir = out_root / "supplementary"
-        print(f"[supplementary] batch_size=1 probe on {cfg_ana['supplementary']['checkpoint']}")
-        run_supplementary(rt, cfg_ana, sup_dir)
+        print(f"[supplementary] batch_size=1 probe on {cfg_ana['supplementary']['checkpoint']} "
+              f"(layers={target_layers or 'ALL'}, freeze_matching={freeze_matching}, "
+              f"reset_temporal_state={reset_temporal_state})")
+        run_supplementary(
+            rt, cfg_ana, sup_dir,
+            target_layers=target_layers, freeze_matching=freeze_matching,
+            reset_temporal_state=reset_temporal_state,
+        )
+        _release_gpu_resources(label="after_supplementary")
 
     # Generate markdown summary
     from tools.gradient_analysis.summary import generate_summary
