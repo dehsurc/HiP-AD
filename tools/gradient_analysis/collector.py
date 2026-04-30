@@ -10,6 +10,7 @@ modules (M2/M3/M5) can read without re-running backward.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -20,6 +21,48 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+
+
+# Stochastic / running-stat layers that MUST be in eval mode during the probe.
+# Without this, every forward updates BN running stats and re-samples dropout
+# masks, so baseline / grad / stepped forwards see a drifting model. That
+# contamination was responsible for the systematic ΔL_det blow-up at 1ep
+# regardless of source task: the *upstream* features (where det is most
+# sensitive) drifted, while downstream queries that buffer through additional
+# transforms (map/motion/plan) showed only minor drift — exactly the pattern
+# observed before this fix landed.
+_STOCHASTIC_TYPES = (
+    nn.Dropout, nn.Dropout2d, nn.Dropout3d,
+    nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm,
+)
+
+
+@contextlib.contextmanager
+def _selective_eval(model: nn.Module):
+    """Force Dropout / BN / DeformableFeatureAggregation to eval for the
+    duration of the block, while keeping the rest of the model in train mode
+    (so loss-computing branches still fire). Restores prior training state on
+    exit."""
+    # Lazy import — DeformableFeatureAggregation is HiP-AD-specific.
+    try:
+        from projects.mmdet3d_plugin.models.blocks import (  # type: ignore
+            DeformableFeatureAggregation,
+        )
+        extra_types = (DeformableFeatureAggregation,)
+    except Exception:
+        extra_types = tuple()
+
+    switched: List[nn.Module] = []
+    target_types = _STOCHASTIC_TYPES + extra_types
+    for m in model.modules():
+        if isinstance(m, target_types) and m.training:
+            m.eval()
+            switched.append(m)
+    try:
+        yield
+    finally:
+        for m in switched:
+            m.train()
 
 
 # ----------------------------- public pure helpers -----------------------------
@@ -156,9 +199,18 @@ class GradientCollector:
         return self.model.module if hasattr(self.model, "module") else self.model
 
     def forward_losses(self, data) -> Dict[str, torch.Tensor]:
-        """Run model forward in train mode and return the loss dict with grad."""
+        """Run model forward and return the loss dict with grad.
+
+        Uses ``_selective_eval`` so BN/Dropout/DeformableFeatureAggregation are
+        in eval mode for this forward, while the rest of the model stays in
+        train (so the loss-computing branches still fire). Without this, the
+        probe's baseline / grad / stepped forwards see a drifting model
+        because each ``model(**data)`` call updates BN running stats and
+        resamples dropout masks.
+        """
         self.model.train()
-        losses = self.model(**data)
+        with _selective_eval(self._raw_model()):
+            losses = self.model(**data)
         if isinstance(losses, (list, tuple)):
             # MMDataParallel wrapping may return a list; take first (single GPU)
             losses = losses[0]

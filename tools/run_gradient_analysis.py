@@ -286,6 +286,15 @@ def run_supplementary(
         forward_seed=forward_seed,
         reset_temporal_state=reset_temporal_state,
     )
+    # M4 correlation assumes one ΔL per (source, target) pair (full-update
+    # probe). Per-layer probe_df has multiple ΔL rows per pair (one per
+    # layer), which makes the cosine ↔ ΔL join multi-valued and the
+    # pearsonr/spearmanr calls hit NaN/inf. Skip in per-layer mode, mirror
+    # the guard in run_primary_for_checkpoint.
+    if target_layers:
+        print(f"[supplementary] per-layer probe active (layers={list(target_layers)}); "
+              f"skipping correlation/M4 step (full-update probe required).")
+        return
     # Collect shared grads on same batches for cos joining
     dl2 = rt["build_dataloader"](model_cfg, sup["batch_size"], True, cfg_ana["seed"])
     cached = []

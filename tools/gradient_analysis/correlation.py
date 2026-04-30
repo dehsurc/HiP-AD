@@ -36,9 +36,21 @@ def join_cos_delta(
 
 
 def pair_correlations(df: pd.DataFrame) -> Tuple[float, float]:
-    """Return (pearson, spearman) between cos and delta."""
+    """Return (pearson, spearman) between cos and delta.
+
+    scipy's pearsonr/spearmanr asserts ``asarray_chkfinite`` and raises
+    ``ValueError: array must not contain infs or NaNs`` when fed any
+    non-finite value. The probe occasionally emits NaN ``delta`` rows
+    (e.g. baseline loss exactly zero, or a task absent on a given batch);
+    drop them defensively so the correlation step doesn't crash the run.
+    """
     from scipy.stats import pearsonr, spearmanr
 
+    finite = (
+        np.isfinite(df["cos"].to_numpy(dtype=float))
+        & np.isfinite(df["delta"].to_numpy(dtype=float))
+    )
+    df = df.loc[finite]
     if len(df) < 3:
         return float("nan"), float("nan")
     p, _ = pearsonr(df["cos"], df["delta"])
