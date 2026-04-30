@@ -278,16 +278,36 @@ def _replan_gather(self, cls_pred, reg_pred, data, mode_idx):
 
 @contextlib.contextmanager
 def per_forward_seed(seed: int):
-    """Pin RNG for the next forward (DN noise / temporal_dn_groups randperm).
+    """Pin RNG for the next forward.
 
-    Captures the pre-call RNG state and restores it on exit, so this can be
-    nested or interleaved without polluting the outer RNG stream."""
+    Pins torch (CPU+CUDA), numpy, and Python ``random`` streams. Numpy
+    matters because ``GridMask.forward`` (data augmentation in
+    ``SparseDetector.extract_feat``) uses ``np.random.rand()`` /
+    ``np.random.randint()`` to choose mask placement; without resetting
+    numpy's RNG, F0 and F1 see DIFFERENT masked input images, which is the
+    real source of prediction drift the freeze patches were getting blamed
+    for. ``random`` is included as belt-and-braces against any third-party
+    aug code path.
+
+    Captures the pre-call RNG states and restores them on exit, so this can
+    be nested or interleaved without polluting the outer RNG stream."""
+    import random as _random
+
+    import numpy as _np
+
     cpu_state = torch.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np_state = _np.random.get_state()
+    py_state = _random.getstate()
+
     torch.manual_seed(seed)
+    _np.random.seed(seed)
+    _random.seed(seed)
     try:
         yield
     finally:
         torch.set_rng_state(cpu_state)
         if cuda_state is not None:
             torch.cuda.set_rng_state_all(cuda_state)
+        _np.random.set_state(np_state)
+        _random.setstate(py_state)

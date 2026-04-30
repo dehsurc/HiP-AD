@@ -36,17 +36,34 @@ probe:
   # baseline forward across the entire probe cycle. Strongly recommended
   # whenever target loss change can be confused with matching reshuffling.
   # Override at the CLI with --freeze-matching / --no-freeze-matching.
+  #
+  # NOTE (2026-04-30): freeze_matching previously appeared "broken" (drift
+  # ~100x on repeated forwards) but the real bugs were leaks elsewhere —
+  # see diag_forward_determinism.py [F]. After fixing them, drift collapses
+  # to ~0 with all three knobs on. Fixes (in tools/gradient_analysis/):
+  #   1. temporal_state.py:_bank_holders — banks live nested inside the
+  #      head (head.onedecoder_head.det_instance_bank), not on raw model.
+  #      Now walks the full module tree; previously snapshotted ZERO banks.
+  #   2. temporal_state.py:_sampler_holders — det/map ``BaseTargetWithDenoising``
+  #      samplers cache ``dn_metas`` via ``cache_dn`` which leaks into the
+  #      next forward via ``update_dn``, changing the decoder's control
+  #      flow (extra anchors). Samplers aren't nn.Module so we discover
+  #      them via *_sampler attrs on every nn.Module.
+  #   3. matching_freeze.py:per_forward_seed — also reseeds numpy and
+  #      ``random``. ``GridMask.forward`` uses ``np.random.rand/randint``
+  #      so without numpy reset the augmented input image differs across
+  #      forwards (was the dominant non-determinism source).
   freeze_matching: true
-  # Restore InstanceBank temporal cache (cached_feature/anchor/metas/
-  # confidence) and `run_step` before every forward inside the probe cycle.
-  # Without this, baseline / grad / stepped forwards see different temporal
-  # caches because each forward calls `bank.cache(...)` which mutates state.
+  # Restore InstanceBank temporal cache + sampler dn_metas + run_step
+  # before every forward inside the probe cycle. Without this, baseline /
+  # grad / stepped forwards see different temporal state because each
+  # forward calls ``bank.cache(...)`` and ``sampler.cache_dn(...)``.
   # Default mirrors `freeze_matching` — leave null to inherit, true/false
   # to override. CLI: --reset-temporal-state / --no-reset-temporal-state.
-  reset_temporal_state: null
-  # Per-forward RNG seed (DN noise determinism). Falls back to the
-  # top-level `seed` if omitted.
-  forward_seed: null
+  reset_temporal_state: true
+  # Per-forward RNG seed (DN noise + GridMask augmentation determinism).
+  # Falls back to the top-level `seed` if omitted.
+  forward_seed: 42
 
 # M8 — gradient-direction loss surface (1D line probe). Computes
 # L_target(θ - t·α·ĝ_source) for every source/target pair across a grid of
