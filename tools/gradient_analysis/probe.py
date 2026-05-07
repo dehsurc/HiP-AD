@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -279,6 +279,140 @@ def aggregate_affinity_matrix(
     )
 
 
+def aggregate_affinity_matrix_with_ci(
+    df: pd.DataFrame, steps: int, variant: str, layer: str = "_all",
+    n_resamples: int = 2000, seed: int = 0,
+):
+    """Phase 1 #9 — bootstrap variance bands on the affinity matrix.
+
+    Like ``aggregate_affinity_matrix`` but returns three matrices:
+    (mean, ci_lo, ci_hi) of the per-batch ΔL distribution per (source, target).
+    Cells whose CI brackets zero are not flagged here — that's downstream
+    interpretation responsibility.
+    """
+    from .bootstrap import bca_ci
+
+    sub = df[(df["steps"] == steps) & (df["variant"] == variant) & (df["layer"] == layer)]
+    sources = sorted(sub["source_task"].unique()) if not sub.empty else []
+    targets = sorted(sub["target_task"].unique()) if not sub.empty else []
+    mean = pd.DataFrame(np.nan, index=sources, columns=targets)
+    lo = pd.DataFrame(np.nan, index=sources, columns=targets)
+    hi = pd.DataFrame(np.nan, index=sources, columns=targets)
+    for i, s in enumerate(sources):
+        for j, t in enumerate(targets):
+            cell = sub[(sub["source_task"] == s) & (sub["target_task"] == t)]["delta"].to_numpy()
+            cell = cell[np.isfinite(cell)]
+            if cell.size == 0:
+                continue
+            mean.iloc[i, j] = float(cell.mean())
+            l, h = bca_ci(cell, statistic=np.mean, n_resamples=n_resamples,
+                          seed=seed + i * len(targets) + j)
+            lo.iloc[i, j] = l
+            hi.iloc[i, j] = h
+    return mean, lo, hi
+
+
+def run_alpha_sweep(
+    collector,
+    dataloader=None,
+    num_batches: int = 100,
+    alphas: Sequence[float] = (1e-4, 1e-3),
+    sources: Sequence[str] = ("motion",),
+    out_dir: Path = Path("alpha_sweep"),
+    steps_list: Sequence[int] = (1,),
+    variants: Sequence[str] = ("raw", "normalized"),
+    target_layers: Optional[Sequence[str]] = None,
+    freeze_matching: bool = True,
+    forward_seed: Optional[int] = 42,
+    reset_temporal_state: bool = True,
+    dl_factory: Optional[Callable] = None,
+) -> pd.DataFrame:
+    """Phase 1 #9 — α-sensitivity sweep, motion-only by default.
+
+    Re-runs the probe on a per-α basis, restricted to the given source tasks.
+    Output: one CSV per α at ``out_dir/sweep_alpha_<a>.csv`` plus a combined
+    ``sweep_summary.csv`` with the diag>0 violation rate as a function of α.
+
+    Dataloader handling:
+
+    * Pass `dl_factory=lambda: build_dataloader(...)` (preferred). The factory
+      is called once per α to produce a fresh iterator with the same seed →
+      same batch order → α comparisons are deterministic without holding
+      the entire dataset in memory.
+
+    * Pass `dataloader=...` (legacy). The first `num_batches` items are
+      materialized via `itertools.islice` and replayed across α values.
+      Memory cost: `num_batches × per-batch tensor size`, bounded.
+    """
+    import itertools
+    from .bootstrap import bca_ci
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary_rows: List[Dict] = []
+
+    if dl_factory is None and dataloader is None:
+        raise ValueError("run_alpha_sweep requires either `dl_factory` or `dataloader`")
+
+    # If only a static dataloader is given, materialize the first num_batches
+    # via islice (NOT list(iter(dl)) which exhausts the entire dataset).
+    materialized: Optional[List] = None
+    if dl_factory is None:
+        materialized = list(itertools.islice(dataloader, num_batches))
+
+    sources = list(sources)
+    for a in alphas:
+        # Per-α iterator: prefer factory (deterministic, low-mem) over the
+        # materialized snapshot (legacy fallback).
+        if dl_factory is not None:
+            dl_iter = itertools.islice(iter(dl_factory()), num_batches)
+        else:
+            dl_iter = iter(materialized)
+        rows: List[ProbeRow] = []
+        prev_data = None
+        for i, data in enumerate(dl_iter):
+            rows.extend(probe_one_batch(
+                collector, data, data_next=prev_data, alpha=a,
+                steps_list=list(steps_list), variants=list(variants), batch_idx=i,
+                target_layers=target_layers,
+                freeze_matching=freeze_matching, forward_seed=forward_seed,
+                reset_temporal_state=reset_temporal_state,
+            ))
+            prev_data = data
+        df = rows_to_dataframe(rows)
+        if not df.empty:
+            df = df[df["source_task"].isin(sources)]
+        df.to_csv(out_dir / f"sweep_alpha_{a:.0e}.csv", index=False)
+        for variant in variants:
+            sub = df[(df["steps"] == 1) & (df["variant"] == variant)] if not df.empty \
+                  else df.iloc[0:0]
+            for s in sources:
+                target_set = sorted(sub["target_task"].unique()) if not sub.empty else []
+                for t in target_set:
+                    cell = sub[(sub["source_task"] == s) & (sub["target_task"] == t)]
+                    if cell.empty:
+                        continue
+                    deltas = cell["delta"].to_numpy()
+                    diag_violation = (
+                        float((deltas > 0).mean()) if s == t and deltas.size > 0
+                        else float("nan")
+                    )
+                    lo, hi = bca_ci(deltas, n_resamples=1000, seed=0)
+                    summary_rows.append({
+                        "alpha": a, "variant": variant,
+                        "source_task": s, "target_task": t,
+                        "n": int(len(cell)),
+                        "diag_violation_rate": diag_violation,
+                        "mean_delta": float(deltas.mean()) if deltas.size else float("nan"),
+                        "mean_delta_ci_lo": lo,
+                        "mean_delta_ci_hi": hi,
+                    })
+
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(out_dir / "sweep_summary.csv", index=False)
+    return summary
+
+
 def run_m3(
     collector,
     dataloader,
@@ -325,8 +459,13 @@ def run_m3(
         suffix = "" if layer == "_all" else f"_{layer}"
         for s in steps_list:
             for v in variants:
-                mat = aggregate_affinity_matrix(df, s, v, layer)
-                if mat.empty:
+                # Phase 1 #9 — write mean + bootstrap CI bands alongside.
+                mean_mat, lo_mat, hi_mat = aggregate_affinity_matrix_with_ci(
+                    df, s, v, layer, n_resamples=2000, seed=42,
+                )
+                if mean_mat.empty:
                     continue
-                mat.to_csv(out_dir / f"probe_matrix{suffix}_{s}step_{v}.csv")
+                mean_mat.to_csv(out_dir / f"probe_matrix{suffix}_{s}step_{v}.csv")
+                lo_mat.to_csv(out_dir / f"probe_matrix{suffix}_{s}step_{v}_ci_lo.csv")
+                hi_mat.to_csv(out_dir / f"probe_matrix{suffix}_{s}step_{v}_ci_hi.csv")
     return df

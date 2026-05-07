@@ -18,17 +18,31 @@ def decompose_matrix(M: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def top_asymmetric_pairs(M: np.ndarray, labels: Sequence[str], k: int = 5):
+    """Rank task pairs by |antisymmetric component|, NaN-aware.
+
+    Pairs whose (i, j) or (j, i) cell is NaN are still emitted (with NaN
+    antisym values) so callers see them in the table, but they sort last so
+    the top-k ranking is dominated by finite values.
+    """
     _, A = decompose_matrix(M)
     candidates = []
     n = len(labels)
     for i in range(n):
         for j in range(i + 1, n):
+            v = float(A[i, j])
+            abs_v = float(abs(v)) if np.isfinite(v) else float("nan")
             candidates.append({
                 "pair": (labels[i], labels[j]),
-                "antisym": float(A[i, j]),
-                "abs_antisym": float(abs(A[i, j])),
+                "antisym": v,
+                "abs_antisym": abs_v,
             })
-    candidates.sort(key=lambda d: d["abs_antisym"], reverse=True)
+    # NaN-aware sort: finite values first by descending abs, NaN trailing.
+    candidates.sort(
+        key=lambda d: (
+            0 if np.isfinite(d["abs_antisym"]) else 1,
+            -d["abs_antisym"] if np.isfinite(d["abs_antisym"]) else 0.0,
+        )
+    )
     return candidates[:k]
 
 

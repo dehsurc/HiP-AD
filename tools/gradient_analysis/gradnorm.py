@@ -33,9 +33,33 @@ def per_task_norms_from_cached(cached, tasks: List[str], groups: List[str]) -> p
 
 
 def antisymmetric_frobenius(M: np.ndarray) -> float:
-    """Frobenius norm of (M - M^T) / 2."""
-    A = (M - M.T) / 2.0
-    return float(np.sqrt((A * A).sum()))
+    """Frobenius norm of the antisymmetric part (M − Mᵀ) / 2.
+
+    NaN-aware (Phase 1 #4 R6 follow-up): any cell whose (i, j) or (j, i)
+    counterpart is NaN is dropped. Returns NaN only if every off-diagonal
+    pair is invalid. Without this guard, a single NaN cell anywhere in the
+    affinity matrix (e.g. an ego row that the model leaves empty under fp16)
+    would propagate to make the entire summary's Frobenius column NaN, which
+    is what the prior summary report showed.
+    """
+    M = np.asarray(M, dtype=np.float64)
+    if M.ndim != 2 or M.shape[0] != M.shape[1]:
+        return float("nan")
+    n = M.shape[0]
+    sq_sum = 0.0
+    n_valid = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            a = M[i, j]
+            b = M[j, i]
+            if np.isfinite(a) and np.isfinite(b):
+                # Each off-diagonal pair contributes ((a − b) / 2)² to both
+                # the (i, j) and (j, i) entries of the antisymmetric matrix.
+                sq_sum += 2.0 * ((a - b) / 2.0) ** 2
+                n_valid += 1
+    if n_valid == 0:
+        return float("nan")
+    return float(np.sqrt(sq_sum))
 
 
 def run_m5(

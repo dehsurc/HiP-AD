@@ -36,12 +36,16 @@ def _import_runtime():
 
     from tools.gradient_analysis.collector import GradientCollector, build_dataloader
     from tools.gradient_analysis.conflict import run_m2, analyze_pair_batches
-    from tools.gradient_analysis.probe import run_m3
+    from tools.gradient_analysis.probe import run_m3, run_alpha_sweep
     from tools.gradient_analysis.correlation import run_m4
     from tools.gradient_analysis.gradnorm import run_m5
     from tools.gradient_analysis.asymmetry import run_m7
     from tools.gradient_analysis.dynamics import run_m6
     from tools.gradient_analysis.landscape import run_m8
+    from tools.gradient_analysis.null_baseline import run_null_baseline
+    from tools.gradient_analysis.distribution import run_distribution
+    from tools.gradient_analysis.bootstrap import augment_summary_with_ci
+    from tools.gradient_analysis.magnitude_dynamics import run_magnitude_dynamics
     # Apply runtime fixes for HiP-AD sampler / CUDA-kernel quirks. Idempotent;
     # safe to call before the first forward.
     from tools.gradient_analysis.compat import (
@@ -59,6 +63,11 @@ def _import_runtime():
         "run_m2": run_m2, "analyze_pair_batches": analyze_pair_batches,
         "run_m3": run_m3, "run_m4": run_m4, "run_m5": run_m5,
         "run_m7": run_m7, "run_m6": run_m6, "run_m8": run_m8,
+        "run_alpha_sweep": run_alpha_sweep,
+        "run_null_baseline": run_null_baseline,
+        "run_distribution": run_distribution,
+        "augment_summary_with_ci": augment_summary_with_ci,
+        "run_magnitude_dynamics": run_magnitude_dynamics,
     }
 
 
@@ -158,6 +167,55 @@ def run_primary_for_checkpoint(
     if "M2" in modules:
         rt["run_m2"](cached, cfg_ana["tasks"], groups, out_dir / "conflict")
 
+    # M_N1 — random-baseline / permutation test (Phase 1 #1)
+    if "M_N1" in modules or "null_baseline" in modules:
+        nb_dir = out_dir / "null_baseline"
+        nb_dir.mkdir(parents=True, exist_ok=True)
+        rt["run_null_baseline"](
+            cached_batches=cached,
+            tasks=cfg_ana["tasks"],
+            group_keys=groups,
+            n_repeats=cfg_ana.get("null_baseline", {}).get("n_repeats", 1000),
+            seed=cfg_ana.get("seed", 42),
+            out_path=nb_dir / "null_baseline.csv",
+        )
+
+    # M_N2 — distribution diagnostics (Phase 1 #2)
+    if "M_N2" in modules or "distribution" in modules:
+        dist_dir = out_dir / "distribution"
+        dist_dir.mkdir(parents=True, exist_ok=True)
+        rt["run_distribution"](
+            cached_batches=cached,
+            tasks=cfg_ana["tasks"],
+            group_keys=groups,
+            out_path=dist_dir / "distribution_report.csv",
+            emit_kde_figures=True,
+            figures_dir=dist_dir / "kde",
+        )
+
+    # Bootstrap CI augmentation on the M2 conflict summary CSVs (Phase 1 #3)
+    if "M2" in modules and cfg_ana.get("bootstrap", {}).get("enabled", True):
+        n_resamples = cfg_ana.get("bootstrap", {}).get("n_resamples", 2000)
+        for f in (out_dir / "conflict").glob("conflict_*_summary.csv"):
+            per_batch_path = f.with_name(f.name.replace("_summary.csv", "_per_batch.csv"))
+            if not per_batch_path.exists():
+                continue
+            try:
+                summary_df = pd.read_csv(f)
+                per_batch_df = pd.read_csv(per_batch_path)
+                augmented = rt["augment_summary_with_ci"](
+                    summary_df, per_batch_df,
+                    group_cols=["group"],
+                    value_cols=["mean_cos", "median_cos", "mean_coop_mag", "mean_conf_mag"],
+                    rate_value_cols=["conflict_ratio"],
+                    rate_per_batch_col="cos",
+                    n_resamples=n_resamples,
+                    seed=cfg_ana.get("seed", 42),
+                )
+                augmented.to_csv(f, index=False)
+            except Exception as e:
+                print(f"[bootstrap] failed on {f.name}: {e}")
+
     # M3 probe — rebuild a fresh dataloader (iterator state reset). Free any
     # residual autograd graphs / cached tensors from the M2 collect loop so
     # cuDNN has room to pick a workspace-hungry conv algorithm.
@@ -214,6 +272,35 @@ def run_primary_for_checkpoint(
     if "M7" in modules and probe_df is not None and not per_layer:
         rt["run_m7"](probe_df, cfg_ana["tasks"],
                steps=1, variant="raw", out_dir=out_dir / "asymmetry")
+
+    # M_AS — α-sensitivity sweep (Phase 1 #9). Runs only on the configured
+    # checkpoint to keep cost bounded. The checkpoint match is on the tag,
+    # not the path, so a YAML override applies cleanly. Uses a factory
+    # closure so each α gets a fresh deterministic iterator without
+    # materializing the entire dataset.
+    if "M_AS" in modules or "alpha_sweep" in modules:
+        sweep_cfg = cfg_ana.get("alpha_sweep", {})
+        if sweep_cfg.get("enabled", False) and ckpt_tag == sweep_cfg.get("checkpoint"):
+            sweep_dir = out_dir / "probe" / "alpha_sweep"
+            def _sweep_dl_factory():
+                return rt["build_dataloader"](
+                    model_cfg, cfg_ana["primary"]["batch_size"], True, cfg_ana["seed"],
+                )
+            rt["run_alpha_sweep"](
+                collector=collector,
+                dl_factory=_sweep_dl_factory,
+                num_batches=sweep_cfg.get("num_batches", 100),
+                alphas=sweep_cfg["alphas"],
+                sources=sweep_cfg["sources"],
+                out_dir=sweep_dir,
+                steps_list=[1],
+                variants=cfg_ana["probe"]["variants"],
+                target_layers=target_layers,
+                freeze_matching=freeze_matching,
+                forward_seed=cfg_ana.get("probe", {}).get("forward_seed",
+                                                          cfg_ana.get("seed")),
+                reset_temporal_state=reset_temporal_state,
+            )
 
     # M8 gradient surface (1D line probe; independent of M2/M3)
     if "M8" in modules:
@@ -322,8 +409,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     p.add_argument("--all", action="store_true")
-    p.add_argument("--modules", default="M2,M3,M4,M5,M6,M7",
-                   help="Comma-separated module codes")
+    p.add_argument("--modules", default="M2,M3,M4,M5,M6,M7,M_N1,M_N2",
+                   help="Comma-separated module codes (M_N1=null_baseline, "
+                        "M_N2=distribution, M_N10=magnitude_dynamics, M_AS=alpha_sweep)")
     p.add_argument("--checkpoints", default=None,
                    help="Comma-separated tags (default: all in config)")
     p.add_argument("--no-supplementary", action="store_true")
@@ -420,6 +508,34 @@ def main() -> int:
     if "M6" in modules and len(per_ckpt_dirs) >= 2:
         print(f"[M6] aggregating dynamics across {list(per_ckpt_dirs.keys())}")
         rt["run_m6"](per_ckpt_dirs, cfg_ana["tasks"], out_root / "dynamics")
+
+    # M_N10 — magnitude non-stationarity (Phase 1 #10). Aggregates across
+    # checkpoints that already have M5 outputs.
+    if "M_N10" in modules or "magnitude_dynamics" in modules:
+        rows: List[Dict] = []
+        for tag, d in per_ckpt_dirs.items():
+            try:
+                ep = float(tag.rstrip("epoch").rstrip("ep"))
+            except ValueError:
+                print(f"[M_N10] skipping checkpoint tag {tag} — cannot parse epoch")
+                continue
+            nf = Path(d) / "gradnorm" / "per_task_norm.csv"
+            if not nf.exists():
+                continue
+            ndf = pd.read_csv(nf)
+            means = ndf.groupby("task")["norm"].mean()
+            for t in cfg_ana["tasks"]:
+                if t in means.index:
+                    rows.append({"epoch": ep, "task": t, "mean_norm": float(means[t])})
+        per_task_norm = pd.DataFrame(rows)
+        if not per_task_norm.empty:
+            print(f"[M_N10] computing magnitude dynamics across "
+                  f"{sorted(per_task_norm['epoch'].unique())} epochs")
+            rt["run_magnitude_dynamics"](
+                per_task_norm,
+                tasks=cfg_ana["tasks"],
+                out_dir=out_root / "magnitude_dynamics",
+            )
 
     if not args.no_supplementary and not args.smoke:
         sup_dir = out_root / "supplementary"

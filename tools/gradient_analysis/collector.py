@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 import sys
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -21,6 +21,12 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+
+
+# Phase 1 #4 B1 — non-zero threshold for per-param gradient validity masks.
+# Anything below this is treated as "task gradient does not flow through this
+# parameter" and pseudo-shared filtering will exclude it.
+EPS_GRAD = 1e-12
 
 
 # Stochastic / running-stat layers that MUST be in eval mode during the probe.
@@ -113,22 +119,35 @@ def slice_shared_from_full(
 
 @dataclass
 class BatchGradients:
-    """Per-batch, per-task gradient bundle."""
+    """Per-batch, per-task gradient bundle.
+
+    v2 (Phase 1 #4 B1): adds `nonzero_masks` carrying per-(task, group, param)
+    boolean masks over the flat group tensor. Pair (a, b) analysis can intersect
+    these masks to operate only on parameters where both tasks' gradients
+    actually flow, making the cosine semantics well-defined ("truly shared" vs
+    "pseudo-shared").
+
+    The on-disk schema is forward-compatible: a v1 file (no `nonzero_masks`
+    key) loads with an empty dict so existing 100-batch caches keep working.
+    """
     batch_idx: int
     shared: Dict[str, Dict[str, torch.Tensor]]  # task -> {group_key -> flat tensor}
     full_norm: Dict[str, float]                 # task -> ||g^full||
     shared_norm: Dict[str, float]               # task -> ||g^shared|| (across all groups)
     loss_values: Dict[str, float]               # task -> L_task(theta)
+    nonzero_masks: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
 
     def save(self, out_dir: Path) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
+                "schema_version": 2,
                 "batch_idx": self.batch_idx,
                 "shared": self.shared,
                 "full_norm": self.full_norm,
                 "shared_norm": self.shared_norm,
                 "loss_values": self.loss_values,
+                "nonzero_masks": self.nonzero_masks,
             },
             out_dir / f"batch_{self.batch_idx:05d}.pt",
         )
@@ -136,6 +155,8 @@ class BatchGradients:
     @classmethod
     def load(cls, path: Path) -> "BatchGradients":
         d = torch.load(path, map_location="cpu")
+        d.pop("schema_version", None)
+        d.setdefault("nonzero_masks", {})
         return cls(**d)
 
 
@@ -232,6 +253,7 @@ class GradientCollector:
         losses = self.forward_losses(data)
 
         shared: Dict[str, Dict[str, torch.Tensor]] = {}
+        nonzero_masks: Dict[str, Dict[str, torch.Tensor]] = {}
         full_grads: Dict[str, List[torch.Tensor]] = {}
         full_norm: Dict[str, float] = {}
         shared_norm: Dict[str, float] = {}
@@ -243,6 +265,7 @@ class GradientCollector:
             if task_loss is None:
                 # Task absent; record NaN and continue
                 shared[task] = {}
+                nonzero_masks[task] = {}
                 full_grads[task] = [torch.zeros_like(p) for p in self.full_params]
                 full_norm[task] = float("nan")
                 shared_norm[task] = float("nan")
@@ -253,13 +276,27 @@ class GradientCollector:
             fg = compute_task_full_gradient(task_loss, self.full_params, retain_graph=retain)
             full_grads[task] = fg
 
-            # Shared slice (per-group dict for M2 consumers)
+            # Shared slice (per-group dict for M2 consumers) plus per-param
+            # non-zero masks (Phase 1 #4 B1) so downstream pair-analysis can
+            # intersect the two task masks and operate on truly-shared params.
             shared_groups: Dict[str, torch.Tensor] = {}
+            mask_groups: Dict[str, torch.Tensor] = {}
             id2idx = {id(p): k for k, p in enumerate(self.full_params)}
             for gk, params in self.shared_param_groups.items():
-                parts = [fg[id2idx[id(p)]].flatten() for p in params]
-                shared_groups[gk] = torch.cat(parts).detach().cpu()
+                parts: List[torch.Tensor] = []
+                masks: List[torch.Tensor] = []
+                for p in params:
+                    g = fg[id2idx[id(p)]].detach()
+                    parts.append(g.flatten())
+                    masks.append((g.abs().flatten() > EPS_GRAD))
+                if parts:
+                    shared_groups[gk] = torch.cat(parts).cpu()
+                    mask_groups[gk] = torch.cat(masks).cpu()
+                else:
+                    shared_groups[gk] = torch.empty(0)
+                    mask_groups[gk] = torch.empty(0, dtype=torch.bool)
             shared[task] = shared_groups
+            nonzero_masks[task] = mask_groups
 
             # Norms
             shared_concat = torch.cat([v for v in shared_groups.values()]) if shared_groups else torch.empty(0)
@@ -274,6 +311,7 @@ class GradientCollector:
             full_norm=full_norm,
             shared_norm=shared_norm,
             loss_values=loss_values,
+            nonzero_masks=nonzero_masks,
         )
         return bg, full_grads
 

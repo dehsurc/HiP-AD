@@ -4,3 +4,4 @@ matplotlib>=3.6
 numpy>=1.23
 scipy>=1.10
 pytest>=7.0
+diptest>=0.5

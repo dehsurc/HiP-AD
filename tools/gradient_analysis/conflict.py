@@ -86,25 +86,73 @@ def analyze_pair_batches(
 
 
 def summarize_pair(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate per-(task_pair, group) across batches.
+    """Aggregate per-(task_pair, group) across batches with validity-aware
+    counts (Phase 1 #4 B2/B3).
 
-    Adds conflict-conditional norm stats: when cos < 0, what are ||g_a||, ||g_b||,
-    and the ratio ||g_a||/||g_b||? (cooperative counterparts included for contrast.)
+    Validity rule: a row contributes to ``n_valid`` iff cos is finite *and*
+    norm_a > EPS *and* norm_b > EPS. Otherwise the row is "pseudo-shared"
+    (one task's gradient does not flow through this group on this batch),
+    and including it in the conflict-ratio denominator systematically biases
+    the ratio toward zero. Cosine summary stats are computed over the valid
+    subset; the legacy ratio (over n_total) is preserved one cycle as
+    ``conflict_ratio_legacy`` for plot reproducibility.
     """
-    base = df.groupby("group").agg(
-        mean_cos=("cos", "mean"),
-        std_cos=("cos", "std"),
-        median_cos=("cos", "median"),
-        n=("cos", "count"),
-        conflict_ratio=("cos", lambda s: float((s < 0).mean())),
-        mean_coop_mag=("coop_mag", "mean"),
-        mean_conf_mag=("conf_mag", "mean"),
-    )
+    def _agg(sub: pd.DataFrame) -> pd.Series:
+        n_total = int(len(sub))
+        finite = sub["cos"].notna()
+        nonzero = (sub["norm_a"] > EPS) & (sub["norm_b"] > EPS)
+        valid = finite & nonzero
+        n_valid = int(valid.sum())
+        # Pseudo-shared: at least one task gradient was below EPS (Phase 1 #4 B2).
+        # Includes both NaN cosines from zero-norm and the rare finite-cos-but-
+        # zero-norm edge case so the partition invariant holds:
+        #   n_total = n_valid + n_pseudo_shared + n_nan_other.
+        n_pseudo_shared = int((~nonzero).sum())
+        # NaN-other: cosine is NaN despite both norms > EPS (numerical edge
+        # case, e.g. ill-conditioned dot products). Should be very rare.
+        n_nan = int(((~finite) & nonzero).sum())
+        valid_sub = sub[valid]
 
-    def _cond_stats(sub: pd.DataFrame) -> pd.Series:
-        conf = sub[sub["cos"] < 0]
-        coop = sub[sub["cos"] >= 0]
-        def _stats(frame: pd.DataFrame, suffix: str) -> Dict[str, float]:
+        if n_valid > 0:
+            mean_cos = float(valid_sub["cos"].mean())
+            median_cos = float(valid_sub["cos"].median())
+            std_cos = float(valid_sub["cos"].std())
+            conflict_ratio = float((valid_sub["cos"] < 0).mean())
+        else:
+            mean_cos = float("nan"); median_cos = float("nan")
+            std_cos = float("nan"); conflict_ratio = float("nan")
+
+        # Legacy ratio: prior behaviour with n_total denominator (kept one cycle).
+        if n_total > 0:
+            cos_neg_count = int((sub["cos"].fillna(0.0) < 0).sum())
+            conflict_ratio_legacy = float(cos_neg_count) / float(n_total)
+        else:
+            conflict_ratio_legacy = float("nan")
+        pseudo_ratio = float(n_pseudo_shared) / n_total if n_total > 0 else float("nan")
+
+        out = {
+            "mean_cos": mean_cos,
+            "std_cos": std_cos,
+            "median_cos": median_cos,
+            "n": n_total,
+            "n_total": n_total,
+            "n_valid": n_valid,
+            "n_pseudo_shared": n_pseudo_shared,
+            "n_nan": n_nan,
+            "pseudo_shared_ratio": pseudo_ratio,
+            "is_pseudo_shared_group": bool(np.isfinite(pseudo_ratio) and pseudo_ratio >= 0.5),
+            "conflict_ratio": conflict_ratio,
+            "conflict_ratio_legacy": conflict_ratio_legacy,
+            "mean_coop_mag": float(sub["coop_mag"].mean()) if n_total > 0 else float("nan"),
+            "mean_conf_mag": float(sub["conf_mag"].mean()) if n_total > 0 else float("nan"),
+        }
+
+        # Conditional norm stats — restricted to the valid subset so NaN/zero-
+        # norm rows don't leak in.
+        conf = valid_sub[valid_sub["cos"] < 0]
+        coop = valid_sub[valid_sub["cos"] >= 0]
+
+        def _cond(frame: pd.DataFrame, suffix: str) -> Dict[str, float]:
             if frame.empty:
                 return {
                     f"mean_norm_a_{suffix}": float("nan"),
@@ -121,13 +169,11 @@ def summarize_pair(df: pd.DataFrame) -> pd.DataFrame:
                 f"median_norm_ratio_{suffix}": float(ratio.median()),
                 f"n_{suffix}": int(len(frame)),
             }
-        out = {}
-        out.update(_stats(conf, "conflict"))
-        out.update(_stats(coop, "coop"))
+        out.update(_cond(conf, "conflict"))
+        out.update(_cond(coop, "coop"))
         return pd.Series(out)
 
-    cond = df.groupby("group").apply(_cond_stats)
-    grouped = base.join(cond).reset_index()
+    grouped = df.groupby("group").apply(_agg).reset_index()
     return grouped
 
 

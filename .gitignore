@@ -17,3 +17,10 @@ wandb/
 *.png
 gradient_analysis_*/
 .claude/
+# phase 1+2 batch — local-only
+evaluation/
+.omc/
+*.log
+GAR_*/
+DISTILLATION_SESSION_PROMPT.md
+wait_and_eval.sh

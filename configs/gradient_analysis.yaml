@@ -92,6 +92,23 @@ shared_param_groups:
 
 output_root: gradient_analysis_results
 
+# Phase 1 #1 — random-baseline / permutation test
+null_baseline:
+  n_repeats: 1000
+
+# Phase 1 #3 — bootstrap CI augmentation on summary CSVs
+bootstrap:
+  enabled: true
+  n_resamples: 2000
+
+# Phase 1 #9 — α-sensitivity sweep (motion-only)
+alpha_sweep:
+  enabled: true
+  alphas: [1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3]
+  sources: [motion]
+  num_batches: 100
+  checkpoint: 1ep
+
 seed: 42
 deterministic: true
 fp16: true
