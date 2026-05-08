@@ -162,6 +162,16 @@ class SparseOneDecoder(BaseModule):
             det_gt_loss_weight=1.0,     # weight for GT detection losses (0.0 = distill-only)
             pseudo_gt_weight=1.0,       # weight for pseudo GT detection loss (pseudo_gt_plus mode)
 
+            # map distillation (mirrors det distill, prefix `map_`)
+            map_distill_alpha_cls=0.0,
+            map_distill_alpha_reg=0.0,
+            map_distill_temperature=4.0,
+            map_distill_score_thr=0.1,
+            map_distill_last_layer_only=True,
+            map_distill_mode="teacher_tp",  # "teacher_tp" or "pseudo_gt"
+            map_gt_loss_weight=1.0,     # weight for GT map losses (0.0 = distill-only)
+            map_distill_dist_thr=5.0,   # distance cutoff for teacher_tp matching (m)
+
             **kwargs,
     ):
         super(SparseOneDecoder, self).__init__(init_cfg)
@@ -202,6 +212,17 @@ class SparseOneDecoder(BaseModule):
         self.distill_mode = distill_mode
         self.det_gt_loss_weight = det_gt_loss_weight
         self.pseudo_gt_weight = pseudo_gt_weight
+
+        # Map distillation config (mirrors det distill)
+        self.map_distill_alpha_cls = map_distill_alpha_cls
+        self.map_distill_alpha_reg = map_distill_alpha_reg
+        self.map_distill_temperature = map_distill_temperature
+        self.map_distill_score_thr = map_distill_score_thr
+        self.map_distill_last_layer_only = map_distill_last_layer_only
+        self.map_use_distill = (map_distill_alpha_cls > 0 or map_distill_alpha_reg > 0)
+        self.map_distill_mode = map_distill_mode
+        self.map_gt_loss_weight = map_gt_loss_weight
+        self.map_distill_dist_thr = map_distill_dist_thr
 
         self.independent_gnn = independent_gnn
         self.independent_temp_gnn = independent_temp_gnn
@@ -1512,11 +1533,134 @@ class SparseOneDecoder(BaseModule):
         kd_reg_loss = self.distill_alpha_reg * total_kd_reg / num_matched
         return kd_cls_loss, kd_reg_loss
 
+    def _build_map_pseudo_gt(self, data):
+        """Build map pseudo GT from teacher map predictions.
+
+        Teacher polylines are cached as one ordered point sequence. We add the
+        reversed sequence as a second permutation so Hungarian assignment is
+        not forced to match the teacher's arbitrary line direction.
+
+        Returns:
+            pseudo_gt_labels: list of [N_valid] long tensors
+            pseudo_gt_pts:    list of [N_valid, 2, num_pts, 2] float tensors
+        """
+        teacher_logits = data["teacher_map_logits"]   # [B, 100, 3]
+        teacher_pts    = data["teacher_map_pts"]      # [B, 100, num_pts, 2]
+        teacher_scores = data["teacher_map_scores"]   # [B, 100]
+        bs = teacher_scores.shape[0]
+        num_pts = teacher_pts.shape[-2]
+
+        pseudo_gt_labels = []
+        pseudo_gt_pts = []
+        for b in range(bs):
+            mask = teacher_scores[b] > self.map_distill_score_thr
+            if mask.any():
+                pts = teacher_pts[b][mask]                                 # [N, num_pts, 2]
+                labels = teacher_logits[b][mask].sigmoid().argmax(dim=-1)  # [N]
+                pts_permuted = torch.stack([pts, pts.flip(dims=[1])], dim=1)  # [N, 2, num_pts, 2]
+                pseudo_gt_labels.append(labels.long())
+                pseudo_gt_pts.append(pts_permuted)
+            else:
+                pseudo_gt_labels.append(teacher_scores.new_zeros(0, dtype=torch.long))
+                pseudo_gt_pts.append(teacher_pts.new_zeros(0, 2, num_pts, 2))
+        return pseudo_gt_labels, pseudo_gt_pts
+
+    def _compute_map_distill_loss(self, student_cls, student_reg, data):
+        """Compute logit-level map KD loss (mirror of _compute_distill_loss).
+
+        Used in `teacher_tp` mode only. For each GT polyline matched by the
+        Hungarian map sampler, finds the closest teacher polyline (by polyline
+        center distance) and applies sigmoid-BCE temperature-scaled cls KD plus
+        optional L1 polyline reg KD.
+
+        Returns:
+            kd_cls_loss, kd_reg_loss
+        """
+        T = self.map_distill_temperature
+        teacher_logits = data["teacher_map_logits"]   # [B, 100, 3]
+        teacher_pts    = data["teacher_map_pts"]      # [B, 100, num_pts, 2]
+        teacher_scores = data["teacher_map_scores"]   # [B, 100]
+
+        bs = student_cls.shape[0]
+
+        total_kd_cls = student_cls.new_tensor(0.0)
+        total_kd_reg = student_cls.new_tensor(0.0)
+        num_matched = 0
+
+        # SparsePoint3DTarget exposes matches as 3-tuples
+        # (pred_idx, target_idx, gt_permute_index). The third item is irrelevant
+        # for logit-level KD.
+        indices = self.map_sampler.indices
+
+        for b in range(bs):
+            triple = indices[b]
+            if triple is None:
+                continue
+            pred_idx, gt_idx = triple[0], triple[1]
+            if pred_idx is None or len(pred_idx) == 0:
+                continue
+
+            gt_map_pts_b = data["gt_map_pts"][b]       # [N_gt, num_perm, num_pts, 2]
+            t_pts_b      = teacher_pts[b]              # [100, num_pts, 2]
+            t_logits_b   = teacher_logits[b]           # [100, 3]
+            t_scores_b   = teacher_scores[b]           # [100]
+
+            score_mask = t_scores_b > self.map_distill_score_thr
+            if not score_mask.any():
+                continue
+            t_centers = t_pts_b.mean(dim=1)            # [100, 2]
+
+            for i in range(len(gt_idx)):
+                gt_i      = int(gt_idx[i])
+                student_q = int(pred_idx[i])
+
+                # Use canonical (first) permutation for the GT center
+                gt_pts = gt_map_pts_b[gt_i, 0]         # [num_pts, 2]
+                gt_center = gt_pts.mean(dim=0)         # [2]
+
+                dists = torch.norm(t_centers - gt_center.unsqueeze(0), dim=-1)
+                dists = torch.where(score_mask, dists,
+                                    torch.full_like(dists, 1e8))
+                teacher_idx = dists.argmin()
+
+                if dists[teacher_idx] > self.map_distill_dist_thr:
+                    continue
+
+                # cls KD (sigmoid-BCE, temperature-scaled — same form as det)
+                if self.map_distill_alpha_cls > 0:
+                    s_logit = student_cls[b, student_q]      # [3]
+                    t_logit = t_logits_b[teacher_idx]        # [3]
+                    t_prob = torch.sigmoid(t_logit / T)
+                    s_prob = torch.sigmoid(s_logit / T)
+                    kd_cls = F.binary_cross_entropy(s_prob, t_prob, reduction='sum') * (T ** 2)
+                    total_kd_cls = total_kd_cls + kd_cls
+
+                # reg KD (polyline L1; off by default due to direction ambiguity)
+                if self.map_distill_alpha_reg > 0:
+                    s_pts = student_reg[b, student_q].reshape(-1, 2)  # [num_pts, 2]
+                    t_pts = t_pts_b[teacher_idx]                      # [num_pts, 2]
+                    s_pts_matched = s_pts[:t_pts.shape[0]]
+                    kd_reg = F.l1_loss(s_pts_matched, t_pts, reduction='sum')
+                    total_kd_reg = total_kd_reg + kd_reg
+
+                num_matched += 1
+
+        num_matched = max(num_matched, 1)
+        kd_cls_loss = self.map_distill_alpha_cls * total_kd_cls / num_matched
+        kd_reg_loss = self.map_distill_alpha_reg * total_kd_reg / num_matched
+        return kd_cls_loss, kd_reg_loss
+
     @force_fp32(apply_to=("model_outs"))
     def loss_map(self, model_outs, data):
         quality = model_outs["quality"]
         reg_preds = model_outs["prediction"]
         cls_scores = model_outs["classification"]
+        gt_w = self.map_gt_loss_weight
+        use_map_pseudo_gt = (self.map_distill_mode == "pseudo_gt"
+                             and self.map_use_distill
+                             and "teacher_map_logits" in data)
+        if use_map_pseudo_gt:
+            pgt_map_labels, pgt_map_pts = self._build_map_pseudo_gt(data)
 
         output = {}
         for decoder_idx, (cls, reg, qt) in enumerate(zip(cls_scores, reg_preds, quality)):
@@ -1536,7 +1680,7 @@ class SparseOneDecoder(BaseModule):
 
             cls = cls.flatten(end_dim=1)
             cls_target = cls_target.flatten(end_dim=1)
-            cls_loss = self.loss_map_cls(cls, cls_target, avg_factor=num_pos)
+            cls_loss = self.loss_map_cls(cls, cls_target, avg_factor=num_pos) * gt_w
 
             mask = mask.reshape(-1)
             reg_weights = reg_weights * reg.new_tensor(self.map_reg_weights)
@@ -1557,10 +1701,83 @@ class SparseOneDecoder(BaseModule):
                 if "map_loss_line" not in output:
                     output["map_loss_line"] = 0.0
                 output["map_loss_cls"] += cls_loss
-                output["map_loss_line"] += reg_loss[f"map_loss_line_{decoder_idx}"]
+                output["map_loss_line"] += reg_loss[f"map_loss_line_{decoder_idx}"] * gt_w
             else:
                 output[f"map_loss_cls_{decoder_idx}"] = cls_loss
-                output.update(reg_loss)
+                for k, v in reg_loss.items():
+                    output[k] = v * gt_w
+
+            # Map distillation KD loss (teacher_tp mode; mirrors det KD branch)
+            if self.map_distill_mode == "teacher_tp" and self.map_use_distill and "teacher_map_logits" in data:
+                apply_kd = (not self.map_distill_last_layer_only) or (decoder_idx == len(cls_scores) - 1)
+                if apply_kd:
+                    kd_cls_loss, kd_reg_loss = self._compute_map_distill_loss(
+                        cls_scores[decoder_idx], reg_preds[decoder_idx], data)
+                    if self.combine_layer_loss:
+                        if "map_loss_kd_cls" not in output:
+                            output["map_loss_kd_cls"] = 0.0
+                            output["map_loss_kd_reg"] = 0.0
+                        output["map_loss_kd_cls"] += kd_cls_loss
+                        output["map_loss_kd_reg"] += kd_reg_loss
+                    else:
+                        output[f"map_loss_kd_cls_{decoder_idx}"] = kd_cls_loss
+                        output[f"map_loss_kd_reg_{decoder_idx}"] = kd_reg_loss
+
+            # Map pseudo-GT mode: run teacher polylines through the regular map
+            # target/loss path, mirroring det pseudo_gt distillation.
+            if use_map_pseudo_gt:
+                cls_raw = cls_scores[decoder_idx]
+                reg_raw = reg_preds[decoder_idx][..., : len(self.map_reg_weights)]
+                qt_raw = quality[decoder_idx]
+
+                pgt_cls_target, pgt_reg_target, pgt_reg_weights = self.map_sampler.sample(
+                    cls_raw, reg_raw, pgt_map_labels, pgt_map_pts)
+
+                pgt_reg_target = pgt_reg_target[..., : len(self.map_reg_weights)]
+                pgt_mask = torch.logical_not(torch.all(pgt_reg_target == 0, dim=-1))
+                pgt_num_pos = max(reduce_mean(torch.sum(pgt_mask).to(dtype=reg_raw.dtype)), 1.0)
+
+                if self.cls_threshold_to_reg > 0:
+                    pgt_mask = torch.logical_and(
+                        pgt_mask, cls_raw.max(dim=-1).values.sigmoid() > self.cls_threshold_to_reg)
+
+                pgt_cls = cls_raw.flatten(end_dim=1)
+                pgt_cls_target = pgt_cls_target.flatten(end_dim=1)
+                pgt_cls_loss = self.loss_map_cls(pgt_cls, pgt_cls_target, avg_factor=pgt_num_pos)
+
+                pgt_mask = pgt_mask.reshape(-1)
+                pgt_reg_weights_w = pgt_reg_weights * reg_raw.new_tensor(self.map_reg_weights)
+                pgt_reg_target = pgt_reg_target.flatten(end_dim=1)[pgt_mask]
+                pgt_reg = reg_raw.flatten(end_dim=1)[pgt_mask]
+                pgt_reg_weights_w = pgt_reg_weights_w.flatten(end_dim=1)[pgt_mask]
+                pgt_reg_target = torch.where(pgt_reg_target.isnan(), pgt_reg.new_tensor(0.0), pgt_reg_target)
+                pgt_cls_target_masked = pgt_cls_target[pgt_mask]
+                pgt_qt = qt_raw.flatten(end_dim=1)[pgt_mask] if qt_raw is not None else None
+
+                pgt_reg_loss = self.loss_map_reg(
+                    pgt_reg, pgt_reg_target, weight=pgt_reg_weights_w, avg_factor=pgt_num_pos,
+                    prefix="map_kd_", suffix=f"_{decoder_idx}", quality=pgt_qt,
+                    cls_target=pgt_cls_target_masked)
+
+                if self.combine_layer_loss:
+                    if "map_loss_kd_cls" not in output:
+                        output["map_loss_kd_cls"] = 0.0
+                        output["map_loss_kd_line"] = 0.0
+                    output["map_loss_kd_cls"] += pgt_cls_loss
+                    output["map_loss_kd_line"] += pgt_reg_loss[f"map_kd_loss_line_{decoder_idx}"]
+                else:
+                    output[f"map_loss_kd_cls_{decoder_idx}"] = pgt_cls_loss
+                    for k, v in pgt_reg_loss.items():
+                        output[k] = v
+
+        # Restore real GT matching for downstream tasks (motion/plan rely on
+        # map_sampler.indices). pseudo_gt's last sample() call leaves indices
+        # bound to pseudo polylines; reset to real GT.
+        if use_map_pseudo_gt:
+            last_cls = cls_scores[-1]
+            last_reg = reg_preds[-1][..., : len(self.map_reg_weights)]
+            self.map_sampler.sample(
+                last_cls, last_reg, data["gt_map_labels"], data["gt_map_pts"])
 
         return output
 
