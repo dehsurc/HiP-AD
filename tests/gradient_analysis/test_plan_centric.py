@@ -212,3 +212,61 @@ def test_top_harmful_sorts_ascending_by_mean_gain():
     assert list(top["layer"]) == ["c", "a"]
     top_harm = pc.top_harmful(summary, k=2, by="large_harm_rate")
     assert list(top_harm["layer"]) == ["c", "a"]
+
+
+def _asym_fixture(n=20):
+    rng = np.random.default_rng(1)
+    rows = []
+    plans = {
+        ("det", "plan"): rng.normal(-0.05, 0.01, n),
+        ("plan", "det"): rng.normal(+0.05, 0.01, n),
+        ("map", "plan"): rng.normal(-0.05, 0.01, n),
+        ("plan", "map"): rng.normal(-0.05, 0.01, n),
+        ("motion", "plan"): rng.normal(0.0, 0.001, n),
+        ("plan", "motion"): rng.normal(0.0, 0.001, n),
+        ("det", "det"): rng.normal(-0.2, 0.01, n),
+        ("map", "map"): rng.normal(-0.2, 0.01, n),
+        ("motion", "motion"): rng.normal(-0.05, 0.005, n),
+    }
+    for (s, t), deltas in plans.items():
+        for i, d in enumerate(deltas):
+            rows.append({
+                "model": "HiP-AD", "checkpoint": "1ep", "checkpoint_order": 1,
+                "batch_idx": i, "source_task": s, "target_task": t,
+                "steps": 1, "variant": "normalized", "layer": "L0",
+                "grad_norm": 1.0,
+                "baseline_loss": 1.0, "stepped_loss": 1.0 + d, "delta": d,
+            })
+    return pd.DataFrame(rows)
+
+
+def test_build_asymmetry_summary_signs_and_interpretation():
+    base = pc.standardize_probe_df(_asym_fixture())
+    summary = pc.build_asymmetry_summary(base)
+    assert {"model", "checkpoint", "layer", "aux_task",
+            "gain_A_to_plan", "gain_plan_to_A",
+            "asymmetry", "plan_transfer_ratio",
+            "helpful_A_to_plan", "helpful_plan_to_A",
+            "interpretation"}.issubset(summary.columns)
+    by_aux = summary.set_index("aux_task")
+    assert by_aux.loc["det", "asymmetry"] > 0
+    assert "보존하지 않는다" in by_aux.loc["det", "interpretation"]
+    assert "상호 보완" in by_aux.loc["map", "interpretation"]
+    assert "도달" in by_aux.loc["motion", "interpretation"] or \
+           "미미" in by_aux.loc["motion", "interpretation"]
+
+
+def test_interpret_asymmetry_row_covers_four_quadrants():
+    tau = 0.01
+    msg = pc.interpret_asymmetry_row({"gain_A_to_plan":  0.05,
+                                      "gain_plan_to_A": -0.05, "tau": tau})
+    assert "보존하지" in msg
+    msg = pc.interpret_asymmetry_row({"gain_A_to_plan":  0.05,
+                                      "gain_plan_to_A":  0.05, "tau": tau})
+    assert "상호 보완" in msg
+    msg = pc.interpret_asymmetry_row({"gain_A_to_plan": -0.05,
+                                      "gain_plan_to_A": -0.05, "tau": tau})
+    assert "상호 간섭" in msg
+    msg = pc.interpret_asymmetry_row({"gain_A_to_plan":  0.0,
+                                      "gain_plan_to_A":  0.05, "tau": tau})
+    assert "도달" in msg or "미미" in msg

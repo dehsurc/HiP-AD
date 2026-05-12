@@ -218,3 +218,84 @@ def top_harmful(summary: pd.DataFrame, k: int = 10, by: str = "mean_gain") -> pd
     """
     ascending = by == "mean_gain"
     return summary.sort_values(by, ascending=ascending).head(k).reset_index(drop=True)
+
+
+_AUX_TASKS = ("det", "map", "motion")
+_GROUP_KEYS_G = ["model", "checkpoint", "checkpoint_order", "layer", "aux_task"]
+
+
+def interpret_asymmetry_row(row: dict) -> str:
+    """Return one of four Korean messages based on (gain_A_to_plan, gain_plan_to_A, tau)."""
+    g_ap = float(row["gain_A_to_plan"])
+    g_pa = float(row["gain_plan_to_A"])
+    tau = float(row.get("tau", 0.0))
+    if abs(g_ap) <= tau:
+        return "A→plan transfer가 미미. A task update가 planning에 잘 도달하지 않을 가능성."
+    if g_ap > tau and g_pa < -tau:
+        return ("A는 planning auxiliary로 유용하지만, planning update는 A "
+                "task representation을 보존하지 않는다.")
+    if g_ap > tau and g_pa > tau:
+        return "A와 planning 사이에 상호 보완적 관계가 있다."
+    if g_ap < -tau and g_pa < -tau:
+        return "A와 planning은 해당 layer에서 상호 간섭 가능성이 있다."
+    return ("A는 planning auxiliary로 유용하지만, planning update의 A 방향 "
+            "효과는 약하다.")
+
+
+def build_asymmetry_summary(base: pd.DataFrame) -> pd.DataFrame:
+    """Part G. Directed asymmetry around planning, per (model, ckpt, layer, aux_task)."""
+    required = {"model", "checkpoint", "checkpoint_order", "source_task",
+                "target_task", "layer", "delta", "gain"}
+    if not ensure_columns(base, required, "asymmetry_summary input"):
+        raise KeyError(f"missing required columns: {required - set(base.columns)}")
+
+    plan_subset = base[base["target_task"] == "plan"]
+    tau_per_mc = (
+        plan_subset.groupby(["model", "checkpoint"])["delta"]
+        .apply(lambda s: practical_threshold(s.values))
+        .to_dict()
+    )
+
+    rows = []
+    seed = 0
+    grouper = ["model", "checkpoint", "checkpoint_order", "layer"]
+    for keys, sub in base.groupby(grouper, sort=False):
+        for aux in _AUX_TASKS:
+            ap = sub[(sub["source_task"] == aux) & (sub["target_task"] == "plan")]
+            pa = sub[(sub["source_task"] == "plan") & (sub["target_task"] == aux)]
+            self_a = sub[(sub["source_task"] == aux) & (sub["target_task"] == aux)]
+            if ap.empty and pa.empty:
+                continue
+            gain_ap = float(ap["gain"].mean()) if not ap.empty else float("nan")
+            gain_pa = float(pa["gain"].mean()) if not pa.empty else float("nan")
+            self_g = float(self_a["gain"].mean()) if not self_a.empty else float("nan")
+            asym = gain_ap - gain_pa
+            ratio = (gain_ap / (abs(self_g) + EPS)) if np.isfinite(self_g) else float("nan")
+            helpful_ap = float((ap["delta"] < 0).mean()) if not ap.empty else float("nan")
+            helpful_pa = float((pa["delta"] < 0).mean()) if not pa.empty else float("nan")
+            ci_lo_ap, ci_hi_ap = _ci_pair(ap["gain"].to_numpy(), seed)
+            ci_lo_pa, ci_hi_pa = _ci_pair(pa["gain"].to_numpy(), seed + 1)
+            seed += 2
+            tau = tau_per_mc.get((keys[0], keys[1]), 0.0)
+            r = {
+                **dict(zip(grouper, keys)),
+                "aux_task": aux,
+                "n_A_to_plan": int(len(ap)),
+                "n_plan_to_A": int(len(pa)),
+                "n_self_A": int(len(self_a)),
+                "gain_A_to_plan": gain_ap,
+                "gain_plan_to_A": gain_pa,
+                "self_gain_A": self_g,
+                "asymmetry": asym,
+                "plan_transfer_ratio": ratio,
+                "helpful_A_to_plan": helpful_ap,
+                "helpful_plan_to_A": helpful_pa,
+                "ci_lo_ap": ci_lo_ap, "ci_hi_ap": ci_hi_ap,
+                "ci_lo_pa": ci_lo_pa, "ci_hi_pa": ci_hi_pa,
+                "tau": tau,
+            }
+            r["ci_lo_asym"] = ci_lo_ap - ci_hi_pa
+            r["ci_hi_asym"] = ci_hi_ap - ci_lo_pa
+            r["interpretation"] = interpret_asymmetry_row(r)
+            rows.append(r)
+    return pd.DataFrame(rows)
