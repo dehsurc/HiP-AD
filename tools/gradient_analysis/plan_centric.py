@@ -31,3 +31,28 @@ def ensure_columns(df: pd.DataFrame, required: Iterable[str], df_name: str) -> b
         )
         return False
     return True
+
+
+def bootstrap_ci(
+    values,
+    stat_fn=np.mean,
+    n_boot: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """Percentile bootstrap CI for ``stat_fn`` over ``values``.
+
+    Returns ``(nan, nan)`` when fewer than 5 finite samples are available.
+    """
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < 5:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, v.size, size=(n_boot, v.size))
+    boots = np.empty(n_boot, dtype=float)
+    for i in range(n_boot):
+        boots[i] = stat_fn(v[idx[i]])
+    lo = float(np.quantile(boots, alpha / 2))
+    hi = float(np.quantile(boots, 1 - alpha / 2))
+    return lo, hi
