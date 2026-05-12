@@ -283,3 +283,141 @@ def test_build_effect_size_summary_columns_and_flags():
             "flag_high_practical_helpful", "flag_high_large_harm"}.issubset(summary.columns)
     assert summary["ci_contains_zero"].dtype == bool or set(summary["ci_contains_zero"].unique()).issubset({True, False})
     assert summary["source_task"].isin(["det", "map", "motion", "plan"]).all()
+
+
+# ---------------------------------------------------------------------------
+# Task 10 – Part I: detect_first_order_columns + build_first_order_residual_summary
+# ---------------------------------------------------------------------------
+
+def test_detect_first_order_columns_returns_none_when_missing():
+    df = pd.DataFrame({"delta": [0.0]})
+    assert pc.detect_first_order_columns(df) is None
+
+
+def test_detect_first_order_columns_finds_canonical_names():
+    df = pd.DataFrame({"delta": [0.0], "grad_dot": [0.0], "step_size": [1e-3]})
+    cols = pc.detect_first_order_columns(df)
+    assert cols == {"grad_dot": "grad_dot", "step_size": "step_size"}
+
+
+def test_first_order_residual_summary_pearson_one_when_pred_matches():
+    rng = np.random.default_rng(0)
+    n = 30
+    df = pd.DataFrame({
+        "model": ["HiP-AD"] * n, "checkpoint": ["1ep"] * n,
+        "checkpoint_order": [1] * n, "layer": ["L0"] * n,
+        "source_task": ["det"] * n, "target_task": ["plan"] * n,
+        "step_size": [1e-3] * n,
+        "grad_dot": rng.normal(0, 1, n),
+    })
+    df["delta"] = -df["step_size"] * df["grad_dot"]
+    base = pc.standardize_probe_df(
+        df.assign(steps=1, variant="normalized", batch_idx=range(n),
+                  grad_norm=1.0, baseline_loss=1.0,
+                  stepped_loss=1.0 + df["delta"]))
+    cols = {"grad_dot": "grad_dot", "step_size": "step_size"}
+    summary = pc.build_first_order_residual_summary(base, cols)
+    assert summary["pearson_actual_pred"].iloc[0] == pytest.approx(1.0, abs=1e-6)
+    assert summary["mean_residual"].iloc[0] == pytest.approx(0.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Task 11 – Part J: load_or_template_query_sensitivity + build_query_sensitivity_summary
+# ---------------------------------------------------------------------------
+
+def test_load_or_template_query_sensitivity_writes_template_when_missing(tmp_path):
+    path = tmp_path / "qs.csv"
+    df, status = pc.load_or_template_query_sensitivity(path)
+    assert df is None
+    assert status == "template"
+    assert path.exists()
+    template = pd.read_csv(path)
+    expected = {
+        "model", "checkpoint", "checkpoint_order", "batch_idx", "scene_token",
+        "layer", "task_query_type", "query_index", "query_norm",
+        "grad_plan_wrt_query_norm",
+    }
+    assert expected.issubset(template.columns)
+
+
+def test_load_or_template_query_sensitivity_reads_existing(tmp_path):
+    path = tmp_path / "qs.csv"
+    pd.DataFrame({
+        "model": ["HiP-AD"], "checkpoint": ["1ep"], "checkpoint_order": [1],
+        "batch_idx": [0], "scene_token": ["s"], "layer": ["L"],
+        "task_query_type": ["det"], "query_index": [0],
+        "query_norm": [1.0], "grad_plan_wrt_query_norm": [0.5],
+    }).to_csv(path, index=False)
+    df, status = pc.load_or_template_query_sensitivity(path)
+    assert status == "loaded"
+    assert len(df) == 1
+
+
+def test_build_query_sensitivity_summary_basic():
+    df = pd.DataFrame({
+        "model": ["HiP-AD"] * 6,
+        "checkpoint": ["1ep"] * 6,
+        "checkpoint_order": [1] * 6,
+        "layer": ["L0"] * 6,
+        "task_query_type": ["det", "det", "map", "map", "motion", "motion"],
+        "query_norm": [1.0, 2.0, 1.0, 1.0, 1.0, 1.0],
+        "grad_plan_wrt_query_norm": [0.2, 0.4, 0.1, 0.1, 0.0, 0.0],
+    })
+    out = pc.build_query_sensitivity_summary(df)
+    assert {"model", "checkpoint", "layer", "task_query_type",
+            "mean_sensitivity", "median_sensitivity", "p05", "p95",
+            "mean_query_norm", "sensitivity_normed_mean",
+            "share_task"}.issubset(out.columns)
+    by_task = out.set_index("task_query_type")
+    assert by_task.loc["det", "share_task"] > by_task.loc["motion", "share_task"]
+
+
+# ---------------------------------------------------------------------------
+# Task 12 – Part K: load_or_template_elasticity + build_elasticity_summary
+#            + planning_safe_weight_range
+# ---------------------------------------------------------------------------
+
+def test_load_or_template_elasticity_writes_template(tmp_path):
+    path = tmp_path / "el.csv"
+    df, status = pc.load_or_template_elasticity(path)
+    assert df is None and status == "template" and path.exists()
+    template = pd.read_csv(path)
+    assert {"model", "run_id", "lambda_det", "lambda_map", "lambda_motion",
+            "lambda_plan", "plan_l2"}.issubset(template.columns)
+
+
+def test_build_elasticity_summary_long_format_and_directions():
+    df = pd.DataFrame({
+        "model": ["A"] * 6,
+        "run_id": [f"r{i}" for i in range(6)],
+        "lambda_det": [1.0, 0.5, 2.0, 1.0, 1.0, 1.0],
+        "lambda_map": [1.0, 1.0, 1.0, 0.5, 2.0, 1.0],
+        "lambda_motion": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        "lambda_plan": [1.0] * 6,
+        "det_metric": [0.30, 0.28, 0.32, 0.30, 0.30, 0.30],
+        "map_metric": [0.50, 0.50, 0.50, 0.45, 0.55, 0.50],
+        "motion_loss": [0.20] * 6,
+        "plan_l2": [1.0, 1.1, 0.9, 1.05, 0.95, 1.0],
+        "is_baseline": [True, False, False, False, False, False],
+    })
+    summary = pc.build_elasticity_summary(df)
+    assert {"model", "swept_task", "lambda_value", "log_lambda",
+            "task_metric", "plan_metric",
+            "relative_task_metric", "relative_plan_metric"}.issubset(summary.columns)
+    det2 = summary[(summary["swept_task"] == "det") & (summary["lambda_value"] == 2.0)]
+    assert det2["relative_task_metric"].iloc[0] > 0
+
+
+def test_planning_safe_weight_range_filters_by_tolerance():
+    summary = pd.DataFrame({
+        "model": ["A"] * 3,
+        "swept_task": ["det"] * 3,
+        "lambda_value": [0.5, 1.0, 2.0],
+        "log_lambda": [np.log(0.5), 0.0, np.log(2.0)],
+        "task_metric": [0.28, 0.30, 0.32],
+        "plan_metric": [1.005, 1.000, 1.030],
+        "relative_task_metric": [-0.067, 0.0, 0.067],
+        "relative_plan_metric": [0.005, 0.0, 0.030],
+    })
+    safe = pc.planning_safe_weight_range(summary, tol=0.01)
+    assert (safe["planning_safe"] == (safe["relative_plan_metric"] <= 0.01)).all()

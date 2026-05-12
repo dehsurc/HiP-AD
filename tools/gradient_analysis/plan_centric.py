@@ -361,3 +361,254 @@ def build_effect_size_summary(base: pd.DataFrame, target: str = "plan") -> pd.Da
             "tau": tau,
         })
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Part I – first-order Taylor prediction vs actual 1-step delta
+# ---------------------------------------------------------------------------
+
+def detect_first_order_columns(probe: pd.DataFrame) -> dict | None:
+    """Return canonical first-order column names if both are present."""
+    grad_dot_aliases = ("grad_dot", "dot", "grad_dot_source_target")
+    step_size_aliases = ("step_size", "lr", "learning_rate", "probe_lr")
+    gd = next((c for c in grad_dot_aliases if c in probe.columns), None)
+    ss = next((c for c in step_size_aliases if c in probe.columns), None)
+    if gd is None or ss is None:
+        return None
+    return {"grad_dot": gd, "step_size": ss}
+
+
+def _safe_corr(x: np.ndarray, y: np.ndarray, kind: str) -> float:
+    if x.size < 3 or np.std(x) == 0 or np.std(y) == 0:
+        return float("nan")
+    if kind == "pearson":
+        return float(np.corrcoef(x, y)[0, 1])
+    from scipy.stats import rankdata
+    rx = rankdata(x)
+    ry = rankdata(y)
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def build_first_order_residual_summary(base: pd.DataFrame, cols: dict) -> pd.DataFrame:
+    """Part I. First-order prediction vs actual 1-step delta."""
+    gd = cols["grad_dot"]
+    ss = cols["step_size"]
+    required = {"model", "checkpoint", "checkpoint_order", "source_task",
+                "target_task", "layer", "delta", gd, ss}
+    if not ensure_columns(base, required, "first_order input"):
+        raise KeyError(f"missing required columns: {required - set(base.columns)}")
+
+    df = base.copy()
+    df["pred_delta"] = -df[ss] * df[gd]
+    df["residual"] = df["delta"] - df["pred_delta"]
+    grouper = ["model", "checkpoint", "checkpoint_order", "layer",
+               "source_task", "target_task"]
+    rows = []
+    for keys, g in df.groupby(grouper, sort=False):
+        actual = g["delta"].to_numpy()
+        pred = g["pred_delta"].to_numpy()
+        resid = g["residual"].to_numpy()
+        pearson = _safe_corr(actual, pred, "pearson")
+        spearman = _safe_corr(actual, pred, "spearman")
+        rows.append({
+            **dict(zip(grouper, keys)),
+            "n": int(actual.size),
+            "mean_actual": float(np.mean(actual)),
+            "mean_pred": float(np.mean(pred)),
+            "mean_residual": float(np.mean(resid)),
+            "std_residual": float(np.std(resid, ddof=1)) if actual.size > 1 else float("nan"),
+            "pearson_actual_pred": pearson,
+            "spearman_actual_pred": spearman,
+            "r_squared": pearson ** 2 if np.isfinite(pearson) else float("nan"),
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Part J – query sensitivity loader / summary
+# ---------------------------------------------------------------------------
+
+QUERY_SENSITIVITY_TEMPLATE_COLUMNS = [
+    "model", "checkpoint", "checkpoint_order", "batch_idx", "scene_token",
+    "layer", "task_query_type", "query_index", "query_norm",
+    "grad_plan_wrt_query_norm",
+]
+
+
+def load_or_template_query_sensitivity(path):
+    """Load query-sensitivity CSV; write a template if the file does not exist."""
+    from pathlib import Path
+    p = Path(path)
+    if p.exists():
+        return pd.read_csv(p), "loaded"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(columns=QUERY_SENSITIVITY_TEMPLATE_COLUMNS).to_csv(p, index=False)
+    return None, "template"
+
+
+def build_query_sensitivity_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Part J. Mean sensitivity per (model, checkpoint, layer, task_query_type)."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    required = {"model", "checkpoint", "layer", "task_query_type",
+                "grad_plan_wrt_query_norm"}
+    if not ensure_columns(df, required, "query_sensitivity input"):
+        raise KeyError(f"missing required columns: {required - set(df.columns)}")
+
+    grouper = (
+        ["model", "checkpoint", "checkpoint_order", "layer", "task_query_type"]
+        if "checkpoint_order" in df.columns
+        else ["model", "checkpoint", "layer", "task_query_type"]
+    )
+
+    rows = []
+    for keys, g in df.groupby(grouper, sort=False):
+        s = g["grad_plan_wrt_query_norm"].to_numpy(dtype=float)
+        s = s[np.isfinite(s)]
+        if s.size == 0:
+            continue
+        rec = {
+            **dict(zip(grouper, keys)),
+            "n": int(s.size),
+            "mean_sensitivity": float(np.mean(s)),
+            "median_sensitivity": float(np.median(s)),
+            "p05": float(np.quantile(s, 0.05)),
+            "p95": float(np.quantile(s, 0.95)),
+        }
+        if "query_norm" in g.columns:
+            qn = g["query_norm"].to_numpy(dtype=float)
+            rec["mean_query_norm"] = float(np.nanmean(qn))
+            rec["sensitivity_normed_mean"] = float(np.nanmean(s / (qn + EPS)))
+        else:
+            rec["mean_query_norm"] = float("nan")
+            rec["sensitivity_normed_mean"] = float("nan")
+        rows.append(rec)
+    out = pd.DataFrame(rows)
+
+    sum_keys = [k for k in grouper if k != "task_query_type"]
+    out["share_task"] = out.groupby(sum_keys)["mean_sensitivity"].transform(
+        lambda s: s / (s.sum() + EPS)
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Part K – elasticity loader / summary / safe range
+# ---------------------------------------------------------------------------
+
+ELASTICITY_TEMPLATE_COLUMNS = [
+    "model", "run_id", "seed", "checkpoint",
+    "lambda_det", "lambda_map", "lambda_motion", "lambda_plan",
+    "det_metric", "map_metric", "motion_metric",
+    "plan_l2", "collision", "plan_metric_name",
+    "is_baseline", "notes",
+]
+
+
+def load_or_template_elasticity(path):
+    """Load elasticity CSV; write a template if the file does not exist."""
+    from pathlib import Path
+    p = Path(path)
+    if p.exists():
+        return pd.read_csv(p), "loaded"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(columns=ELASTICITY_TEMPLATE_COLUMNS).to_csv(p, index=False)
+    return None, "template"
+
+
+def _metric_lower_is_better(name: str) -> bool:
+    lname = name.lower()
+    return any(tok in lname for tok in ("loss", "error", "ade", "fde",
+                                        "plan_l2", "collision"))
+
+
+_TASK_METRIC_FALLBACKS = {
+    "det":    ["det_metric",    "det_score",    "det_map",    "det_loss"],
+    "map":    ["map_metric",    "map_score",    "map_loss"],
+    "motion": ["motion_metric", "motion_score", "motion_loss", "motion_ade", "motion_fde"],
+}
+
+
+def _resolve_task_metric(df: pd.DataFrame, task: str) -> str | None:
+    for c in _TASK_METRIC_FALLBACKS[task]:
+        if c in df.columns:
+            return c
+    return None
+
+
+def build_elasticity_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Part K. Build long-format elasticity summary from a runs table."""
+    required = {"model", "lambda_det", "lambda_map", "lambda_motion",
+                "lambda_plan", "plan_l2"}
+    if not ensure_columns(df, required, "elasticity_summary input"):
+        raise KeyError(f"missing required columns: {required - set(df.columns)}")
+
+    if "is_baseline" in df.columns:
+        baseline_mask = df["is_baseline"].astype(bool)
+    else:
+        baseline_mask = (
+            (df["lambda_det"] == 1.0)
+            & (df["lambda_map"] == 1.0)
+            & (df["lambda_motion"] == 1.0)
+            & (df["lambda_plan"] == 1.0)
+        )
+
+    rows = []
+    plan_metric_col = "plan_l2"
+    for model_name, model_df in df.groupby("model", sort=False):
+        baseline = model_df[baseline_mask.reindex(model_df.index, fill_value=False)]
+        if baseline.empty:
+            continue
+        plan_base = float(baseline[plan_metric_col].iloc[0])
+        for task in ("det", "map", "motion", "plan"):
+            lam_col = f"lambda_{task}"
+            task_metric_col = (
+                plan_metric_col if task == "plan"
+                else _resolve_task_metric(model_df, task)
+            )
+            if task_metric_col is None:
+                continue
+            task_lib = _metric_lower_is_better(task_metric_col)
+            task_base = float(baseline[task_metric_col].iloc[0])
+            others = [f"lambda_{o}" for o in ("det", "map", "motion", "plan") if o != task]
+            mask = (model_df[others] == 1.0).all(axis=1) & (model_df[lam_col] != 1.0)
+            swept = model_df[mask]
+            for _, r in swept.iterrows():
+                lam = float(r[lam_col])
+                task_metric = float(r[task_metric_col])
+                plan_metric = float(r[plan_metric_col])
+                rel_task = (
+                    (task_base - task_metric) / (abs(task_base) + EPS)
+                    if task_lib
+                    else (task_metric - task_base) / (abs(task_base) + EPS)
+                )
+                rel_plan = (plan_metric - plan_base) / (abs(plan_base) + EPS)
+                rows.append({
+                    "model": model_name,
+                    "swept_task": task,
+                    "lambda_value": lam,
+                    "log_lambda": float(np.log(lam)),
+                    "task_metric": task_metric,
+                    "plan_metric": plan_metric,
+                    "task_metric_name": task_metric_col,
+                    "plan_metric_name": plan_metric_col,
+                    "relative_task_metric": rel_task,
+                    "relative_plan_metric": rel_plan,
+                })
+    summary = pd.DataFrame(rows)
+    if not summary.empty:
+        summary = summary.sort_values(["model", "swept_task", "lambda_value"])
+        summary["elasticity"] = (
+            summary.groupby(["model", "swept_task"])["task_metric"].diff()
+            / summary.groupby(["model", "swept_task"])["log_lambda"].diff()
+        )
+    return summary.reset_index(drop=True)
+
+
+def planning_safe_weight_range(
+    elast_summary: pd.DataFrame, tol: float = 0.01
+) -> pd.DataFrame:
+    """Mark rows whose ``relative_plan_metric`` (worse-for-plan) is within tolerance."""
+    out = elast_summary.copy()
+    out["planning_safe"] = out["relative_plan_metric"] <= tol
+    return out
