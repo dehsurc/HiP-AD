@@ -10,9 +10,8 @@ exists because BOTH adapters need it, and is added during the interleaved
 authoring (T3-T12 of phase2 plan).
 
 The spec §4.1 sketched 9 operations; we add `restore_temporal_state` for
-symmetry with `snapshot_temporal_state` (HiP-AD's existing
-`ModelStateSnapshot` had the snapshot/restore pair built in; the Protocol
-makes the pair explicit).
+symmetry with `snapshot_temporal_state`; the Protocol makes the pair
+explicit.
 """
 from __future__ import annotations
 
@@ -40,8 +39,8 @@ from torch.utils.data import DataLoader
 @dataclass
 class TemporalSnapshot:
     """Opaque payload holding the per-forward mutable state an adapter needs
-    to keep stable across a probe cycle (run_step counters, instance-bank
-    caches, prev_bev queues, sampler dn_metas, ...).
+    to keep stable across a probe cycle (counters, recurrent caches,
+    sampler payloads, RNG state, ...).
 
     Adapters are free to put whatever they need in `payload`; M3 probe code
     only ever calls `adapter.restore_temporal_state(model, snap)`, never
@@ -102,3 +101,24 @@ class GradientAnalysisAdapter(Protocol):
     def restore_temporal_state(
         self, model: nn.Module, snapshot: TemporalSnapshot,
     ) -> None: ...
+
+
+class BaseAdapter:
+    """Concrete base class providing default (raising) implementations of
+    optional adapter methods. Subclasses that need them override selectively.
+
+    Distinct from ``GradientAnalysisAdapter`` (a ``Protocol``) — this is a
+    real class you can inherit from when you want the defaults.
+    """
+
+    def get_task_queries(self, model, fwd_artifacts) -> "dict":
+        """Return task-specific query tensors that participate in L_plan's graph.
+
+        Default implementation raises ``NotImplementedError``. Subclasses that
+        support query-sensitivity analysis (currently HiP-AD only) override
+        this and return a mapping ``{task_query_type: Tensor}`` where each
+        Tensor still requires gradient (no ``.detach()``).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.get_task_queries is not implemented"
+        )

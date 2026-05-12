@@ -21,6 +21,7 @@ pins the RNG before each forward to fix DN noise sampling.
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
@@ -29,9 +30,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-
-from .matching_freeze import FrozenMatching, per_forward_seed
-from .temporal_state import ModelStateSnapshot
 
 
 EPS = 1e-8
@@ -75,6 +73,30 @@ def _flat_norm(grads: List[torch.Tensor]) -> float:
     return float(torch.cat([g.detach().flatten() for g in grads]).norm().item())
 
 
+@contextlib.contextmanager
+def _seed_scope(seed: int):
+    import random as _random
+
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np_state = np.random.get_state()
+    py_state = _random.getstate()
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    _random.seed(seed)
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
+        np.random.set_state(np_state)
+        _random.setstate(py_state)
+
+
 # ----------------------------- probe runner -----------------------------
 
 @dataclass
@@ -85,7 +107,9 @@ class ProbeRow:
     steps: int
     variant: str
     layer: str           # "_all" for full-param update, group_key otherwise
-    grad_norm: float     # ||g|| restricted to the layer's params
+    grad_norm: float     # ||g_src|| restricted to the layer's params
+    grad_dot: float      # <g_src, g_tgt> at the same param scope
+    step_size: float     # effective scalar applied to g_src
     baseline_loss: float
     stepped_loss: float
     delta: float
@@ -137,102 +161,108 @@ def probe_one_batch(
     """For each (source_task, target_layer) apply a k-step virtual update and
     record ΔL for all targets."""
     from .collector import compute_task_full_gradient
-    from analyze_gradient_conflict import _sum_task_loss, TASK_GROUPS, match_loss_key  # type: ignore
 
-    def _sum_task_loss_any(loss_dict, task_name):
-        """Like _sum_task_loss but does NOT filter by requires_grad — needed
-        for stepped forwards under torch.no_grad()."""
-        prefixes = TASK_GROUPS.get(task_name, [])
-        total = None
-        for key, val in loss_dict.items():
-            if match_loss_key(key, prefixes) and isinstance(val, torch.Tensor):
-                total = val if total is None else total + val
-        return total
+    def _split_task_loss_any(loss_dict, task_name):
+        return collector.adapter.split_losses(loss_dict, task_name)
 
     layers: List[Optional[str]] = list(target_layers) if target_layers else [None]
     rows: List[ProbeRow] = []
 
-    fm = FrozenMatching() if freeze_matching else None
-    state_snap = ModelStateSnapshot(collector.model) if reset_temporal_state else None
+    adapter = collector.adapter
+    state_snap = (
+        adapter.snapshot_temporal_state(collector.model)
+        if reset_temporal_state else None
+    )
 
     def _seeded_forward_on(d):
         # Order matters: temporal cache restore first (so the model rolls back
         # to the same starting state), then matching-freeze rewind, then RNG.
         if state_snap is not None:
-            state_snap.restore()
-        if fm is not None:
-            fm.next_forward()
+            adapter.restore_temporal_state(collector.model, state_snap)
         if forward_seed is not None:
-            with per_forward_seed(forward_seed):
+            with _seed_scope(forward_seed):
                 return collector.forward_losses(d)
         return collector.forward_losses(d)
 
     def _seeded_forward():
         return _seeded_forward_on(data)
 
-    ctx = fm if fm is not None else _NullCM()
+    ctx = adapter.freeze_stochastic_state() if freeze_matching else _NullCM()
     with ctx:
-        # Baseline forward — no_grad. This is the call that records matchings
-        # (det/map indices, motion/plan mode_idx) into the freeze queues.
+        # Baseline forward — no_grad.
         with torch.no_grad():
             losses = _seeded_forward()
             baseline: Dict[str, float] = {}
             for t in collector.tasks:
-                tl = _sum_task_loss_any(losses, t)
+                tl = _split_task_loss_any(losses, t)
                 baseline[t] = float(tl.item()) if tl is not None else float("nan")
 
-        for source in collector.tasks:
-            for layer_key in layers:
-                try:
-                    update_params, layer_label = _resolve_param_set(collector, layer_key)
-                except KeyError as e:
-                    print(f"[probe] skip layer {layer_key}: {e}")
+        for layer_key in layers:
+            try:
+                update_params, layer_label = _resolve_param_set(collector, layer_key)
+            except KeyError as e:
+                print(f"[probe] skip layer {layer_key}: {e}")
+                continue
+
+            # Pre-compute gradient of each task's loss at this layer's params.
+            # Cost: T backward passes per layer per batch; no extra forwards beyond
+            # those already required by the per-source loop.
+            task_grads: Dict[str, List[torch.Tensor]] = {}
+            for t in collector.tasks:
+                fwd_g = _seeded_forward()
+                tl_g = collector.adapter.split_losses(fwd_g, t)
+                if tl_g is None:
+                    task_grads[t] = []
                     continue
+                gt = compute_task_full_gradient(tl_g, update_params, retain_graph=False)
+                task_grads[t] = [x.detach().clone() for x in gt]
+                del fwd_g, tl_g, gt
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            def _grad_dot(gs: List[torch.Tensor], gt: List[torch.Tensor]) -> float:
+                if not gs or not gt:
+                    return float("nan")
+                total = 0.0
+                for a, b in zip(gs, gt):
+                    total += float((a * b).sum().item())
+                return total
+
+            for source in collector.tasks:
+                g_src = task_grads.get(source, [])
+                if not g_src:
+                    continue
+                gn = _flat_norm(g_src)
 
                 for variant in variants:
                     for steps in steps_list:
-                        snap = snapshot_params(update_params)
+                        step_size = (
+                            alpha / max(gn, EPS) if variant == "normalized" else alpha
+                        )
 
-                        # Step 1 — needs grad. Forward graph (G1) holds the
-                        # entire backbone activation tape; we must release it
-                        # before step 2 builds G2, otherwise both graphs sit
-                        # in GPU memory simultaneously (~2× peak).
-                        fwd = _seeded_forward()
-                        tl = _sum_task_loss(fwd, source)
-                        if tl is None:
-                            restore_params(update_params, snap)
-                            continue
-                        g = compute_task_full_gradient(tl, update_params, retain_graph=False)
-                        gn = _flat_norm(g)
-                        apply_virtual_step(update_params, g, alpha=alpha,
+                        snap = snapshot_params(update_params)
+                        apply_virtual_step(update_params, g_src, alpha=alpha,
                                            normalize=(variant == "normalized"))
-                        # `tl` only frees its own graph branch under
-                        # retain_graph=False; the other tasks' losses still
-                        # held by `fwd` keep their branches alive. Drop the
-                        # whole dict + the residual gradient list explicitly.
-                        del fwd, tl, g
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
 
                         if steps >= 2:
                             data2 = data if data_next is None else data_next
                             fwd2 = _seeded_forward_on(data2)
-                            tl2 = _sum_task_loss(fwd2, source)
+                            tl2 = collector.adapter.split_losses(fwd2, source)
                             if tl2 is None:
                                 restore_params(update_params, snap)
                                 continue
-                            g2 = compute_task_full_gradient(tl2, update_params, retain_graph=False)
+                            g2 = compute_task_full_gradient(tl2, update_params,
+                                                            retain_graph=False)
                             apply_virtual_step(update_params, g2, alpha=alpha,
                                                normalize=(variant == "normalized"))
                             del fwd2, tl2, g2
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
 
-                        # Stepped forward — no_grad
                         with torch.no_grad():
                             fwd_after = _seeded_forward()
                             for target in collector.tasks:
-                                tl_after = _sum_task_loss_any(fwd_after, target)
+                                tl_after = _split_task_loss_any(fwd_after, target)
                                 if tl_after is None:
                                     continue
                                 la = float(tl_after.item())
@@ -241,6 +271,7 @@ def probe_one_batch(
                                 rel = delta / lb if abs(lb) > EPS else float("nan")
                                 if not np.isfinite(delta):
                                     continue
+                                grad_dot = _grad_dot(g_src, task_grads.get(target, []))
                                 rows.append(ProbeRow(
                                     batch_idx=batch_idx,
                                     source_task=source,
@@ -249,6 +280,8 @@ def probe_one_batch(
                                     variant=variant,
                                     layer=layer_label,
                                     grad_norm=gn,
+                                    grad_dot=grad_dot,
+                                    step_size=step_size,
                                     baseline_loss=lb,
                                     stepped_loss=la,
                                     delta=delta,
