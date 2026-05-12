@@ -71,3 +71,43 @@ def practical_threshold(
     if v.size == 0:
         return float(min_value)
     return float(max(min_value, ratio * float(np.median(np.abs(v)))))
+
+
+def standardize_probe_df(probe: pd.DataFrame) -> pd.DataFrame:
+    """Add ``gain``, ``gain_rel``, ``delta_rel`` and ``loss_before/after`` aliases.
+
+    The on-disk probe schema uses ``baseline_loss`` / ``stepped_loss``; the
+    spec text uses ``loss_before`` / ``loss_after``. We expose both names so
+    downstream code can pick either.
+    """
+    df = probe.copy()
+
+    if "loss_before" not in df.columns and "baseline_loss" in df.columns:
+        df["loss_before"] = df["baseline_loss"]
+    if "loss_after" not in df.columns and "stepped_loss" in df.columns:
+        df["loss_after"] = df["stepped_loss"]
+
+    df["gain"] = -df["delta"]
+
+    if {"loss_before", "loss_after"}.issubset(df.columns):
+        df["delta_rel"] = (df["loss_after"] - df["loss_before"]) / (
+            df["loss_before"].abs() + EPS
+        )
+        df["gain_rel"] = -df["delta_rel"]
+    elif "rel_delta" in df.columns:
+        df["delta_rel"] = df["rel_delta"]
+        df["gain_rel"] = -df["rel_delta"]
+        warnings.warn(
+            "standardize_probe_df: loss_before/loss_after absent; "
+            "falling back to existing rel_delta as delta_rel.",
+            stacklevel=2,
+        )
+    else:
+        df["delta_rel"] = np.nan
+        df["gain_rel"] = np.nan
+        warnings.warn(
+            "standardize_probe_df: loss_before/loss_after and rel_delta "
+            "both absent; delta_rel/gain_rel set to NaN.",
+            stacklevel=2,
+        )
+    return df

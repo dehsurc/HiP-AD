@@ -52,3 +52,61 @@ def test_practical_threshold_scales_with_median_abs():
 def test_practical_threshold_ignores_nonfinite():
     series = [np.nan, np.inf, 4.0, -4.0, 0.0]
     assert pc.practical_threshold(series, ratio=0.1) == pytest.approx(0.4)
+
+
+def _make_probe(loss_before=True, rel_delta=True):
+    cols = {
+        "batch_idx": [0, 1],
+        "source_task": ["det", "map"],
+        "target_task": ["plan", "plan"],
+        "steps": [1, 1],
+        "variant": ["normalized", "normalized"],
+        "layer": ["_all", "_all"],
+        "grad_norm": [2.0, 3.0],
+        "delta": [-0.1, 0.2],
+    }
+    if loss_before:
+        cols["baseline_loss"] = [1.0, 2.0]
+        cols["stepped_loss"] = [0.9, 2.2]
+    if rel_delta:
+        cols["rel_delta"] = [-0.1, 0.1]
+    return pd.DataFrame(cols)
+
+
+def test_standardize_probe_df_aliases_loss_columns():
+    df = pc.standardize_probe_df(_make_probe())
+    assert "loss_before" in df.columns
+    assert "loss_after" in df.columns
+    assert df.loc[0, "loss_before"] == pytest.approx(1.0)
+    assert df.loc[1, "loss_after"] == pytest.approx(2.2)
+
+
+def test_standardize_probe_df_computes_gain():
+    df = pc.standardize_probe_df(_make_probe())
+    assert df.loc[0, "gain"] == pytest.approx(0.1)
+    assert df.loc[1, "gain"] == pytest.approx(-0.2)
+
+
+def test_standardize_probe_df_computes_delta_rel_when_losses_present():
+    df = pc.standardize_probe_df(_make_probe())
+    assert df.loc[0, "delta_rel"] == pytest.approx(-0.1)
+    assert df.loc[0, "gain_rel"] == pytest.approx(0.1)
+
+
+def test_standardize_probe_df_falls_back_to_rel_delta_when_no_losses():
+    base = _make_probe(loss_before=False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        df = pc.standardize_probe_df(base)
+    assert df.loc[0, "delta_rel"] == pytest.approx(-0.1)
+    assert any("loss_before" in str(w.message) or "loss_after" in str(w.message)
+               for w in caught)
+
+
+def test_standardize_probe_df_emits_nan_when_no_losses_and_no_rel_delta():
+    base = _make_probe(loss_before=False, rel_delta=False)
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        df = pc.standardize_probe_df(base)
+    assert df["delta_rel"].isna().all()
+    assert df["gain_rel"].isna().all()
