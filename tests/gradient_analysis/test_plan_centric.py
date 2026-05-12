@@ -110,3 +110,22 @@ def test_standardize_probe_df_emits_nan_when_no_losses_and_no_rel_delta():
         df = pc.standardize_probe_df(base)
     assert df["delta_rel"].isna().all()
     assert df["gain_rel"].isna().all()
+
+
+def test_get_probe_base_filters_variant_and_steps():
+    df = pd.DataFrame({
+        "batch_idx": [0, 0, 0],
+        "source_task": ["det", "det", "det"],
+        "target_task": ["plan", "plan", "plan"],
+        "steps": [1, 1, 2],
+        "variant": ["normalized", "raw", "normalized"],
+        "layer": ["_all", "_all", "_all"],
+        "grad_norm": [1.0, 1.0, 1.0],
+        "baseline_loss": [1.0, 1.0, 1.0],
+        "stepped_loss": [0.9, 0.8, 0.7],
+        "delta": [-0.1, -0.2, -0.3],
+    })
+    base = pc.get_probe_base(df, variant="normalized", steps=1)
+    assert len(base) == 1
+    assert "gain" in base.columns
+    assert base.iloc[0]["gain"] == pytest.approx(0.1)

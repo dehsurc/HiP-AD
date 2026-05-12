@@ -111,3 +111,11 @@ def standardize_probe_df(probe: pd.DataFrame) -> pd.DataFrame:
             stacklevel=2,
         )
     return df
+
+
+def get_probe_base(
+    probe: pd.DataFrame, variant: str = "normalized", steps: int = 1
+) -> pd.DataFrame:
+    """Standardize, then filter to ``(variant, steps)`` subset."""
+    df = standardize_probe_df(probe)
+    return df[(df["variant"] == variant) & (df["steps"] == steps)].copy()
