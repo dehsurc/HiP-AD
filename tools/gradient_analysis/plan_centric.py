@@ -299,3 +299,65 @@ def build_asymmetry_summary(base: pd.DataFrame) -> pd.DataFrame:
             r["interpretation"] = interpret_asymmetry_row(r)
             rows.append(r)
     return pd.DataFrame(rows)
+
+
+def build_effect_size_summary(base: pd.DataFrame, target: str = "plan") -> pd.DataFrame:
+    """Part H. Effect-size-aware 1-step probe summary for the given target."""
+    required = {"model", "checkpoint", "checkpoint_order", "source_task",
+                "target_task", "layer", "delta", "gain"}
+    if not ensure_columns(base, required, "effect_size_summary input"):
+        raise KeyError(f"missing required columns: {required - set(base.columns)}")
+
+    sub = base[(base["target_task"] == target)
+               & (base["source_task"].isin(_MAIN_SOURCES))].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=_GROUP_KEYS_FH + [
+            "n", "helpful_rate", "practical_helpful_rate", "large_harm_rate",
+            "mean_gain", "median_gain", "std_delta", "effect_size",
+            "ci_lo_gain", "ci_hi_gain", "ci_contains_zero",
+            "flag_high_helpful_low_gain", "flag_positive_but_insig",
+            "flag_high_practical_helpful", "flag_high_large_harm", "tau",
+        ])
+
+    tau_per_mc = (
+        sub.groupby(["model", "checkpoint"])["delta"]
+        .apply(lambda s: practical_threshold(s.values))
+        .to_dict()
+    )
+
+    rows = []
+    seed = 1000
+    for keys, g in sub.groupby(_GROUP_KEYS_FH, sort=False):
+        d = g["delta"].to_numpy()
+        gain = g["gain"].to_numpy()
+        tau = float(tau_per_mc[(keys[0], keys[1])])
+        n = int(d.size)
+        helpful = float(np.mean(d < 0))
+        practical_helpful = float(np.mean(d < -tau))
+        large_harm = float(np.mean(d > tau))
+        mean_g = float(np.mean(gain))
+        std_d = float(np.std(d, ddof=1)) if n > 1 else float("nan")
+        es = mean_g / (std_d + EPS) if np.isfinite(std_d) else float("nan")
+        ci_lo_g, ci_hi_g = _ci_pair(gain, seed)
+        seed += 1
+        ci_contains_zero = bool((ci_lo_g <= 0 <= ci_hi_g))
+        rows.append({
+            **dict(zip(_GROUP_KEYS_FH, keys)),
+            "n": n,
+            "helpful_rate": helpful,
+            "practical_helpful_rate": practical_helpful,
+            "large_harm_rate": large_harm,
+            "mean_gain": mean_g,
+            "median_gain": float(np.median(gain)),
+            "std_delta": std_d,
+            "effect_size": es,
+            "ci_lo_gain": ci_lo_g,
+            "ci_hi_gain": ci_hi_g,
+            "ci_contains_zero": ci_contains_zero,
+            "flag_high_helpful_low_gain": bool(helpful >= 0.6 and abs(mean_g) < tau),
+            "flag_positive_but_insig": bool(mean_g > 0 and ci_contains_zero),
+            "flag_high_practical_helpful": bool(practical_helpful >= 0.5),
+            "flag_high_large_harm": bool(large_harm >= 0.5),
+            "tau": tau,
+        })
+    return pd.DataFrame(rows)

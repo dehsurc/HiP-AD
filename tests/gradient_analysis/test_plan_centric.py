@@ -270,3 +270,16 @@ def test_interpret_asymmetry_row_covers_four_quadrants():
     msg = pc.interpret_asymmetry_row({"gain_A_to_plan":  0.0,
                                       "gain_plan_to_A":  0.05, "tau": tau})
     assert "도달" in msg or "미미" in msg
+
+
+def test_build_effect_size_summary_columns_and_flags():
+    base = pc.standardize_probe_df(_plan_target_fixture())
+    summary = pc.build_effect_size_summary(base, target="plan")
+    assert {"model", "checkpoint", "layer", "source_task",
+            "n", "helpful_rate", "practical_helpful_rate", "large_harm_rate",
+            "mean_gain", "median_gain", "std_delta", "effect_size",
+            "ci_lo_gain", "ci_hi_gain", "ci_contains_zero",
+            "flag_high_helpful_low_gain", "flag_positive_but_insig",
+            "flag_high_practical_helpful", "flag_high_large_harm"}.issubset(summary.columns)
+    assert summary["ci_contains_zero"].dtype == bool or set(summary["ci_contains_zero"].unique()).issubset({True, False})
+    assert summary["source_task"].isin(["det", "map", "motion", "plan"]).all()
