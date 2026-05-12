@@ -38,3 +38,17 @@ def test_bootstrap_ci_filters_nonfinite():
     sample = [1.0, 2.0, np.nan, np.inf, 3.0, 4.0, 5.0, 6.0]
     lo, hi = pc.bootstrap_ci(sample, n_boot=200, seed=0)
     assert np.isfinite(lo) and np.isfinite(hi)
+
+
+def test_practical_threshold_floors_at_min_value():
+    assert pc.practical_threshold([0.0, 0.0, 0.0]) == pytest.approx(1e-8)
+
+
+def test_practical_threshold_scales_with_median_abs():
+    series = [-10.0, -5.0, 0.0, 5.0, 10.0]
+    assert pc.practical_threshold(series, ratio=0.1) == pytest.approx(0.5)
+
+
+def test_practical_threshold_ignores_nonfinite():
+    series = [np.nan, np.inf, 4.0, -4.0, 0.0]
+    assert pc.practical_threshold(series, ratio=0.1) == pytest.approx(0.4)

@@ -56,3 +56,18 @@ def bootstrap_ci(
     lo = float(np.quantile(boots, alpha / 2))
     hi = float(np.quantile(boots, 1 - alpha / 2))
     return lo, hi
+
+
+def practical_threshold(
+    series, ratio: float = 0.1, min_value: float = 1e-8
+) -> float:
+    """Return ``max(min_value, ratio * median(|series|))``.
+
+    Noise-robust threshold used by helpful/harmful rate calculations so that
+    arbitrarily small deltas are not counted as helpful.
+    """
+    v = np.asarray(series, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return float(min_value)
+    return float(max(min_value, ratio * float(np.median(np.abs(v)))))
