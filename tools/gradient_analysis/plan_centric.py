@@ -203,3 +203,18 @@ def build_plan_transfer_summary(base: pd.DataFrame) -> pd.DataFrame:
             "tau": tau,
         })
     return pd.DataFrame(rows)
+
+
+def top_beneficial(summary: pd.DataFrame, k: int = 10, by: str = "mean_gain") -> pd.DataFrame:
+    """Top-``k`` rows ranked by ``by`` descending (most beneficial first)."""
+    return summary.sort_values(by, ascending=False).head(k).reset_index(drop=True)
+
+
+def top_harmful(summary: pd.DataFrame, k: int = 10, by: str = "mean_gain") -> pd.DataFrame:
+    """Top-``k`` rows.
+
+    For ``by="mean_gain"`` sorts ascending (worst gain first). For
+    ``by="large_harm_rate"`` sorts descending.
+    """
+    ascending = by == "mean_gain"
+    return summary.sort_values(by, ascending=ascending).head(k).reset_index(drop=True)

@@ -182,3 +182,33 @@ def test_build_plan_transfer_summary_groups_and_signs():
     assert det_row["mean_gain"] > 0
     assert motion_row["mean_gain"] < 0
     assert (summary["helpful_rate"].between(0, 1)).all()
+
+
+def test_top_beneficial_sorts_descending_by_mean_gain():
+    summary = pd.DataFrame({
+        "model": ["HiP-AD"] * 3,
+        "checkpoint": ["1ep"] * 3,
+        "layer": ["a", "b", "c"],
+        "source_task": ["det"] * 3,
+        "mean_gain": [0.1, 0.3, 0.05],
+        "practical_helpful_rate": [0.5, 0.7, 0.4],
+        "large_harm_rate": [0.0, 0.0, 0.0],
+    })
+    top = pc.top_beneficial(summary, k=2, by="mean_gain")
+    assert list(top["layer"]) == ["b", "a"]
+
+
+def test_top_harmful_sorts_ascending_by_mean_gain():
+    summary = pd.DataFrame({
+        "model": ["HiP-AD"] * 3,
+        "checkpoint": ["1ep"] * 3,
+        "layer": ["a", "b", "c"],
+        "source_task": ["det"] * 3,
+        "mean_gain": [-0.2, 0.0, -0.5],
+        "practical_helpful_rate": [0.1, 0.2, 0.0],
+        "large_harm_rate": [0.5, 0.0, 0.8],
+    })
+    top = pc.top_harmful(summary, k=2, by="mean_gain")
+    assert list(top["layer"]) == ["c", "a"]
+    top_harm = pc.top_harmful(summary, k=2, by="large_harm_rate")
+    assert list(top_harm["layer"]) == ["c", "a"]
