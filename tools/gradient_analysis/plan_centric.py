@@ -119,3 +119,87 @@ def get_probe_base(
     """Standardize, then filter to ``(variant, steps)`` subset."""
     df = standardize_probe_df(probe)
     return df[(df["variant"] == variant) & (df["steps"] == steps)].copy()
+
+
+_MAIN_SOURCES = ("det", "map", "motion", "plan")
+_GROUP_KEYS_FH = ["model", "checkpoint", "checkpoint_order", "layer", "source_task"]
+
+
+def _ci_pair(values, seed_base: int) -> tuple[float, float]:
+    return bootstrap_ci(values, stat_fn=np.mean, n_boot=2000, seed=seed_base)
+
+
+def build_plan_transfer_summary(base: pd.DataFrame) -> pd.DataFrame:
+    """Part F. Plan-centric directed transfer summary.
+
+    ``base`` must already be ``get_probe_base(..., variant="normalized",
+    steps=1)`` output. Returns one row per ``(model, checkpoint, layer,
+    source_task)`` restricted to ``target_task == "plan"``.
+    """
+    required = {"model", "checkpoint", "checkpoint_order", "source_task",
+                "target_task", "layer", "delta", "gain", "grad_norm"}
+    if not ensure_columns(base, required, "plan_transfer_summary input"):
+        raise KeyError(f"missing required columns: {required - set(base.columns)}")
+
+    plan_df = base[
+        (base["target_task"] == "plan")
+        & (base["source_task"].isin(_MAIN_SOURCES))
+    ].copy()
+    if plan_df.empty:
+        return pd.DataFrame(columns=_GROUP_KEYS_FH + [
+            "n", "mean_delta", "median_delta", "p05_delta", "p95_delta",
+            "mean_gain", "median_gain",
+            "helpful_rate", "harmful_rate",
+            "practical_helpful_rate", "large_harm_rate",
+            "std_delta", "sem_delta",
+            "ci_lo_delta", "ci_hi_delta",
+            "ci_lo_gain", "ci_hi_gain",
+            "mean_grad_norm", "effect_size", "tau",
+        ])
+
+    tau_per_mc = (
+        plan_df.groupby(["model", "checkpoint"])["delta"]
+        .apply(lambda s: practical_threshold(s.values))
+        .to_dict()
+    )
+    plan_df["tau"] = plan_df.apply(
+        lambda r: tau_per_mc[(r["model"], r["checkpoint"])], axis=1
+    )
+
+    rows = []
+    seed = 0
+    for keys, sub in plan_df.groupby(_GROUP_KEYS_FH, sort=False):
+        d = sub["delta"].to_numpy()
+        g = sub["gain"].to_numpy()
+        tau = float(sub["tau"].iloc[0])
+        n = int(d.size)
+        ci_lo_d, ci_hi_d = _ci_pair(d, seed)
+        ci_lo_g, ci_hi_g = _ci_pair(g, seed + 1)
+        seed += 2
+        std_d = float(np.std(d, ddof=1)) if n > 1 else float("nan")
+        sem_d = std_d / np.sqrt(n) if n > 1 else float("nan")
+        mean_g = float(np.mean(g))
+        rows.append({
+            **dict(zip(_GROUP_KEYS_FH, keys)),
+            "n": n,
+            "mean_delta": float(np.mean(d)),
+            "median_delta": float(np.median(d)),
+            "p05_delta": float(np.quantile(d, 0.05)),
+            "p95_delta": float(np.quantile(d, 0.95)),
+            "mean_gain": mean_g,
+            "median_gain": float(np.median(g)),
+            "helpful_rate": float(np.mean(d < 0)),
+            "harmful_rate": float(np.mean(d > 0)),
+            "practical_helpful_rate": float(np.mean(d < -tau)),
+            "large_harm_rate": float(np.mean(d > tau)),
+            "std_delta": std_d,
+            "sem_delta": sem_d,
+            "ci_lo_delta": ci_lo_d,
+            "ci_hi_delta": ci_hi_d,
+            "ci_lo_gain": ci_lo_g,
+            "ci_hi_gain": ci_hi_g,
+            "mean_grad_norm": float(sub["grad_norm"].mean()),
+            "effect_size": mean_g / (std_d + EPS) if np.isfinite(std_d) else float("nan"),
+            "tau": tau,
+        })
+    return pd.DataFrame(rows)

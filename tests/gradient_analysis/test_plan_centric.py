@@ -129,3 +129,56 @@ def test_get_probe_base_filters_variant_and_steps():
     assert len(base) == 1
     assert "gain" in base.columns
     assert base.iloc[0]["gain"] == pytest.approx(0.1)
+
+
+def _plan_target_fixture():
+    rows = []
+    rng = np.random.default_rng(0)
+    for source in ["det", "map", "motion", "plan"]:
+        if source == "det":
+            deltas = rng.normal(-0.05, 0.02, size=20)
+        elif source == "map":
+            deltas = rng.normal(0.0, 0.02, size=20)
+        elif source == "motion":
+            deltas = rng.normal(0.05, 0.02, size=20)
+        else:
+            deltas = rng.normal(-0.1, 0.02, size=20)
+        for i, d in enumerate(deltas):
+            rows.append({
+                "model": "HiP-AD",
+                "checkpoint": "1ep",
+                "checkpoint_order": 1,
+                "batch_idx": i,
+                "source_task": source,
+                "target_task": "plan",
+                "steps": 1,
+                "variant": "normalized",
+                "layer": "dec3_ffn_0",
+                "grad_norm": 1.0,
+                "baseline_loss": 1.0,
+                "stepped_loss": 1.0 + d,
+                "delta": d,
+            })
+    return pd.DataFrame(rows)
+
+
+def test_build_plan_transfer_summary_groups_and_signs():
+    base = pc.standardize_probe_df(_plan_target_fixture())
+    summary = pc.build_plan_transfer_summary(base)
+    expected_cols = {
+        "model", "checkpoint", "checkpoint_order", "layer", "source_task",
+        "n", "mean_delta", "median_delta", "p05_delta", "p95_delta",
+        "mean_gain", "median_gain",
+        "helpful_rate", "harmful_rate",
+        "practical_helpful_rate", "large_harm_rate",
+        "std_delta", "sem_delta",
+        "ci_lo_delta", "ci_hi_delta",
+        "ci_lo_gain", "ci_hi_gain",
+        "mean_grad_norm", "effect_size", "tau",
+    }
+    assert expected_cols.issubset(set(summary.columns))
+    det_row = summary[summary["source_task"] == "det"].iloc[0]
+    motion_row = summary[summary["source_task"] == "motion"].iloc[0]
+    assert det_row["mean_gain"] > 0
+    assert motion_row["mean_gain"] < 0
+    assert (summary["helpful_rate"].between(0, 1)).all()
