@@ -2,15 +2,22 @@
 from __future__ import division
 import sys
 import os
+import warnings
 
-print(sys.executable, os.path.abspath(__file__))
+warnings.filterwarnings(
+    "ignore",
+    message="On January 1, 2023, MMCV will release v2.0.0.*",
+    category=UserWarning,
+    module="mmcv",
+)
+if os.environ.get("HIPAD_SHOW_STARTUP_PRINTS") == "1":
+    print(sys.executable, os.path.abspath(__file__))
 # import init_paths # for conda pkgs submitting method
 import argparse
 import copy
 import mmcv
 import time
 import torch
-import warnings
 from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist
 from os import path as osp

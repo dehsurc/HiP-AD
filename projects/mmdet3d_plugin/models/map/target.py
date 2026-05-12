@@ -59,6 +59,7 @@ class SparsePoint3DTarget(BaseTargetWithDenoising):
             output_box_target[i, pred_idx] = pts_targets[i][target_idx, permute_idx]
             output_reg_weights[i, pred_idx] = 1
 
+        self.indices = indices
         return output_cls_target, output_box_target, output_reg_weights
 
     def normalize_line(self, line):
