@@ -14,6 +14,15 @@ from mmdet.models import (
 )
 from .grid_mask import GridMask
 
+# Task-to-loss-prefix mapping for PCGrad per-task loss grouping
+TASK_LOSS_PREFIXES = {
+    'det': ['det_loss'],
+    'map': ['map_loss'],
+    'motion': ['motion_loss'],
+    'ego': ['ego_loss'],
+    'plan': ['plan_loss'],
+}
+
 try:
     from ..ops import feature_maps_format
     DAF_VALID = True
@@ -143,6 +152,57 @@ class SparseDetector(BaseDetector):
                 depths, data["gt_depth"]
             )
         return output
+
+    def train_step(self, data, optimizer):
+        """train_step with optional per-task loss grouping for PCGrad.
+
+        When ``self._pcgrad_enabled`` is False (default), this falls back to
+        the standard BaseDetector behavior. When True, losses matching a
+        task prefix in ``TASK_LOSS_PREFIXES`` are exposed as ``task_losses``
+        (PCGrad-managed); unmatched grad-requiring losses (e.g.,
+        ``loss_dense_depth``) are summed into ``aux_loss`` and backpropagated
+        normally, outside the PCGrad projection.
+        """
+        if not (getattr(self, '_pcgrad_enabled', False) or
+                getattr(self, '_famo_enabled', False)):
+            return super().train_step(data, optimizer)
+
+        losses = self(**data)
+
+        task_losses = {}
+        matched_keys = set()
+        for task, prefixes in TASK_LOSS_PREFIXES.items():
+            task_sum = None
+            for key, val in losses.items():
+                if isinstance(val, torch.Tensor) and val.requires_grad:
+                    if any(key.startswith(p) for p in prefixes):
+                        task_sum = val if task_sum is None else task_sum + val
+                        matched_keys.add(key)
+            if task_sum is not None:
+                task_losses[task] = task_sum
+
+        aux_sum = None
+        for key, val in losses.items():
+            if isinstance(val, torch.Tensor) and val.requires_grad and key not in matched_keys:
+                aux_sum = val if aux_sum is None else aux_sum + val
+
+        loss, log_vars = self._parse_losses(losses)
+
+        if 'img_metas' in data:
+            num_samples = len(data['img_metas'])
+        elif 'img' in data:
+            img = data['img']
+            num_samples = img.data.shape[0] if hasattr(img, 'data') else img.shape[0]
+        else:
+            num_samples = 1
+
+        return dict(
+            loss=loss,
+            log_vars=log_vars,
+            num_samples=num_samples,
+            task_losses=task_losses,
+            aux_loss=aux_sum,
+        )
 
     def forward_test(self, img, **data):
         if isinstance(img, list):

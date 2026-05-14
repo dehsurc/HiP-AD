@@ -3,33 +3,33 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/exp/E6_E5_stage2_6ep_distill_wo_det"
+work_dir = "work_dirs/exp/E1_stage1_12ep_1_3_seed0"
 
 version = 'trainval'
-length = {'trainval': 28130, 'mini': 323}
+# 1/3 stratified-by-scene subset (seed 0). Full trainval = 28130 infos; subset = 9360.
+length = {'trainval': 9360, 'mini': 323}
 
 num_gpus = 2
-batch_size = 6
+batch_size = 8
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 6
+num_epochs = 12
 checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
-import datetime
 wandb_project = "hipad"
-wandb_name = "E6_E5_stage2_distill_wo_det"
+wandb_name = "E1_stage1_12ep_1_3_seed0"
 log_config = dict(
     interval=50,
     hooks=[
         dict(type="TextLoggerHook", by_epoch=False),
         dict(
             type="WandbLoggerHook",
-            init_kwargs=dict(project=wandb_project, name=wandb_name, entity="e2ekd"),
+            init_kwargs=dict(entity="e2ekd", project=wandb_project, name=wandb_name),
             by_epoch=False,
         ),
     ],
 )
-load_from = "./work_dirs/exp/E5_stage1_12ep_distill_wo_det/latest.pth"
+load_from = None
 resume_from = None
 workflow = [("train", 1)]
 fp16 = dict(loss_scale=32.0)
@@ -67,7 +67,6 @@ fut_mode = 6
 ego_fut_ts = 6
 ego_fut_cmd = 3
 ego_fut_mode = 6
-# Match B2D-style ego status supervision shape.
 ego_status_dims = 6
 
 # model
@@ -93,8 +92,8 @@ temporal_plan = True
 # tasks
 task_config = dict(with_onedecoder=True)
 
-task_select = ["det", "map", "plan", "ego", "motion"]
-query_select = ["det", "map", "plan", "ego"]  # with query initial order
+task_select = ["det", "map", "plan", "ego"]
+query_select = ["det", "map", "plan", "ego"]
 
 single_frame_layer = ["concat", "gnn", "inter_gnn", "norm", "split", "deformable", "concat", "ffn", "norm", "split", "refine"]
 temporal_frame_layer = ["concat", "temp_gnn", "gnn", "inter_gnn", "norm", "split", "deformable", "concat", "ffn", "norm", "split", "refine"]
@@ -113,16 +112,6 @@ plan_anchor_paths = f"data/kmeans/kmeans_plan_{ego_fut_mode}.npy"
 plan_speed_refer = None
 plan_anchor_refer = ("temp", "2hz")
 plan_anchor_types = [("temp", "2hz")]
-
-# ================== distillation config ========================
-teacher_cache_path = "data/cache/det/bevfusion_teacher_train.pkl"
-distill_alpha_cls = 0.2
-distill_alpha_reg = 0.4
-distill_temperature = 4.0  # softening temperature for cls KD
-distill_score_thr = 0.1    # only use teacher proposals with score > this
-distill_last_layer_only = True  # apply KD to last decoder layer only
-distill_mode = "pseudo_gt"     # "teacher_tp" or "pseudo_gt"
-det_gt_loss_weight = 0.0        # 0.0 = distill-only (no GT det supervision)
 
 
 model = dict(
@@ -152,7 +141,7 @@ model = dict(
         no_norm_on_lateral=True,
         in_channels=[256, 512, 1024, 2048],
     ),
-    depth_branch=dict(  # for auxiliary supervision only
+    depth_branch=dict(
         type="DenseDepthNet",
         embed_dims=embed_dims,
         num_depth_layers=num_depth_layers,
@@ -178,14 +167,6 @@ model = dict(
             with_incremental_plan_refine=True,
             motion_anchor=anchor_paths["motion"],
             cls_threshold_to_reg=0.05,
-            # distillation
-            distill_alpha_cls=distill_alpha_cls,
-            distill_alpha_reg=distill_alpha_reg,
-            distill_temperature=distill_temperature,
-            distill_score_thr=distill_score_thr,
-            distill_last_layer_only=distill_last_layer_only,
-            distill_mode=distill_mode,
-            det_gt_loss_weight=det_gt_loss_weight,
             # instance_bank
             det_instance_bank=dict(
                 type="InstanceBank",
@@ -372,7 +353,7 @@ model = dict(
                     num_sample=map_num_pts,
                     num_learnable_pts=3,
                     fix_height=(0, 0.5, -0.5, 1, -1),
-                    ground_height=-1.84023,  # ground height in lidar frame
+                    ground_height=-1.84023,
                 ),
             ),
             ego_deformable=dict(
@@ -409,7 +390,7 @@ model = dict(
                     num_sample=ego_fut_ts,
                     num_learnable_pts=3,
                     fix_height=(0, 0.5, -0.5, 1, -1),
-                    ground_height=-1.84023,  # ground height in lidar frame
+                    ground_height=-1.84023,
                 ),
             ),
             # refine
@@ -500,9 +481,9 @@ model = dict(
                               loss_line=dict(type="LinesL1Loss", loss_weight=10.0, beta=0.01),
                               num_sample=map_num_pts,
                               roi_size=map_roi_size),
-            loss_ego_status=dict(type="L1Loss", loss_weight=1.0),
-            loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.5),
-            loss_plan_reg=dict(type="L1Loss", loss_weight=1.0),
+            loss_ego_status=dict(type="L1Loss", loss_weight=0.0),
+            loss_plan_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.0),
+            loss_plan_reg=dict(type="L1Loss", loss_weight=0.0),
             loss_motion_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=0.2),
             loss_motion_reg=dict(type="L1Loss", loss_weight=0.2),
             # weights
@@ -575,11 +556,8 @@ train_pipeline = [
             "gt_ego_fut_masks_2hz",
             "ego_status",
             "ego_status_mask",
-            "teacher_logits",
-            "teacher_boxes",
-            "teacher_scores",
         ],
-        meta_keys=["T_global", "T_global_inv", "timestamp", "instance_id", "token"],
+        meta_keys=["T_global", "T_global_inv", "timestamp", "instance_id"],
     ),
 ]
 
@@ -672,14 +650,13 @@ data = dict(
     workers_per_gpu=batch_size,
     train=dict(
         **data_basic_config,
-        ann_file=anno_root + "nuscenes_infos_train.pkl",
+        ann_file=anno_root + "nuscenes_infos_train_1_3_seed0.pkl",
         pipeline=train_pipeline,
         test_mode=False,
         data_aug_conf=data_aug_conf,
         with_seq_flag=True,
         sequences_split_num=2,
         keep_consistent_seq_aug=True,
-        teacher_cache_path=teacher_cache_path,
     ),
     val=dict(
         **data_basic_config,
@@ -728,8 +705,8 @@ eval_mode = dict(
     with_det=True,
     with_tracking=False,
     with_map=True,
-    with_motion=True,
-    with_planning=True,
+    with_motion=False,
+    with_planning=False,
     tracking_threshold=0.2,
     motion_threshhold=0.2,
 )
@@ -737,17 +714,6 @@ evaluation = dict(
     interval=num_iters_per_epoch * 3,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
-    out_dir="val_vis",
 )
 
-custom_hooks = [
-    dict(
-        type="WandbValVisHook",
-        vis_dir="val_vis/visual",
-        max_images=8,
-        interval=1,
-        priority="LOWEST",
-    )
-]
-
-load_from = "./work_dirs/exp/E5_stage1_12ep_distill_wo_det/latest.pth"
+load_from = None
