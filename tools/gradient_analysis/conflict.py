@@ -97,6 +97,19 @@ def summarize_pair(df: pd.DataFrame) -> pd.DataFrame:
     subset; the legacy ratio (over n_total) is preserved one cycle as
     ``conflict_ratio_legacy`` for plot reproducibility.
     """
+    summary_cols = [
+        "group", "mean_cos", "std_cos", "median_cos", "n", "n_total",
+        "n_valid", "n_pseudo_shared", "n_nan", "pseudo_shared_ratio",
+        "is_pseudo_shared_group", "conflict_ratio", "conflict_ratio_legacy",
+        "mean_coop_mag", "mean_conf_mag", "mean_norm_a_conflict",
+        "mean_norm_b_conflict", "mean_norm_ratio_conflict",
+        "median_norm_ratio_conflict", "n_conflict", "mean_norm_a_coop",
+        "mean_norm_b_coop", "mean_norm_ratio_coop",
+        "median_norm_ratio_coop", "n_coop",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=summary_cols)
+
     def _agg(sub: pd.DataFrame) -> pd.Series:
         n_total = int(len(sub))
         finite = sub["cos"].notna()

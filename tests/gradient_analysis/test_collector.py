@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from tools.gradient_analysis.collector import (
+    GradientCollector,
     compute_task_full_gradient,
     slice_shared_from_full,
 )
@@ -66,3 +67,39 @@ def test_shared_slice_matches_shared_only_computation():
     direct_flat = torch.cat([g.detach().flatten() for g in direct])
 
     assert torch.allclose(sliced, direct_flat, atol=1e-6)
+
+
+class ToyAdapter:
+    @property
+    def tasks(self):
+        return ["a", "b"]
+
+    def forward_losses(self, model, data):
+        out = model(data)
+        return {task: value.pow(2).sum() for task, value in out.items()}
+
+    def split_losses(self, loss_dict, task):
+        return loss_dict.get(task)
+
+    def shared_param_groups(self, model, group_names):
+        return {"shared": list(model.shared.parameters())}
+
+
+def test_gradient_collector_delegates_to_adapter():
+    torch.manual_seed(0)
+    model = ToyModel()
+    adapter = ToyAdapter()
+    collector = GradientCollector(
+        model=model,
+        adapter=adapter,
+        shared_layer_names=["shared"],
+        device="cpu",
+    )
+    x = torch.randn(8, 4)
+    bg, full_grads = collector.collect_batch(batch_idx=0, data=x)
+
+    assert bg.batch_idx == 0
+    assert set(bg.shared) == {"a", "b"}
+    assert set(full_grads) == {"a", "b"}
+    assert "shared" in bg.shared["a"]
+    assert bg.nonzero_masks["a"]["shared"].dtype == torch.bool

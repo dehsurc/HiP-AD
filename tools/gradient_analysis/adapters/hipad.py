@@ -238,6 +238,12 @@ class HipadAdapter:
         DeformableFeatureAggregation are in eval for this forward — without
         this, the probe's baseline / grad / stepped forwards see a drifting
         model (the bug Phase 1's `_STOCHASTIC_TYPES` first fixed).
+
+        Also installs forward-pre-hooks on the planner's task-specific
+        ``*_refine[-1]`` modules so the graph-attached input query of the
+        final refinement iteration is captured into ``losses['task_queries']``
+        for the Part J query-sensitivity runner. The hooks are removed before
+        returning, and the loss dict is otherwise unchanged for M2/M3 use.
         """
         raw = model.module if hasattr(model, "module") else model
         model.train()
@@ -256,11 +262,52 @@ class HipadAdapter:
                 self._freeze_snapshot = _ModelStateSnapshot(model)
             self._freeze_snapshot.restore()
             freeze_session.next_forward()
-        with seed_ctx:
-            with self._selective_eval(raw):
-                losses = model(**batch)
+
+        # Capture task-specific queries at the last refine iteration via pre-hooks.
+        # Notes:
+        # - refine[-1] is the deepest deterministic hook point on HiP-AD planner.
+        #   In practice plan_loss's autograd graph at this point is connected only
+        #   to plan_query — det/map/motion queries come back as `None` gradient,
+        #   recorded as zero-norm rows downstream. This is the actual finding for
+        #   HiP-AD (task branches are gradient-isolated by the final refine step),
+        #   not a missing-data bug.
+        # - refine[0] was tried as an alternative hook position but raises
+        #   `RuntimeError: dependency not found for AddBackward0` inside
+        #   torch.autograd.grad due to multi-iter graph reuse in the planner.
+        task_refines = _resolve_task_refine_modules(raw)
+        captured: Dict[str, torch.Tensor] = {}
+        handles = []
+        for task, modlist in task_refines.items():
+            if modlist is None or len(modlist) == 0:
+                continue
+            last = modlist[-1]
+            def _make_pre_hook(t: str):
+                def _hook(_module, args):
+                    if args:
+                        captured[t] = args[0]
+                    return None
+                return _hook
+            handles.append(last.register_forward_pre_hook(_make_pre_hook(task)))
+
+        try:
+            with seed_ctx:
+                with self._selective_eval(raw):
+                    losses = model(**batch)
+        finally:
+            for h in handles:
+                h.remove()
         if isinstance(losses, (list, tuple)):
             losses = losses[0]  # MMDataParallel returns list
+        if captured:
+            # Stash graph-attached task queries for the query-sensitivity runner.
+            losses["task_queries"] = captured
+        # One-shot diagnostic: which task hooks actually fired?
+        global _FWD_LOSSES_DEBUG_DONE
+        if not _FWD_LOSSES_DEBUG_DONE:
+            registered = [t for t, m in task_refines.items()
+                          if m is not None and len(m) > 0]
+            print(f"[hipad-hook] hooks_registered={registered} hooks_fired={sorted(captured.keys())}")
+            _FWD_LOSSES_DEBUG_DONE = True
         return losses
 
     def split_losses(
@@ -451,6 +498,56 @@ def _deepclone(x: Any) -> Any:
     if isinstance(x, tuple):
         return tuple(_deepclone(v) for v in x)
     return x
+
+
+_TASK_REFINE_ATTRS = ("det_refine", "map_refine", "motion_refine", "ego_refine")
+_TASK_REFINE_DEBUG_DONE = False
+_FWD_LOSSES_DEBUG_DONE = False
+
+
+def _resolve_task_refine_modules(raw: nn.Module) -> Dict[str, Any]:
+    """Locate the HiP-AD planner sub-module that owns ``*_refine`` ModuleLists
+    and return a {task: ModuleList or None} mapping. ``plan`` is taken from
+    ``ego_refine`` (the planning head consumes plan_query as its first arg).
+    Returns ``{}`` if no such planner is found.
+
+    Emits a one-shot diagnostic line on first call so misconfigurations
+    (missing attribute / zero-length ModuleList / wrong submodule path)
+    surface immediately in M_Q logs.
+    """
+    global _TASK_REFINE_DEBUG_DONE
+    # Fast path: most HiP-AD models expose head.onedecoder_head
+    candidate = None
+    head = getattr(raw, "head", None)
+    if head is not None:
+        candidate = getattr(head, "onedecoder_head", None)
+    # Fallback: walk the module tree
+    if candidate is None or not any(hasattr(candidate, a) for a in _TASK_REFINE_ATTRS):
+        candidate = None
+        for m in raw.modules():
+            if any(hasattr(m, a) for a in _TASK_REFINE_ATTRS):
+                candidate = m
+                break
+    if candidate is None:
+        if not _TASK_REFINE_DEBUG_DONE:
+            print("[hipad-hook] no planner module with *_refine attrs found")
+            _TASK_REFINE_DEBUG_DONE = True
+        return {}
+    out = {
+        "det":    getattr(candidate, "det_refine", None),
+        "map":    getattr(candidate, "map_refine", None),
+        "motion": getattr(candidate, "motion_refine", None),
+        "plan":   getattr(candidate, "ego_refine", None),
+    }
+    if not _TASK_REFINE_DEBUG_DONE:
+        diag = {k: (None if v is None else len(v) if hasattr(v, "__len__") else "?")
+                for k, v in out.items()}
+        extra = sorted(a for a in dir(candidate)
+                       if a.endswith("_refine") and a not in _TASK_REFINE_ATTRS)
+        print(f"[hipad-hook] planner={type(candidate).__name__} refine lengths={diag} "
+              f"other_refine_attrs={extra}")
+        _TASK_REFINE_DEBUG_DONE = True
+    return out
 
 
 def _capture_rng_state() -> Dict[str, Any]:

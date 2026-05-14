@@ -436,11 +436,15 @@ QUERY_SENSITIVITY_TEMPLATE_COLUMNS = [
 
 
 def load_or_template_query_sensitivity(path):
-    """Load query-sensitivity CSV; write a template if the file does not exist."""
+    """Load query-sensitivity CSV; write a template if the file does not exist
+    or contains no data rows (header-only)."""
     from pathlib import Path
     p = Path(path)
     if p.exists():
-        return pd.read_csv(p), "loaded"
+        df = pd.read_csv(p)
+        if not df.empty:
+            return df, "loaded"
+        return None, "template"
     p.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(columns=QUERY_SENSITIVITY_TEMPLATE_COLUMNS).to_csv(p, index=False)
     return None, "template"
@@ -506,11 +510,15 @@ ELASTICITY_TEMPLATE_COLUMNS = [
 
 
 def load_or_template_elasticity(path):
-    """Load elasticity CSV; write a template if the file does not exist."""
+    """Load elasticity CSV; write a template if the file does not exist
+    or contains no data rows (header-only)."""
     from pathlib import Path
     p = Path(path)
     if p.exists():
-        return pd.read_csv(p), "loaded"
+        df = pd.read_csv(p)
+        if not df.empty:
+            return df, "loaded"
+        return None, "template"
     p.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(columns=ELASTICITY_TEMPLATE_COLUMNS).to_csv(p, index=False)
     return None, "template"
@@ -610,5 +618,9 @@ def planning_safe_weight_range(
 ) -> pd.DataFrame:
     """Mark rows whose ``relative_plan_metric`` (worse-for-plan) is within tolerance."""
     out = elast_summary.copy()
+    if "relative_plan_metric" not in out.columns:
+        # No sweep rows produced (empty CSV / template-only / baseline-missing).
+        # Return passthrough with planning_safe absent so downstream code can detect.
+        return out
     out["planning_safe"] = out["relative_plan_metric"] <= tol
     return out

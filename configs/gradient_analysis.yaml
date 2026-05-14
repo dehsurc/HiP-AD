@@ -1,9 +1,10 @@
 # MTL gradient analysis configuration. All quantities are user-adjustable.
 
-tasks: [det, map, motion, ego, plan]
+tasks: [det, map, motion, plan]
 
+adapter: hipad
 ckpt_root: ckpts/E2_E1_stage2_18ep
-model_config: projects/configs/hipad_nusc_stage2.py  # matches nusc/pcgrad training config for E2_E1_stage2_18ep
+model_config: ckpts/E2_E1_stage2_18ep/E2_E1_stage2_18ep.py
 
 checkpoints:
   1ep:  iter_2344.pth

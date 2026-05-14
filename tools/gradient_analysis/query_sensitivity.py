@@ -77,11 +77,12 @@ def run_query_sensitivity(
     rows = []
     sidecar = []
     try:
-        ctx = _maybe_freeze(collector.adapter, freeze_matching)
         for i, data in enumerate(dataloader):
             if i >= num_batches:
                 break
-            with ctx:
+            # 매 batch마다 새 contextmanager 인스턴스 — contextmanager-decorated
+            # 객체는 한 번만 __enter__ 가능하기 때문.
+            with _maybe_freeze(collector.adapter, freeze_matching):
                 fwd = (collector.forward_losses(data) if forward_seed is None
                        else _seeded_forward(collector, data, forward_seed))
                 plan_loss = collector.adapter.split_losses(fwd, "plan")
@@ -93,12 +94,17 @@ def run_query_sensitivity(
                 grads = torch.autograd.grad(plan_loss, tensors,
                                             retain_graph=False, allow_unused=True)
                 for task, Q, gQ in zip(names, tensors, grads):
-                    if gQ is None:
-                        continue
                     q_flat = Q.detach().reshape(-1, Q.shape[-1])
-                    g_flat = gQ.detach().reshape(-1, gQ.shape[-1])
                     q_norms = q_flat.norm(dim=-1).cpu().numpy()
-                    g_norms = g_flat.norm(dim=-1).cpu().numpy()
+                    if gQ is None:
+                        # Query is not in plan_loss's autograd graph (e.g. parallel
+                        # branch). Record zero-norm rows so the notebook can still
+                        # plot bar charts per task; this is a meaningful negative
+                        # finding, not a missing-data hole.
+                        g_norms = np.zeros_like(q_norms)
+                    else:
+                        g_flat = gQ.detach().reshape(-1, gQ.shape[-1])
+                        g_norms = g_flat.norm(dim=-1).cpu().numpy()
                     for idx, (qn, gn) in enumerate(zip(q_norms, g_norms)):
                         rows.append({
                             "model": model_name,
@@ -112,12 +118,17 @@ def run_query_sensitivity(
                             "query_norm": float(qn),
                             "grad_plan_wrt_query_norm": float(gn),
                         })
-                    if capture_vectors:
+                    if capture_vectors and gQ is not None:
                         sidecar.append((i, task, g_flat.cpu().clone()))
     except NotImplementedError as e:
         print(f"[query_sensitivity] SKIP: {e}")
 
-    df = pd.DataFrame(rows)
+    # Always write a CSV with header even when SKIP empties `rows`, so the
+    # downstream merge in run_gradient_analysis.main() doesn't trip EmptyDataError.
+    _SCHEMA = ["model", "checkpoint", "checkpoint_order", "batch_idx",
+               "scene_token", "layer", "task_query_type", "query_index",
+               "query_norm", "grad_plan_wrt_query_norm"]
+    df = pd.DataFrame(rows, columns=None if rows else _SCHEMA)
     df.to_csv(out_csv, index=False)
     if capture_vectors:
         torch.save(sidecar, out_dir / "qs_vectors.pt")

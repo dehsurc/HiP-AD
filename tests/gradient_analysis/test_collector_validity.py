@@ -35,6 +35,22 @@ def test_batch_gradients_v1_load_backward_compat(tmp_path):
     assert loaded.nonzero_masks == {}
 
 
+def test_v1_cache_loads_with_empty_masks(tmp_path):
+    """A v1 cache file (no nonzero_masks key) must load through v2 collector."""
+    v1_path = tmp_path / "batch_00000.pt"
+    torch.save({
+        "schema_version": 1,
+        "batch_idx": 0,
+        "shared": {},
+        "full_norm": {},
+        "shared_norm": {},
+        "loss_values": {},
+    }, v1_path)
+    bg = BatchGradients.load(v1_path)
+    assert bg.batch_idx == 0
+    assert bg.nonzero_masks == {}
+
+
 def test_batch_gradients_default_factory_isolates_instances():
     """Two default-constructed BatchGradients should not share a dict."""
     bg1 = BatchGradients(batch_idx=0, shared={}, full_norm={}, shared_norm={}, loss_values={})

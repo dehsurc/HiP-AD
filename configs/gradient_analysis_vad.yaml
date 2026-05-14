@@ -1,0 +1,91 @@
+# Gradient analysis configuration -- VAD primary run (Phase 2 T22).
+# Mirrors configs/gradient_analysis.yaml where the shared pipeline expects it.
+
+tasks: [det, map, motion, plan]
+
+adapter: vad
+vad_repo_root: /home/yongjae/e2e/VAD
+adapter_config: /home/yongjae/e2e/VAD/data/ckpts/VAD_tiny_e2e.py
+model_config: /home/yongjae/e2e/VAD/data/ckpts/VAD_tiny_e2e.py
+ckpt_root: /home/yongjae/e2e/VAD/data/ckpts
+
+checkpoints:
+  ep1:  epoch_1.pth
+  ep10: epoch_10.pth
+  ep30: epoch_30.pth
+  ep60: epoch_60.pth
+
+primary:
+  batch_size: 6
+  num_batches: 100
+
+supplementary:
+  enabled: false
+  batch_size: 1
+  num_samples: 0
+  checkpoint: ep1
+
+probe:
+  alpha: 0.001
+  steps: [1]
+  variants: [raw, normalized]
+  target_layers: []
+  freeze_matching: true
+  reset_temporal_state: true
+  forward_seed: 42
+
+layer_conflict:
+  enabled: true
+  layers:
+    - bev_embedding
+    - enc0_temporal_self_attention
+    - enc0_spatial_cross_attention
+    - enc0_ffn
+    - enc1_temporal_self_attention
+    - enc1_spatial_cross_attention
+    - enc1_ffn
+    - enc2_temporal_self_attention
+    - enc2_spatial_cross_attention
+    - enc2_ffn
+
+
+landscape:
+  enabled: true
+  num_batches: 5
+  batch_size: null
+  t_grid: [-3.0, -2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0, 3.0]
+
+binning:
+  cosine_bins: [-1.0, -0.3, -0.1, 0.1, 0.3, 1.0]
+
+shared_param_groups:
+  - bev_embedding
+  - enc0_temporal_self_attention
+  - enc0_spatial_cross_attention
+  - enc0_ffn
+  - enc1_temporal_self_attention
+  - enc1_spatial_cross_attention
+  - enc1_ffn
+  - enc2_temporal_self_attention
+  - enc2_spatial_cross_attention
+  - enc2_ffn
+
+null_baseline:
+  n_repeats: 1000
+
+bootstrap:
+  enabled: true
+  n_resamples: 2000
+
+alpha_sweep:
+  enabled: false
+  alphas: [1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3]
+  sources: [motion]
+  num_batches: 100
+  checkpoint: ep1
+
+seed: 42
+deterministic: true
+fp16: false
+device: cuda:0
+output_root: gradient_analysis_results_phase2_vad

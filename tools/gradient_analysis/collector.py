@@ -10,65 +10,21 @@ modules (M2/M3/M5) can read without re-running backward.
 """
 from __future__ import annotations
 
-import contextlib
-import sys
-from collections import OrderedDict
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+
+from .adapters.base import GradientAnalysisAdapter
 
 
 # Phase 1 #4 B1 — non-zero threshold for per-param gradient validity masks.
 # Anything below this is treated as "task gradient does not flow through this
 # parameter" and pseudo-shared filtering will exclude it.
 EPS_GRAD = 1e-12
-
-
-# Stochastic / running-stat layers that MUST be in eval mode during the probe.
-# Without this, every forward updates BN running stats and re-samples dropout
-# masks, so baseline / grad / stepped forwards see a drifting model. That
-# contamination was responsible for the systematic ΔL_det blow-up at 1ep
-# regardless of source task: the *upstream* features (where det is most
-# sensitive) drifted, while downstream queries that buffer through additional
-# transforms (map/motion/plan) showed only minor drift — exactly the pattern
-# observed before this fix landed.
-_STOCHASTIC_TYPES = (
-    nn.Dropout, nn.Dropout2d, nn.Dropout3d,
-    nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm,
-)
-
-
-@contextlib.contextmanager
-def _selective_eval(model: nn.Module):
-    """Force Dropout / BN / DeformableFeatureAggregation to eval for the
-    duration of the block, while keeping the rest of the model in train mode
-    (so loss-computing branches still fire). Restores prior training state on
-    exit."""
-    # Lazy import — DeformableFeatureAggregation is HiP-AD-specific.
-    try:
-        from projects.mmdet3d_plugin.models.blocks import (  # type: ignore
-            DeformableFeatureAggregation,
-        )
-        extra_types = (DeformableFeatureAggregation,)
-    except Exception:
-        extra_types = tuple()
-
-    switched: List[nn.Module] = []
-    target_types = _STOCHASTIC_TYPES + extra_types
-    for m in model.modules():
-        if isinstance(m, target_types) and m.training:
-            m.eval()
-            switched.append(m)
-    try:
-        yield
-    finally:
-        for m in switched:
-            m.train()
 
 
 # ----------------------------- public pure helpers -----------------------------
@@ -162,31 +118,6 @@ class BatchGradients:
 
 # ----------------------------- main collector -----------------------------
 
-# Lazy imports for HiP-AD-specific utilities — only loaded when GradientCollector is used.
-# This lets the pure helpers above be importable in pure-Python test environments.
-def _import_hipad_utils():
-    repo_root = Path(__file__).resolve().parents[2]
-    tools_dir = repo_root / "tools"
-    if str(tools_dir) not in sys.path:
-        sys.path.insert(0, str(tools_dir))
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    from analyze_gradient_conflict import (  # type: ignore
-        TASK_GROUPS,
-        _sum_task_loss,
-        compute_task_gradient_grouped,
-    )
-    from projects.mmdet3d_plugin.core.hooks.pcgrad_optimizer_hook import (  # type: ignore
-        get_shared_parameters_grouped,
-    )
-    return {
-        "TASK_GROUPS": TASK_GROUPS,
-        "_sum_task_loss": _sum_task_loss,
-        "compute_task_gradient_grouped": compute_task_gradient_grouped,
-        "get_shared_parameters_grouped": get_shared_parameters_grouped,
-    }
-
-
 class GradientCollector:
     """Run per-task backward passes over a dataloader and cache gradients.
 
@@ -198,17 +129,15 @@ class GradientCollector:
     def __init__(
         self,
         model: nn.Module,
-        tasks: List[str],
+        adapter: GradientAnalysisAdapter,
         shared_layer_names: List[str],
         device: str,
     ):
         self.model = model
-        self.tasks = tasks
+        self.adapter = adapter
+        self.tasks = adapter.tasks
         self.device = device
-        self._utils = _import_hipad_utils()
-        self.shared_param_groups, self.shared_param_ids = self._utils["get_shared_parameters_grouped"](
-            model, shared_layer_names
-        )
+        self.shared_param_groups = adapter.shared_param_groups(model, shared_layer_names)
         self.full_params: List[nn.Parameter] = [
             p for p in self._raw_model().parameters() if p.requires_grad
         ]
@@ -220,22 +149,8 @@ class GradientCollector:
         return self.model.module if hasattr(self.model, "module") else self.model
 
     def forward_losses(self, data) -> Dict[str, torch.Tensor]:
-        """Run model forward and return the loss dict with grad.
-
-        Uses ``_selective_eval`` so BN/Dropout/DeformableFeatureAggregation are
-        in eval mode for this forward, while the rest of the model stays in
-        train (so the loss-computing branches still fire). Without this, the
-        probe's baseline / grad / stepped forwards see a drifting model
-        because each ``model(**data)`` call updates BN running stats and
-        resamples dropout masks.
-        """
-        self.model.train()
-        with _selective_eval(self._raw_model()):
-            losses = self.model(**data)
-        if isinstance(losses, (list, tuple)):
-            # MMDataParallel wrapping may return a list; take first (single GPU)
-            losses = losses[0]
-        return losses
+        """Run model forward through the model-specific adapter."""
+        return self.adapter.forward_losses(self.model, data)
 
     def collect_batch(
         self,
@@ -249,7 +164,6 @@ class GradientCollector:
           - full_grads: task -> list of full-param gradients (kept in memory for M3 probe;
                         caller is responsible for freeing)
         """
-        _sum_task_loss = self._utils["_sum_task_loss"]
         losses = self.forward_losses(data)
 
         shared: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -261,7 +175,7 @@ class GradientCollector:
 
         n_tasks = len(self.tasks)
         for i, task in enumerate(self.tasks):
-            task_loss = _sum_task_loss(losses, task)
+            task_loss = self.adapter.split_losses(losses, task)
             if task_loss is None:
                 # Task absent; record NaN and continue
                 shared[task] = {}
@@ -318,20 +232,15 @@ class GradientCollector:
 
 # ----------------------------- dataloader factory -----------------------------
 
-def build_dataloader(cfg, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
-    """Build a train dataloader using HiP-AD's custom dataset builder."""
-    from projects.mmdet3d_plugin.datasets.builder import custom_build_dataset  # type: ignore
-    from mmcv.parallel import collate  # type: ignore
-
-    dataset = custom_build_dataset(cfg.data.train)
-    g = torch.Generator()
-    g.manual_seed(seed)
-    return DataLoader(
-        dataset,
+def build_dataloader(
+    adapter: GradientAnalysisAdapter,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+) -> DataLoader:
+    """Build a train dataloader through the active adapter."""
+    return adapter.build_dataloader(
         batch_size=batch_size,
+        seed=seed,
         shuffle=shuffle,
-        num_workers=min(4, batch_size),
-        collate_fn=partial(collate, samples_per_gpu=batch_size),
-        drop_last=True,
-        generator=g,
     )

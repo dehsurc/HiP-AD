@@ -25,6 +25,7 @@ Output:
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -33,8 +34,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .matching_freeze import FrozenMatching, per_forward_seed
-from .temporal_state import ModelStateSnapshot
 from .probe import (
     EPS,
     apply_virtual_step,
@@ -44,6 +43,30 @@ from .probe import (
     _flat_norm,
     _NullCM,
 )
+
+
+@contextlib.contextmanager
+def _seed_scope(seed: int):
+    import random as _random
+
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np_state = np.random.get_state()
+    py_state = _random.getstate()
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    _random.seed(seed)
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
+        np.random.set_state(np_state)
+        _random.setstate(py_state)
 
 
 @dataclass
@@ -73,40 +96,35 @@ def line_probe_one_batch(
     """Sweep loss along the (normalized) gradient direction for each
     (source_task, layer), recording losses for every target task at each t."""
     from .collector import compute_task_full_gradient
-    from analyze_gradient_conflict import _sum_task_loss, TASK_GROUPS, match_loss_key  # type: ignore
 
-    def _sum_task_loss_any(loss_dict, task_name):
-        prefixes = TASK_GROUPS.get(task_name, [])
-        total = None
-        for key, val in loss_dict.items():
-            if match_loss_key(key, prefixes) and isinstance(val, torch.Tensor):
-                total = val if total is None else total + val
-        return total
+    def _split_task_loss_any(loss_dict, task_name):
+        return collector.adapter.split_losses(loss_dict, task_name)
 
     layers: List[Optional[str]] = list(target_layers) if target_layers else [None]
     rows: List[LandscapeRow] = []
 
-    fm = FrozenMatching() if freeze_matching else None
-    state_snap = ModelStateSnapshot(collector.model) if reset_temporal_state else None
+    adapter = collector.adapter
+    state_snap = (
+        adapter.snapshot_temporal_state(collector.model)
+        if reset_temporal_state else None
+    )
 
     def fwd():
         if state_snap is not None:
-            state_snap.restore()
-        if fm is not None:
-            fm.next_forward()
+            adapter.restore_temporal_state(collector.model, state_snap)
         if forward_seed is not None:
-            with per_forward_seed(forward_seed):
+            with _seed_scope(forward_seed):
                 return collector.forward_losses(data)
         return collector.forward_losses(data)
 
-    ctx = fm if fm is not None else _NullCM()
+    ctx = adapter.freeze_stochastic_state() if freeze_matching else _NullCM()
     with ctx:
         # Baseline (t=0) — this is also the call that fills the freeze queue.
         with torch.no_grad():
             losses = fwd()
             baseline: Dict[str, float] = {}
             for t in collector.tasks:
-                tl = _sum_task_loss_any(losses, t)
+                tl = _split_task_loss_any(losses, t)
                 baseline[t] = float(tl.item()) if tl is not None else float("nan")
 
         for source in collector.tasks:
@@ -121,7 +139,7 @@ def line_probe_one_batch(
 
                 # One backward to obtain the descent direction.
                 fwd_with_grad = fwd()
-                tl = _sum_task_loss(fwd_with_grad, source)
+                tl = collector.adapter.split_losses(fwd_with_grad, source)
                 if tl is None:
                     continue
                 grads = compute_task_full_gradient(tl, update_params, retain_graph=False)
@@ -158,7 +176,7 @@ def line_probe_one_batch(
                     with torch.no_grad():
                         fwd_after = fwd()
                         for target in collector.tasks:
-                            tl_after = _sum_task_loss_any(fwd_after, target)
+                            tl_after = _split_task_loss_any(fwd_after, target)
                             if tl_after is None:
                                 continue
                             la = float(tl_after.item())

@@ -7,6 +7,15 @@ from typing import Iterable, List
 import pandas as pd
 
 
+def _to_table(df: pd.DataFrame, *args, **kwargs) -> str:
+    try:
+        return df.to_markdown(*args, **kwargs)
+    except ImportError as exc:
+        if "tabulate" not in str(exc):
+            raise
+        return df.to_string(index=kwargs.get("index", True))
+
+
 def _load_conflict_summaries(output_root: Path, checkpoint_tags: Iterable[str]) -> pd.DataFrame:
     """Concatenate every per-checkpoint conflict_*_summary.csv into one frame
     with checkpoint, task_a, task_b columns added."""
@@ -55,10 +64,10 @@ def _write_conflict_rankings(lines: List[str], summary_df: pd.DataFrame) -> None
     if not real.empty and "conflict_ratio" in real.columns:
         lines.append("\n## Highest conflict_ratio (real shared groups)\n")
         top = real.sort_values("conflict_ratio", ascending=False).head(10)
-        lines.append(top[cols].to_markdown(index=False) + "\n")
+        lines.append(_to_table(top[cols], index=False) + "\n")
         lines.append("\n## Lowest conflict_ratio (real shared groups)\n")
         low = real.sort_values("conflict_ratio", ascending=True).head(10)
-        lines.append(low[cols].to_markdown(index=False) + "\n")
+        lines.append(_to_table(low[cols], index=False) + "\n")
 
     if not pseudo.empty:
         lines.append("\n## Pseudo-shared groups (excluded from main analysis)\n")
@@ -70,7 +79,7 @@ def _write_conflict_rankings(lines: List[str], summary_df: pd.DataFrame) -> None
         pcols = [c for c in ("checkpoint", "task_a", "task_b", "group",
                              "n_total", "n_pseudo_shared", "pseudo_shared_ratio")
                  if c in pseudo.columns]
-        lines.append(pseudo[pcols].to_markdown(index=False) + "\n")
+        lines.append(_to_table(pseudo[pcols], index=False) + "\n")
 
 
 def generate_summary(output_root: Path, checkpoint_tags: Iterable[str]) -> None:
@@ -91,7 +100,7 @@ def generate_summary(output_root: Path, checkpoint_tags: Iterable[str]) -> None:
         corr_1raw = corr[(corr["steps"] == 1) & (corr["variant"] == "raw")]
         lines.append("## Strongest correlation |cos ↔ Δloss| (1-step raw)\n")
         top = corr_1raw.reindex(corr_1raw["pearson"].abs().sort_values(ascending=False).index).head(10)
-        lines.append(top.to_markdown(index=False) + "\n")
+        lines.append(_to_table(top, index=False) + "\n")
 
     # Conflict rankings — split into real-shared vs pseudo-shared (Phase 1 #4 B4)
     conflict_df = _load_conflict_summaries(output_root, tags)
@@ -103,7 +112,7 @@ def generate_summary(output_root: Path, checkpoint_tags: Iterable[str]) -> None:
         if f.exists():
             df = pd.read_csv(f)
             lines.append(f"\n## Top asymmetric pairs @ {tag}\n")
-            lines.append(df.head(5).to_markdown(index=False) + "\n")
+            lines.append(_to_table(df.head(5), index=False) + "\n")
 
     # GradNorm raw vs normalized symmetry
     lines.append("\n## Raw vs Normalized probe symmetry (Frobenius of antisymmetric Δloss)\n")
@@ -112,7 +121,7 @@ def generate_summary(output_root: Path, checkpoint_tags: Iterable[str]) -> None:
         if f.exists():
             df = pd.read_csv(f)
             lines.append(f"### {tag}\n")
-            lines.append(df.to_markdown(index=False) + "\n")
+            lines.append(_to_table(df, index=False) + "\n")
 
     # Distribution diagnostics summary (Phase 1 #2)
     dist_rows = []
@@ -127,14 +136,14 @@ def generate_summary(output_root: Path, checkpoint_tags: Iterable[str]) -> None:
         dist_df = pd.concat(dist_rows, ignore_index=True)
         lines.append("\n## Distribution shape census (per checkpoint)\n")
         census = dist_df.groupby(["checkpoint", "shape_label"]).size().unstack(fill_value=0)
-        lines.append(census.to_markdown() + "\n")
+        lines.append(_to_table(census) + "\n")
         bimodal = dist_df[dist_df["shape_label"] == "bimodal"]
         if not bimodal.empty:
             lines.append("\n### Bimodal cells (mean is misleading — report modes instead)\n")
             bcols = [c for c in ("checkpoint", "task_a", "task_b", "group",
                                  "dip_p_value", "p5", "p50", "p95")
                      if c in bimodal.columns]
-            lines.append(bimodal[bcols].to_markdown(index=False) + "\n")
+            lines.append(_to_table(bimodal[bcols], index=False) + "\n")
 
     # Null-baseline pass rates (Phase 1 #1)
     nb_rows = []
@@ -154,6 +163,6 @@ def generate_summary(output_root: Path, checkpoint_tags: Iterable[str]) -> None:
             "Bonferroni-corrected p ≤ 0.05.\n"
         )
         rate = nb_df.groupby("checkpoint")["passes_noise_threshold"].mean()
-        lines.append(rate.to_frame("pass_rate").to_markdown() + "\n")
+        lines.append(_to_table(rate.to_frame("pass_rate")) + "\n")
 
     (output_root / "summary_report.md").write_text("\n".join(lines))

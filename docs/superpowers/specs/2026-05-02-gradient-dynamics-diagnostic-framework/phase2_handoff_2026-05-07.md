@@ -1,4 +1,4 @@
-# Phase 2 세션 핸드오프 (2026-05-07)
+/home/yongjae/e2e/HiP-AD/docs/superpowers/specs/2026-05-02-gradient-dynamics-diagnostic-framework/phase2_handoff_2026-05-07.md# Phase 2 세션 핸드오프 (2026-05-07)
 
 > 이전 세션이 GPU 미가용으로 중단되었습니다. 새 세션은 이 문서를 먼저 읽고 진행하세요.
 

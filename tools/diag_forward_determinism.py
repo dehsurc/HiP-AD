@@ -16,8 +16,11 @@ Run::
 """
 from __future__ import annotations
 
+import contextlib
+import random
 import sys
 from pathlib import Path
+import numpy as np
 import torch
 import yaml
 
@@ -27,50 +30,77 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 
 def main() -> int:
-    from mmcv import Config
-    from mmcv.parallel import MMDataParallel
-    from mmcv.runner import load_checkpoint
-    from mmdet.models import build_detector
-
     from tools.gradient_analysis.collector import GradientCollector, build_dataloader
-    from tools.gradient_analysis.compat import (
-        apply_use_reentrant_false, apply_index_put_fix,
+    from tools.run_gradient_analysis import (
+        _import_runtime,
+        _resolve_ckpt_path,
+        build_adapter,
+        set_seeds,
     )
-    from tools.gradient_analysis.matching_freeze import FrozenMatching, per_forward_seed
-    from tools.gradient_analysis.temporal_state import ModelStateSnapshot
-    from tools.run_gradient_analysis import _load_plugins, set_seeds
-
-    apply_use_reentrant_false()
-    apply_index_put_fix()
 
     with open("configs/gradient_analysis.yaml") as f:
         cfg_ana = yaml.safe_load(f)
     set_seeds(cfg_ana["seed"], False)
 
-    # Build model
-    model_cfg = Config.fromfile(cfg_ana["model_config"])
-    _load_plugins(model_cfg)
-    model = build_detector(model_cfg.model,
-                           train_cfg=model_cfg.get("train_cfg"),
-                           test_cfg=model_cfg.get("test_cfg"))
-    model.init_weights()
-    ckpt_path = Path(cfg_ana["ckpt_root"]) / cfg_ana["checkpoints"]["1ep"]
-    load_checkpoint(model, str(ckpt_path), map_location="cpu")
+    rt = _import_runtime()
+    adapter = build_adapter(rt, cfg_ana, "hipad")
     device = cfg_ana["device"]
-    device_id = int(device.split(":")[1]) if ":" in device else 0
-    model = model.to(device)
-    model = MMDataParallel(model, device_ids=[device_id])
+    model = adapter.build_model(
+        ckpt=_resolve_ckpt_path(cfg_ana, "1ep"),
+        device=device,
+    )
 
     collector = GradientCollector(
-        model=model, tasks=cfg_ana["tasks"],
+        model=model,
+        adapter=adapter,
         shared_layer_names=cfg_ana["shared_param_groups"], device=device,
     )
 
     dataloader = build_dataloader(
-        model_cfg, batch_size=cfg_ana["primary"]["batch_size"],
+        adapter, batch_size=cfg_ana["primary"]["batch_size"],
         shuffle=True, seed=cfg_ana["seed"],
     )
     data = next(iter(dataloader))
+
+    @contextlib.contextmanager
+    def per_forward_seed(seed: int):
+        cpu_state = torch.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        np_state = np.random.get_state()
+        py_state = random.getstate()
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        try:
+            yield
+        finally:
+            torch.set_rng_state(cpu_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
+            np.random.set_state(np_state)
+            random.setstate(py_state)
+
+    class ModelStateSnapshot:
+        def __init__(self, model):
+            self._model = model
+            self._snap = adapter.snapshot_temporal_state(model)
+
+        def restore(self) -> None:
+            adapter.restore_temporal_state(self._model, self._snap)
+
+    class FrozenMatching:
+        def __enter__(self):
+            self._ctx = adapter.freeze_stochastic_state()
+            self._ctx.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._ctx.__exit__(exc_type, exc, tb)
+
+        def next_forward(self) -> None:
+            pass
 
     # ---------- Diagnostic A: 3 consecutive forwards, no intervention ----------
     print("\n[A] 3 consecutive forwards (no freeze/no temporal/no seed) — train mode")

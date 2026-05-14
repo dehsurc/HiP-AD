@@ -12,38 +12,27 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 def main() -> int:
     import yaml
-    from mmcv import Config
-    from mmcv.parallel import MMDataParallel
-    from mmcv.runner import load_checkpoint
-    from mmdet.models import build_detector
-
-    from tools.gradient_analysis.compat import (
-        apply_use_reentrant_false, apply_index_put_fix,
+    from tools.gradient_analysis.adapters.hipad import (
+        _ModelStateSnapshot as ModelStateSnapshot,
+        _bank_holders,
+        _raw_model,
+        _sampler_holders,
     )
-    from tools.gradient_analysis.temporal_state import (
-        _sampler_holders, _bank_holders, ModelStateSnapshot, _raw_model,
+    from tools.run_gradient_analysis import (
+        _import_runtime,
+        _resolve_ckpt_path,
+        build_adapter,
+        set_seeds,
     )
-    from tools.run_gradient_analysis import _load_plugins, set_seeds
-
-    apply_use_reentrant_false()
-    apply_index_put_fix()
 
     with open("configs/gradient_analysis.yaml") as f:
         cfg_ana = yaml.safe_load(f)
     set_seeds(cfg_ana["seed"], False)
 
-    model_cfg = Config.fromfile(cfg_ana["model_config"])
-    _load_plugins(model_cfg)
-    model = build_detector(model_cfg.model,
-                           train_cfg=model_cfg.get("train_cfg"),
-                           test_cfg=model_cfg.get("test_cfg"))
-    model.init_weights()
-    ckpt_path = Path(cfg_ana["ckpt_root"]) / cfg_ana["checkpoints"]["1ep"]
-    load_checkpoint(model, str(ckpt_path), map_location="cpu")
-    device = cfg_ana["device"]
-    device_id = int(device.split(":")[1]) if ":" in device else 0
-    model = model.to(device)
-    model = MMDataParallel(model, device_ids=[device_id])
+    rt = _import_runtime()
+    adapter = build_adapter(rt, cfg_ana, "hipad")
+    ckpt_path = _resolve_ckpt_path(cfg_ana, "1ep")
+    model = adapter.build_model(ckpt=ckpt_path, device=cfg_ana["device"])
 
     raw = _raw_model(model)
     print("== Walking module tree for *sampler* attributes ==")

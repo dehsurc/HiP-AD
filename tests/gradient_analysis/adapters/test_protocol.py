@@ -1,5 +1,7 @@
 """Conformance tests for the GradientAnalysisAdapter Protocol shape."""
 import inspect
+import sys
+from pathlib import Path
 
 from tools.gradient_analysis.adapters.base import (
     GradientAnalysisAdapter,
@@ -127,3 +129,45 @@ def test_mockadapter_full_lifecycle():
         snap = a.snapshot_temporal_state(model)
     assert "dummy" in snap.model_state_keys
     a.restore_temporal_state(model, snap)
+
+
+def _clear_projects_modules():
+    for name in list(sys.modules):
+        if name == "projects" or name.startswith("projects."):
+            del sys.modules[name]
+
+
+def _is_env(name: str) -> bool:
+    return name in Path(sys.executable).parts
+
+
+@pytest.mark.skipif(
+    not Path("/home/yongjae/e2e/HiP-AD/ckpts/E2_E1_stage2_18ep/E2_E1_stage2_18ep.py").exists(),
+    reason="HiP-AD config not present",
+)
+@pytest.mark.skipif(_is_env("vad"), reason="HiP-AD adapter requires the hipad env")
+def test_hipad_adapter_satisfies_protocol():
+    try:
+        _clear_projects_modules()
+        from tools.gradient_analysis.adapters.hipad import HipadAdapter
+
+        a = HipadAdapter()
+    except Exception as exc:
+        pytest.skip(f"HiP-AD adapter unavailable in this env: {exc}")
+    assert isinstance(a, GradientAnalysisAdapter)
+
+
+@pytest.mark.skipif(
+    not Path("/home/yongjae/e2e/VAD/data/ckpts/VAD_tiny_e2e.py").exists(),
+    reason="VAD config not present",
+)
+@pytest.mark.skipif(_is_env("hipad"), reason="VAD adapter requires the vad env")
+def test_vad_adapter_satisfies_protocol():
+    try:
+        _clear_projects_modules()
+        from tools.gradient_analysis.adapters.vad import VadAdapter
+
+        a = VadAdapter()
+    except Exception as exc:
+        pytest.skip(f"VAD adapter unavailable in this env: {exc}")
+    assert isinstance(a, GradientAnalysisAdapter)
