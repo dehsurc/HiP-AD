@@ -237,13 +237,20 @@ model = dict(
             temp_graph_model=dict(
                 type="TemporalSeparateAttention",
                 query_select=query_select,
-                query_list=[["det"], ["map"], ["plan", "ego"]],
-                key_list=[["det"], ["map"], ["det", "map"]],
-                decouple_list=[True, False, False],
+                query_list=[["det"], ["map"], ["plan", "ego"], ["plan", "ego"]],
+                key_list=[["det"], ["map"], ["plan", "ego"], ["det", "map"]],
+                decouple_list=[True, False, False, False],
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",
                         embed_dims=embed_dims * 2,
+                        num_heads=num_groups,
+                        batch_first=True,
+                        dropout=drop_out,
+                    ),
+                    dict(
+                        type="MultiheadFlashAttention",
+                        embed_dims=embed_dims,
                         num_heads=num_groups,
                         batch_first=True,
                         dropout=drop_out,
@@ -267,8 +274,8 @@ model = dict(
             graph_model=dict(
                 type="SeparateAttention",
                 query_select=query_select,
-                separate_list=[["det"], ["map"]],
-                decouple_list=[True, False],
+                separate_list=[["det"], ["map"], ["plan", "ego"]],
+                decouple_list=[True, False, False],
                 with_distance_attn_mask=True,
                 attn=[
                     dict(
@@ -285,13 +292,19 @@ model = dict(
                         batch_first=True,
                         dropout=drop_out,
                     ),
+                    dict(
+                        type="MultiheadFlashAttention",
+                        embed_dims=embed_dims,
+                        num_heads=num_groups,
+                        batch_first=True,
+                        dropout=drop_out,
+                    ),
                 ],
             ),
             inter_graph_model=dict(
-                type="InteractiveAttention",
+                type="SeparateAttention",
                 query_select=query_select,
-                query_list=[["plan", "ego"]],
-                key_list=[["det", "map"]],
+                separate_list=[["det", "map", "plan", "ego"]],
                 decouple_list=[False],
                 with_distance_attn_mask=True,
                 attn=[
