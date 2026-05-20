@@ -1,10 +1,13 @@
 import os
+import sys
 import math
 import copy
 import argparse
 from os import path as osp
 from collections import OrderedDict
 from typing import List, Tuple, Union
+
+sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), "../..")))
 
 import numpy as np
 from pyquaternion import Quaternion

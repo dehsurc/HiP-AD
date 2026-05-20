@@ -102,7 +102,7 @@ map_distill_last_layer_only = True
 # Real-GT + teacher pseudo-GT map distillation. The pseudo-GT map path
 # converts teacher logits to hard labels and provides both original/reversed
 # polyline directions before Hungarian assignment.
-map_gt_loss_weight = 1.0
+map_gt_loss_weight = 0.0
 map_distill_mode = 'pseudo_gt'
 model = dict(
     type='SparseDetector',

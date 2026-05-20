@@ -102,7 +102,7 @@ map_distill_last_layer_only = True
 # Real-GT + teacher pseudo-GT map distillation. The pseudo-GT map path
 # converts teacher logits to hard labels and provides both original/reversed
 # polyline directions before Hungarian assignment.
-map_gt_loss_weight = 1.0
+map_gt_loss_weight = 0.0
 map_distill_mode = 'pseudo_gt'
 model = dict(
     type='SparseDetector',
@@ -495,7 +495,7 @@ model = dict(
             motion_decoder=dict(type='SparseMotionDecoder'))))
 dataset_type = 'NuScenes3DDataset'
 data_root = 'data/nuscenes/'
-eval_data_root = 'data/infos/nuscenes/'
+eval_data_root = 'data/nuscenes/'
 anno_root = 'data/infos/'
 file_client_args = dict(backend='disk')
 img_norm_cfg = dict(
@@ -629,7 +629,7 @@ eval_config = dict(
         use_external=False),
     version='v1.0-trainval',
     work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-    eval_data_root='data/infos/nuscenes/',
+    eval_data_root='data/nuscenes/',
     ann_file='data/infos/nuscenes_infos_val.pkl',
     pipeline=[
         dict(
@@ -816,7 +816,7 @@ data = dict(
                 use_external=False),
             version='v1.0-trainval',
             work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-            eval_data_root='data/infos/nuscenes/',
+            eval_data_root='data/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
                 dict(
@@ -908,7 +908,7 @@ data = dict(
                 use_external=False),
             version='v1.0-trainval',
             work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-            eval_data_root='data/infos/nuscenes/',
+            eval_data_root='data/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
                 dict(
