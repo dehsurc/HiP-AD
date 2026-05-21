@@ -127,7 +127,7 @@ class SparseOneDecoder(BaseModule):
 
             with_close_loop=False,  # default False, True means use closed-loop memory bank
             open_loop_hz=2,
-            close_loop_hz=20,
+            close_loop_hz=10,
             open_loop_bank_length=None,
             close_loop_bank_length=None,
 

@@ -561,18 +561,43 @@ class SparseAgent(autonomous_agent.AutonomousAgent):
         )
 
         # control
-        plan_temp_name = 'plan_speed_5hz'  # 'plan_temp_5hz'
+        plan_temp_name = 'plan_speed_5hz'
+        plan_temp_fallback_name = 'plan_temp_5hz'
         plan_spat_name = 'plan_spat_2m'
 
         pred_temp_traj = None
-        if plan_temp_name in outputs[0]['img_bbox']:
-            pred_temp_traj = outputs[0]['img_bbox'][plan_temp_name].cpu().numpy()
-            outputs[0]['img_bbox']['temporal_planning'] = outputs[0]['img_bbox'][plan_temp_name]
+        plan_temp_source = plan_temp_name
+        img_bbox = outputs[0]['img_bbox']
+        if plan_temp_name in img_bbox:
+            pred_temp_traj = img_bbox[plan_temp_name].cpu().numpy()
+            outputs[0]['img_bbox']['temporal_planning'] = img_bbox[plan_temp_name]
+
+            speed_area_name = '{}_area'.format(plan_temp_name)
+            if speed_area_name in img_bbox and plan_temp_fallback_name in img_bbox:
+                speed_area = img_bbox[speed_area_name]
+                if hasattr(speed_area, 'cpu'):
+                    speed_area = speed_area.cpu().numpy()
+                speed_area = np.asarray(speed_area).reshape(-1)
+
+                if speed_area.size >= 2:
+                    hz = float(plan_temp_name.split('_')[-1].split('hz')[0])
+                    pred_with_origin = np.concatenate(
+                        [np.zeros((1, pred_temp_traj.shape[-1]), dtype=pred_temp_traj.dtype), pred_temp_traj],
+                        axis=0)
+                    pred_speed = np.linalg.norm(np.diff(pred_with_origin, axis=0), axis=-1).mean() * hz
+                    if not (speed_area[0] <= pred_speed < speed_area[1]):
+                        pred_temp_traj = img_bbox[plan_temp_fallback_name].cpu().numpy()
+                        outputs[0]['img_bbox']['temporal_planning'] = img_bbox[plan_temp_fallback_name]
+                        plan_temp_source = plan_temp_fallback_name
+        elif plan_temp_fallback_name in img_bbox:
+            pred_temp_traj = img_bbox[plan_temp_fallback_name].cpu().numpy()
+            outputs[0]['img_bbox']['temporal_planning'] = img_bbox[plan_temp_fallback_name]
+            plan_temp_source = plan_temp_fallback_name
 
         pred_spat_traj = None
-        if plan_spat_name in outputs[0]['img_bbox']:
-            pred_spat_traj = outputs[0]['img_bbox'][plan_spat_name].cpu().numpy()
-            outputs[0]['img_bbox']['spatial_planning'] = outputs[0]['img_bbox'][plan_spat_name]
+        if plan_spat_name in img_bbox:
+            pred_spat_traj = img_bbox[plan_spat_name].cpu().numpy()
+            outputs[0]['img_bbox']['spatial_planning'] = img_bbox[plan_spat_name]
 
         steer_traj, throttle_traj, brake_traj, metadata_traj = self.pidcontroller.control_pid(
             pred_temp_traj, pred_spat_traj, ego_speed, target_point)
@@ -594,6 +619,7 @@ class SparseAgent(autonomous_agent.AutonomousAgent):
         self.pid_metadata['throttle_traj'] = float(throttle_traj)
         self.pid_metadata['brake_traj'] = float(brake_traj)
         self.pid_metadata['plan_temp'] = pred_temp_traj.tolist()
+        self.pid_metadata['plan_temp_source'] = plan_temp_source
         self.pid_metadata['plan_spat'] = pred_spat_traj.tolist()
         self.pid_metadata['command'] = command
         self.pid_metadata['target_point'] = [float(target_point[0]), float(target_point[1])]

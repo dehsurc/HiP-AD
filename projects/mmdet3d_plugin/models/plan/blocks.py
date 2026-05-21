@@ -91,7 +91,7 @@ class SparsePlanAlignRefinementModule(BaseModule):
 
             self.plan_cls_branch_speed = nn.Sequential(
                 *linear_relu_ln(embed_dims, 1, 2),
-                Linear(embed_dims, 1),
+                Linear(embed_dims, len(self.speed_areas)),
             )
 
         for anchor_type in anchor_types:
@@ -100,7 +100,17 @@ class SparsePlanAlignRefinementModule(BaseModule):
                 Linear(embed_dims, ego_fut_ts * 2),
                 Scale([1.0] * ego_fut_ts * 2),
             )
-            setattr(self, "plan_reg_branch_{}_{}".format(anchor_type[0], anchor_type[1]), reg_branch)
+            setattr(self, "plan_reg_branch_{}".format(self._branch_suffix(anchor_type)), reg_branch)
+
+    @staticmethod
+    def _branch_suffix(anchor_type):
+        parts = []
+        for item in anchor_type:
+            if isinstance(item, tuple):
+                parts.extend(item)
+            else:
+                parts.append(item)
+        return "_".join(str(part).replace("-", "m").replace(".", "p") for part in parts)
 
     def init_weight(self):
         bias_init = bias_init_with_prob(0.01)
@@ -115,44 +125,23 @@ class SparsePlanAlignRefinementModule(BaseModule):
 
         instance_features = torch.stack(instance_feature.chunk(self.anchor_group, dim=1))
 
-        align_query = []
-        speed_query_dict = dict()
-        for index, anchor_type in enumerate(self.anchor_types):
-            if anchor_type[0] in ["temp", "spat"]:
-                align_query.append(instance_features[index])
-            elif anchor_type[0] == "speed":
-                if anchor_type[1] not in speed_query_dict:
-                    speed_query_dict[anchor_type[1]] = [None] * len(self.speed_areas)
-                speed_index = self.speed_areas.index(anchor_type[2])
-                speed_query_dict[anchor_type[1]][speed_index] = instance_features[index]
-            else:
-                raise NotImplementedError
-
-        align_query = sum(align_query)
-
-        if len(speed_query_dict):
-            for speed_index in range(len(self.speed_areas)):
-                speed_query = []
-                for freq in speed_query_dict.keys():
-                    speed_query.append(speed_query_dict[freq][speed_index])
-                speed_query = sum(speed_query)
-                for freq in speed_query_dict.keys():
-                    speed_query_dict[freq][speed_index] = align_query + speed_query
+        fused_query = sum(instance_features)
+        modality_cls = self.plan_cls_branch(fused_query)
+        style_cls = self.plan_cls_branch_speed(fused_query) if hasattr(self, "plan_cls_branch_speed") else None
 
         cls_outputs = []
         reg_outputs = []
         for anchor_type in self.anchor_types:
-            reg_branch = getattr(self, "plan_reg_branch_{}_{}".format(anchor_type[0], anchor_type[1]))
-            if anchor_type[0] in ["temp", "spat"]:
-                reg_output = reg_branch(align_query)
-                cls_output = self.plan_cls_branch(align_query)
+            reg_branch = getattr(self, "plan_reg_branch_{}".format(self._branch_suffix(anchor_type)))
+            reg_output = reg_branch(fused_query)
 
+            if anchor_type[0] in ["temp", "spat"]:
+                cls_output = modality_cls
             elif anchor_type[0] == "speed":
                 speed_index = self.speed_areas.index(anchor_type[2])
-                speed_query = speed_query_dict[anchor_type[1]][speed_index]
-                reg_output = reg_branch(speed_query)
-                cls_output = self.plan_cls_branch_speed(speed_query)
-
+                cls_output = style_cls[..., speed_index:speed_index + 1]
+            else:
+                raise NotImplementedError
             cls_outputs.append(cls_output)
             reg_outputs.append(reg_output)
 

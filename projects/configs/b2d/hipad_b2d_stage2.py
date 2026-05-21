@@ -94,17 +94,17 @@ plan_anchor_paths = {
     ("spat", "5m") : spat_path_6x8_5m,
     ("speed", "5hz", (0, 0.4)) : spat_path_6x8_2m,
     ("speed", "5hz", (0.4, 3)) : spat_path_6x8_2m,
-    ("speed", "5hz", (3, 999)) : spat_path_6x8_2m,
+    ("speed", "5hz", (3, 10)) : spat_path_6x8_2m,
     ("speed", "2hz", (0, 0.4)) : spat_path_6x8_5m,
     ("speed", "2hz", (0.4, 3)) : spat_path_6x8_5m,
-    ("speed", "2hz", (3, 999)) : spat_path_6x8_5m,
+    ("speed", "2hz", (3, 10)) : spat_path_6x8_5m,
 }
 
 plan_speed_refer = ("temp", "5hz")
 plan_anchor_refer = ("spat", "2m")
 plan_anchor_types = [("temp", "5hz"), ("spat", "2m"), ("temp", "2hz"), ("spat", "5m"),
-                     ("speed", "5hz", (0, 0.4)), ("speed", "5hz", (0.4, 3)), ("speed", "5hz", (3, 999)),
-                     ("speed", "2hz", (0, 0.4)), ("speed", "2hz", (0.4, 3)), ("speed", "2hz", (3, 999))]
+                     ("speed", "5hz", (0, 0.4)), ("speed", "5hz", (0.4, 3)), ("speed", "5hz", (3, 10)),
+                     ("speed", "2hz", (0, 0.4)), ("speed", "2hz", (0.4, 3)), ("speed", "2hz", (3, 10))]
 
 
 model = dict(
@@ -150,6 +150,8 @@ model = dict(
             query_select=query_select,
             operation_order=operation_order,
             num_single_frame_decoder=num_single_frame_decoder,
+            open_loop_hz=2,
+            close_loop_hz=10,
             plan_speed_refer=plan_speed_refer,
             plan_anchor_refer=plan_anchor_refer,
             with_command_embed=True,
@@ -157,6 +159,7 @@ model = dict(
             with_supervise_ego_status=True,
             with_ego_instance_feature=True,
             with_incremental_plan_refine=True,
+            with_distance_attn_mask=True,
             motion_anchor=anchor_paths["motion"],
             cls_threshold_to_reg=0.05,
             # instance_bank
@@ -227,8 +230,45 @@ model = dict(
             temp_graph_model=dict(
                 type="TemporalSeparateAttention",
                 query_select=query_select,
-                query_list=[["det"], ["map"], ["plan", "ego"]],
-                key_list=[["det"], ["map"], ["det", "map"]],
+                query_list=[["det"], ["map"], ["plan", "ego"], ["plan", "ego"]],
+                key_list=[["det"], ["map"], ["plan", "ego"], ["det", "map"]],
+                decouple_list=[True, False, False, False],
+                use_updated_query=True,
+                attn=[
+                    dict(
+                        type="MultiheadFlashAttention",
+                        embed_dims=embed_dims * 2,
+                        num_heads=num_groups,
+                        batch_first=True,
+                        dropout=drop_out,
+                    ),
+                    dict(
+                        type="MultiheadFlashAttention",
+                        embed_dims=embed_dims,
+                        num_heads=num_groups,
+                        batch_first=True,
+                        dropout=drop_out,
+                    ),
+                    dict(
+                        type="MultiheadFlashAttention",
+                        embed_dims=embed_dims,
+                        num_heads=num_groups,
+                        batch_first=True,
+                        dropout=drop_out,
+                    ),
+                    dict(
+                        type="MultiheadFlashAttention",
+                        embed_dims=embed_dims,
+                        num_heads=num_groups,
+                        batch_first=True,
+                        dropout=drop_out,
+                    ),
+                ],
+            ) if temporal else None,
+            graph_model=dict(
+                type="SeparateAttention",
+                query_select=query_select,
+                separate_list=[["det"], ["map"], ["plan", "ego"]],
                 decouple_list=[True, False, False],
                 attn=[
                     dict(
@@ -253,35 +293,14 @@ model = dict(
                         dropout=drop_out,
                     ),
                 ],
-            ) if temporal else None,
-            graph_model=dict(
-                type="SeparateAttention",
-                query_select=query_select,
-                separate_list=[["det"], ["map"]],
-                decouple_list=[True, False],
-                attn=[
-                    dict(
-                        type="MultiheadFlashAttention",
-                        embed_dims=embed_dims * 2,
-                        num_heads=num_groups,
-                        batch_first=True,
-                        dropout=drop_out,
-                    ),
-                    dict(
-                        type="MultiheadFlashAttention",
-                        embed_dims=embed_dims,
-                        num_heads=num_groups,
-                        batch_first=True,
-                        dropout=drop_out,
-                    ),
-                ],
             ),
             inter_graph_model=dict(
-                type="InteractiveAttention",
+                type="SeparateAttention",
                 query_select=query_select,
-                query_list=[["plan", "ego"]],
-                key_list=[["det", "map"]],
+                separate_list=[["det", "map", "plan", "ego"]],
                 decouple_list=[False],
+                with_distance_attn_mask=True,
+                with_structured_mask=True,
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",

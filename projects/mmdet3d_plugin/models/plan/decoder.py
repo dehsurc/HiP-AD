@@ -155,7 +155,10 @@ class SparsePlanDecoder(object):
                         if status_idx != -1:
                             speed_idx = status_idx
 
-                    output["plan_speed_{}".format(speed_type)] = speed_reg_preds[speed_idx].cpu()
+                    speed_idx_value = int(speed_idx.item()) if torch.is_tensor(speed_idx) else int(speed_idx)
+                    speed_area = speed_dict[speed_type]["speed_areas"][speed_idx_value]
+                    output["plan_speed_{}".format(speed_type)] = speed_reg_preds[speed_idx_value].cpu()
+                    output["plan_speed_{}_area".format(speed_type)] = speed_reg_preds.new_tensor(speed_area).cpu()
 
             outputs.append(output)
         return outputs
