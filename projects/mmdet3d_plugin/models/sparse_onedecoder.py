@@ -894,11 +894,6 @@ class SparseOneDecoder(BaseModule):
                     attn_mask=attn_mask,
                     independent=self.independent_gnn,
                     num_anchor_cumsum=self.num_anchor_cumsum,
-                    det_anchor=det_anchor,
-                    map_anchor=map_anchor,
-                    plan_anchor=plan_anchor,
-                    distance_tau=self.distance_tau if self.with_distance_attn_mask else None,
-                    velocity_tau=self.velocity_tau if self.with_velocity_attn_mask else None,
                     fc_before=self.fc_before,
                     fc_after=self.fc_after,
                 )

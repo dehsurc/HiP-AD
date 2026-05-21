@@ -8,7 +8,7 @@ work_dir = "work_dirs/exp/E1_stage1_12ep_new"
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
 
-num_gpus = 2
+num_gpus = 4
 batch_size = 4
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
 num_epochs = 12
@@ -275,7 +275,6 @@ model = dict(
                 query_select=query_select,
                 separate_list=[["det"], ["map"], ["plan", "ego"]],
                 decouple_list=[True, False, False],
-                with_distance_attn_mask=True,
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",
@@ -306,6 +305,7 @@ model = dict(
                 separate_list=[["det", "map", "plan", "ego"]],
                 decouple_list=[False],
                 with_distance_attn_mask=True,
+                with_structured_mask=True,
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",

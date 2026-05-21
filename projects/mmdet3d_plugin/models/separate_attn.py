@@ -32,6 +32,9 @@ class SeparateAttention(nn.Module):
                  decouple_list=None,
                  with_distance_attn_mask=False,
                  with_velocity_attn_mask=False,
+                 with_structured_mask=False,
+                 perception_modalities=("det", "map"),
+                 planning_modalities=("plan", "ego"),
                  **kwargs):
         super(SeparateAttention, self).__init__()
         self.query_select = query_select
@@ -39,6 +42,9 @@ class SeparateAttention(nn.Module):
         self.decouple_list = decouple_list
         self.with_distance_attn_mask = with_distance_attn_mask
         self.with_velocity_attn_mask = with_velocity_attn_mask
+        self.with_structured_mask = with_structured_mask
+        self.perception_modalities = tuple(perception_modalities)
+        self.planning_modalities = tuple(planning_modalities)
         assert separate_list is not None
         assert decouple_list is not None
         assert len(separate_list) == len(decouple_list)
@@ -93,6 +99,16 @@ class SeparateAttention(nn.Module):
                     velo_attn_mask = InteractiveAttention.get_velocity_attn_mask(
                         self, sep_query, separate, separate, velocity_tau, kwargs)
                     sep_attn_mask = sep_attn_mask + velo_attn_mask if sep_attn_mask is not None else velo_attn_mask
+
+                # Paper §3.2 + figure: planning queries access info from all tasks,
+                # but perception (det/map) does NOT attend to plan/ego. Block perception
+                # row × planning column with -inf so the symmetric self-attn matrix
+                # behaves like the figure's grey-cell Collaborative Attention Map.
+                if self.with_structured_mask:
+                    struct_mask = self._make_structured_mask(
+                        separate, num_query_list, sep_query.dtype, sep_query.device)
+                    if struct_mask is not None:
+                        sep_attn_mask = sep_attn_mask + struct_mask if sep_attn_mask is not None else struct_mask
 
                 if self.decouple_list[sep]:
                     sep_query = torch.cat([sep_query, sep_query_pos], dim=-1)
@@ -173,6 +189,42 @@ class SeparateAttention(nn.Module):
                     output_instance[:, start2:end2] = output[:, start1:end1]
 
         return output_instance
+
+
+    def _make_structured_mask(self, separate, num_query_list, dtype, device):
+        """Build additive attention mask that blocks perception→plan/ego routes.
+
+        Paper §3.2 + Fig 4: planning queries can access all tasks (free), but
+        perception (det/map) must NOT attend to plan/ego — figure shows plan
+        column greyed out in the Collaborative Attention Map. Implemented as an
+        additive mask of shape [Nq, Nq] (broadcasts across batch/heads) with
+        -inf at perception_row × planning_column cells, 0 elsewhere. Returns
+        None if the group does not contain both perception and planning
+        modalities (mask would be trivial).
+        """
+        cum = [0]
+        for n in num_query_list:
+            cum.append(cum[-1] + n)
+
+        perception_ranges = []
+        planning_ranges = []
+        for i, modality in enumerate(separate):
+            rng = (cum[i], cum[i + 1])
+            if modality in self.perception_modalities:
+                perception_ranges.append(rng)
+            elif modality in self.planning_modalities:
+                planning_ranges.append(rng)
+
+        if not perception_ranges or not planning_ranges:
+            return None
+
+        total = cum[-1]
+        mask = torch.zeros((total, total), dtype=dtype, device=device)
+        neg_inf = torch.finfo(dtype).min
+        for p_start, p_end in perception_ranges:
+            for q_start, q_end in planning_ranges:
+                mask[p_start:p_end, q_start:q_end] = neg_inf
+        return mask
 
 
     def get_separate_attn_mask(self, attn_mask, separate, num_anchor_cumsum, num_temp_anchor_cumsum=None):
@@ -601,9 +653,12 @@ class InteractiveAttention(nn.Module):
         tau = distance_tau(sep_query)  # [B, Nq_total, H]
 
         # Paper §3.2: planning queries are exempt from τ·D distance gating.
+        # Release convention groups ego with plan (concat in same attn block) and
+        # the figure shows no separate ego query — treat ego as plan-side, also
+        # exempt.
         q_offset = 0
         for q_type, q_len in zip(sep_query_list, q_lens):
-            if q_type == "plan":
+            if q_type in ("plan", "ego"):
                 tau = tau.clone()
                 tau[:, q_offset:q_offset + q_len, :] = 0.0
             q_offset += q_len
