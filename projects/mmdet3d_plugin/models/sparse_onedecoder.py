@@ -125,7 +125,7 @@ class SparseOneDecoder(BaseModule):
 
             with_close_loop=False,  # default False, True means use closed-loop memory bank
             open_loop_hz=2,
-            close_loop_hz=20,
+            close_loop_hz=10,
             open_loop_bank_length=None,
             close_loop_bank_length=None,
 
@@ -359,10 +359,10 @@ class SparseOneDecoder(BaseModule):
             self.fc_after = nn.Linear(self.embed_dims * 2, self.embed_dims, bias=False)
 
         if self.with_distance_attn_mask:
-            self.distance_tau = nn.Linear(256, 8)
+            self.distance_tau = nn.Linear(self.embed_dims, 8)
 
         if self.with_velocity_attn_mask:
-            self.velocity_tau = nn.Linear(256, 8)
+            self.velocity_tau = nn.Linear(self.embed_dims, 8)
 
         self.run_step = 0
         self.attn_mask = None
@@ -1603,4 +1603,3 @@ class SparseOneDecoder(BaseModule):
                 ego_output, det_output, motion_output, plan_output, data)
 
         return det_result, map_result, ego_result, plan_result, motion_result
-
