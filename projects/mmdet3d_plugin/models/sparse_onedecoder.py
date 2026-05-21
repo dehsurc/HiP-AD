@@ -25,6 +25,7 @@ from mmdet.models import HEADS, LOSSES
 
 from .blocks import linear_relu_ln
 from .attention import gen_sineembed_for_position
+from .oracle_inject import build_oracle_det_outputs
 
 from typing import List, Optional, Tuple, Union
 from projects.mmdet3d_plugin.core.box3d import *
@@ -162,6 +163,10 @@ class SparseOneDecoder(BaseModule):
             det_gt_loss_weight=1.0,     # weight for GT detection losses (0.0 = distill-only)
             pseudo_gt_weight=1.0,       # weight for pseudo GT detection loss (pseudo_gt_plus mode)
 
+            # oracle perception (Scenario A: det-only oracle)
+            oracle_det=False,
+            oracle_det_freeze=True,
+
             **kwargs,
     ):
         super(SparseOneDecoder, self).__init__(init_cfg)
@@ -202,6 +207,14 @@ class SparseOneDecoder(BaseModule):
         self.distill_mode = distill_mode
         self.det_gt_loss_weight = det_gt_loss_weight
         self.pseudo_gt_weight = pseudo_gt_weight
+
+        # Oracle perception (Scenario A: det -> GT). When enabled, the det
+        # "slot" tensors consumed by motion_query / inter_gnn are produced from
+        # gt_bboxes_3d / gt_labels_3d instead of from det_refine. det modules
+        # remain in the graph but their outputs are discarded; with
+        # oracle_det_freeze=True they also stop receiving gradients.
+        self.oracle_det = oracle_det
+        self.oracle_det_freeze = oracle_det_freeze
 
         self.independent_gnn = independent_gnn
         self.independent_temp_gnn = independent_temp_gnn
@@ -419,6 +432,21 @@ class SparseOneDecoder(BaseModule):
 
         self.init_instance_bank_list()
 
+        if self.oracle_det and self.oracle_det_freeze and "det" in self.query_select:
+            # Freeze det modules: their outputs are overridden by GT, so we
+            # don't want them updating from the discarded path.
+            for mod_name in (
+                "det_refine",
+                "det_deformable",
+                "det_anchor_encoder",
+                "det_instance_bank",
+            ):
+                mod = getattr(self, mod_name, None)
+                if mod is None:
+                    continue
+                for p in mod.parameters():
+                    p.requires_grad_(False)
+
     def init_instance_bank_list(self):
         self.is_init_bank_list = True
 
@@ -450,6 +478,21 @@ class SparseOneDecoder(BaseModule):
                 self.plan_instance_bank_list = [copy.deepcopy(self.plan_instance_bank) for _ in range(self.bank_length)]
             if "scenes" in self.query_select:
                 self.scenes_instance_bank_list = [copy.deepcopy(self.scenes_instance_bank) for _ in range(self.bank_length)]
+
+    def _build_oracle_det(self, metas, device, dtype, instance_feature_template=None):
+        """Wrapper around oracle_inject.build_oracle_det_outputs that knows our shapes."""
+        num_cls = self.loss_det_cls.num_classes if hasattr(self.loss_det_cls, "num_classes") \
+            else self.det_refine[0].num_cls
+        return build_oracle_det_outputs(
+            metas=metas,
+            num_anchor=self.det_instance_bank.num_anchor,
+            num_cls=num_cls,
+            embed_dims=self.embed_dims,
+            device=device,
+            dtype=dtype,
+            anchor_encoder=self.det_anchor_encoder,
+            instance_feature_template=instance_feature_template,
+        )
 
     def _agent2lidar(self, trajs, boxes):
         yaw = torch.atan2(boxes[..., SIN_YAW], boxes[..., COS_YAW])
@@ -529,6 +572,18 @@ class SparseOneDecoder(BaseModule):
             temp_det_anchor_embed = self.det_anchor_encoder(temp_det_anchor) if temp_det_anchor is not None else None
             self.num_det_anchor = det_anchor.size(1)
             self.num_temp_det_anchor = temp_det_anchor.size(1) if temp_det_anchor is not None else 0
+
+            if self.oracle_det:
+                # Override the det slot with GT before any GNN / inter_gnn runs.
+                det_anchor, _det_cls_init, _det_qt_init, det_instance_feature, det_anchor_embed, _ = \
+                    self._build_oracle_det(
+                        metas, det_instance_feature.device, det_instance_feature.dtype,
+                        instance_feature_template=det_instance_feature)
+                # Drop temporal det to avoid mixing GT current with stale learned features.
+                temp_det_instance_feature = None
+                temp_det_anchor = None
+                temp_det_anchor_embed = None
+                self.num_temp_det_anchor = 0
         else:
             det_instance_feature, det_anchor, det_anchor_embed = None, None, None
             temp_det_instance_feature, temp_det_anchor, temp_det_anchor_embed = None, None, None
@@ -914,22 +969,34 @@ class SparseOneDecoder(BaseModule):
 
             elif op == "refine":
                 if "det" in self.task_select:
-                    det_anchor, det_cls, det_qt = self.det_refine[refine_i](
-                        det_instance_feature, det_anchor, det_anchor_embed, time_interval=time_interval,
-                        return_cls=True)
-                    det_prediction.append(det_anchor)
-                    det_classification.append(det_cls)
-                    det_quality.append(det_qt)
+                    if self.oracle_det:
+                        # Discard whatever the deformable/gnn pass produced for
+                        # det; reload GT into the slot for the next layer.
+                        det_anchor, det_cls, det_qt, det_instance_feature, det_anchor_embed, _ = \
+                            self._build_oracle_det(
+                                metas, det_instance_feature.device, det_instance_feature.dtype,
+                                instance_feature_template=det_instance_feature)
+                        det_prediction.append(det_anchor)
+                        det_classification.append(det_cls)
+                        det_quality.append(det_qt)
+                        # No bank update, no temporal carry — oracle is stateless.
+                    else:
+                        det_anchor, det_cls, det_qt = self.det_refine[refine_i](
+                            det_instance_feature, det_anchor, det_anchor_embed, time_interval=time_interval,
+                            return_cls=True)
+                        det_prediction.append(det_anchor)
+                        det_classification.append(det_cls)
+                        det_quality.append(det_qt)
 
-                    if len(det_prediction) == self.num_single_frame_decoder:
-                        det_instance_feature, det_anchor = self.det_instance_bank_list[bank_idx].update(
-                            det_instance_feature, det_anchor, det_cls)
+                        if len(det_prediction) == self.num_single_frame_decoder:
+                            det_instance_feature, det_anchor = self.det_instance_bank_list[bank_idx].update(
+                                det_instance_feature, det_anchor, det_cls)
 
-                    det_anchor_embed = self.det_anchor_encoder(det_anchor)
+                        det_anchor_embed = self.det_anchor_encoder(det_anchor)
 
-                    if len(det_prediction) > self.num_single_frame_decoder and temp_det_anchor_embed is not None:
-                        temp_det_anchor_embed = det_anchor_embed[:,
-                                                : self.det_instance_bank_list[bank_idx].num_temp_instances]
+                        if len(det_prediction) > self.num_single_frame_decoder and temp_det_anchor_embed is not None:
+                            temp_det_anchor_embed = det_anchor_embed[:,
+                                                    : self.det_instance_bank_list[bank_idx].num_temp_instances]
 
                 if "map" in self.task_select:
                     map_anchor, map_cls, map_qt = self.map_refine[refine_i](
@@ -1097,7 +1164,9 @@ class SparseOneDecoder(BaseModule):
             if modality == "ego":
                 self.ego_instance_bank_list[bank_idx].cache(
                     ego_instance_feature, ego_anchor, metas, feature_maps)
-            if modality == "det":
+            if modality == "det" and not self.oracle_det:
+                # Skip the det bank cache when oracle is on — det_anchor is GT,
+                # not a learned prediction, and we override get() anyway.
                 self.det_instance_bank_list[bank_idx].cache(
                     det_instance_feature, det_anchor, det_cls, metas, feature_maps)
             if modality == "map":
@@ -1110,7 +1179,9 @@ class SparseOneDecoder(BaseModule):
                 self.scenes_instance_bank_list[bank_idx].cache(
                     scenes_instance_feature, scenes_anchor_embed, metas, feature_maps)
 
-        if self.with_instance_id and "det" in self.task_select:
+        if self.with_instance_id and "det" in self.task_select and not self.oracle_det:
+            # Skip tracker instance-id assignment in oracle mode: it relies on
+            # the temporal det bank state which we deliberately leave empty.
             det_instance_id = self.det_instance_bank_list[bank_idx].get_instance_id(
                 det_cls, det_anchor, self.det_decoder.score_threshold)
             det_output["instance_id"] = det_instance_id
