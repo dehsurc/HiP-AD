@@ -3,7 +3,7 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/exp/E1_stage1_12ep_new"
+work_dir = "work_dirs/exp/E1_stage1_12ep_rev"
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
@@ -15,8 +15,8 @@ num_epochs = 12
 checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
-wandb_project = "hipad"
-wandb_name = "E1_stage1_12ep_new"
+wandb_project = "hipad_rev"
+wandb_name = "E1_stage1_12ep_rev"
 log_config = dict(
     interval=50,
     hooks=[
