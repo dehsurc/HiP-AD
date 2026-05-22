@@ -94,10 +94,11 @@ plan_speed_refer = None
 plan_anchor_refer = ('temp', '2hz')
 plan_anchor_types = [('temp', '2hz')]
 map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train.pkl'
-map_distill_alpha_cls = 0.4
-map_distill_alpha_reg = 0.2
+map_distill_alpha_cls = 0.1
+map_distill_alpha_reg = 1.0
 map_distill_temperature = 4.0
 map_distill_score_thr = 0.3
+map_distill_dist_thr = 4.0
 map_distill_last_layer_only = True
 # Real-GT + teacher pseudo-GT map distillation. The pseudo-GT map path
 # converts teacher logits to hard labels and provides both original/reversed
@@ -167,10 +168,11 @@ model = dict(
             with_incremental_plan_refine=True,
             motion_anchor='data/kmeans/kmeans_motion_6.npy',
             cls_threshold_to_reg=0.05,
-            map_distill_alpha_cls=0.4,
-            map_distill_alpha_reg=0.2,
+            map_distill_alpha_cls=map_distill_alpha_cls,
+            map_distill_alpha_reg=map_distill_alpha_reg,
             map_distill_temperature=4.0,
             map_distill_score_thr=0.3,
+            map_distill_dist_thr=map_distill_dist_thr,
             map_distill_last_layer_only=True,
             map_gt_loss_weight=map_gt_loss_weight,
             map_distill_mode=map_distill_mode,
@@ -495,7 +497,7 @@ model = dict(
             motion_decoder=dict(type='SparseMotionDecoder'))))
 dataset_type = 'NuScenes3DDataset'
 data_root = 'data/nuscenes/'
-eval_data_root = 'data/nuscenes/'
+eval_data_root = 'data/infos/nuscenes/'
 anno_root = 'data/infos/'
 file_client_args = dict(backend='disk')
 img_norm_cfg = dict(
@@ -546,7 +548,7 @@ train_pipeline = [
             'teacher_map_scores'
         ],
         meta_keys=[
-            'T_global', 'T_global_inv', 'timestamp', 'instance_id', 'token'
+            'T_global', 'T_global_inv', 'timestamp', 'instance_id'
         ])
 ]
 test_pipeline = [
@@ -629,7 +631,7 @@ eval_config = dict(
         use_external=False),
     version='v1.0-trainval',
     work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-    eval_data_root='data/nuscenes/',
+    eval_data_root='data/infos/nuscenes/',
     ann_file='data/infos/nuscenes_infos_val.pkl',
     pipeline=[
         dict(
@@ -735,8 +737,7 @@ data = dict(
                     'teacher_map_pts', 'teacher_map_scores'
                 ],
                 meta_keys=[
-                    'T_global', 'T_global_inv', 'timestamp', 'instance_id',
-                    'token'
+                    'T_global', 'T_global_inv', 'timestamp', 'instance_id'
                 ])
         ],
         test_mode=False,
@@ -816,7 +817,7 @@ data = dict(
                 use_external=False),
             version='v1.0-trainval',
             work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-            eval_data_root='data/nuscenes/',
+            eval_data_root='data/infos/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
                 dict(
@@ -908,7 +909,7 @@ data = dict(
                 use_external=False),
             version='v1.0-trainval',
             work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-            eval_data_root='data/nuscenes/',
+            eval_data_root='data/infos/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
                 dict(
