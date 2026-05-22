@@ -240,6 +240,7 @@ model = dict(
                 query_list=[["det"], ["map"], ["plan", "ego"], ["plan", "ego"]],
                 key_list=[["det"], ["map"], ["plan", "ego"], ["det", "map"]],
                 decouple_list=[True, False, False, False],
+                use_updated_query=True,
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",

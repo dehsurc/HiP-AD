@@ -30,7 +30,7 @@ class SeparateAttention(nn.Module):
                  query_select=None,
                  separate_list=None,
                  decouple_list=None,
-                 with_distance_attn_mask=False,
+                 with_distance_attn_mask=True,
                  with_velocity_attn_mask=False,
                  with_structured_mask=False,
                  perception_modalities=("det", "map"),
@@ -408,7 +408,7 @@ class InteractiveAttention(nn.Module):
                  query_list=None,
                  key_list=None,
                  decouple_list=None,
-                 with_distance_attn_mask=False,
+                 with_distance_attn_mask=True,
                  with_velocity_attn_mask=False,
                  attn_mask_ban_list=None,
                  attn_mask_cancel_list=None,
@@ -716,6 +716,7 @@ class InteractiveAttention(nn.Module):
             return vels
 
         all_query2key_vel_list = []
+        q_lens = []
         for query_type in sep_query_list:
             query2key_vel_list = []
             for key_type in sep_key_list:
@@ -723,15 +724,25 @@ class InteractiveAttention(nn.Module):
                 query2key_vel_list.append(query_key_vel)
             all_query2key_vel = torch.cat(query2key_vel_list, dim=-1)
             all_query2key_vel_list.append(all_query2key_vel)
+            q_lens.append(all_query2key_vel.shape[-2])
         velocity = torch.cat(all_query2key_vel_list, dim=-2)
         velocity = velocity - velocity.max()
 
-        tau = velocity_tau(sep_query)
-        tau = tau.permute(0, 2, 1)
+        tau = velocity_tau(sep_query)  # [B, Nq_total, H]
 
-        attn_mask = velocity[:, None, :, :] * tau[..., None]
-        attn_mask = attn_mask.flatten(0, 1)
+        # Same plan/ego exemption convention as get_distance_attn_mask: paper
+        # §3.2 leaves planning queries free of geometric gating, and release
+        # groups ego with plan so ego is plan-side too.
+        q_offset = 0
+        for q_type, q_len in zip(sep_query_list, q_lens):
+            if q_type in ("plan", "ego"):
+                tau = tau.clone()
+                tau[:, q_offset:q_offset + q_len, :] = 0.0
+            q_offset += q_len
 
+        tau = tau.permute(0, 2, 1)  # [B, H, Nq_total]
+
+        attn_mask = velocity[:, None, :, :] * tau[..., None]  # [B, H, Nq, Nk]
         return attn_mask
 
 
