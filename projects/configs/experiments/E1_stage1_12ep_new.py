@@ -276,6 +276,12 @@ model = dict(
                 query_select=query_select,
                 separate_list=[["det"], ["map"], ["plan", "ego"]],
                 decouple_list=[True, False, False],
+                # paper §3.2 names "map-agent, map-map, agent-map" — all
+                # cross-task pairs handled inside the unified self-attn
+                # (inter_graph_model). Per-task self-attn (this block) gets
+                # no τ·D in paper, so explicitly disable here even though
+                # the class default flipped to True.
+                with_distance_attn_mask=False,
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",
