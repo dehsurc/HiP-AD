@@ -63,12 +63,21 @@ shared_param_groups:
   - enc0_temporal_self_attention
   - enc0_spatial_cross_attention
   - enc0_ffn
+  - enc0_norm_0
+  - enc0_norm_1
+  - enc0_norm_2
   - enc1_temporal_self_attention
   - enc1_spatial_cross_attention
   - enc1_ffn
+  - enc1_norm_0
+  - enc1_norm_1
+  - enc1_norm_2
   - enc2_temporal_self_attention
   - enc2_spatial_cross_attention
   - enc2_ffn
+  - enc2_norm_0
+  - enc2_norm_1
+  - enc2_norm_2
 
 null_baseline:
   n_repeats: 1000
