@@ -4,13 +4,17 @@ tasks: [det, map, motion, plan]
 
 adapter: hipad
 ckpt_root: ckpts/E2_E1_stage2_18ep
-model_config: ckpts/E2_E1_stage2_18ep/E2_E1_stage2_18ep.py
+# Analysis-side model config (isolated copy of E2_E1_stage2_18ep_new.py — see spec
+# docs/superpowers/specs/2026-05-23-planning-aligned-task-importance-design.md §4).
+# Override at the CLI with --adapter-config / --vad-repo-root.
+model_config: projects/configs/experiments/E2_E1_stage2_18ep_grad_analysis.py
 
 checkpoints:
-  1ep:  iter_2344.pth
-  3ep:  iter_7032.pth
-  6ep:  iter_14064.pth
-  18ep: iter_42192.pth
+  1ep:  iter_1758.pth
+  3ep:  iter_5274.pth
+  6ep:  iter_7032.pth
+  9ep:  iter_15822.pth
+  18ep: iter.pth
 
 primary:
   batch_size: 6
@@ -31,8 +35,17 @@ probe:
   # per-layer ΔL matrices. Leave empty/null for the original full-param
   # update. Override at the CLI with --probe-layers.
   # Allowed values match `shared_param_groups` after grouping, e.g.:
-  #   dec0_norm_0, dec3_ffn_0, dec5_gnn_0, fc_before, fc_after
-  target_layers: []
+  #   dec0_norm_0, dec3_ffn_0, dec5_gnn_0, fc_before, fc_after, dec0_inter_gnn_0, ...
+  # Default below = inter_gnn scope for the Planning-Aligned Task Importance run
+  # (spec docs/superpowers/specs/2026-05-23-planning-aligned-task-importance-design.md).
+  # Set to [] to fall back to the full-param update.
+  target_layers:
+    - dec0_inter_gnn_0
+    - dec1_inter_gnn_0
+    - dec2_inter_gnn_0
+    - dec3_inter_gnn_0
+    - dec4_inter_gnn_0
+    - dec5_inter_gnn_0
   # Pin Hungarian matching (det/map) and mode argmin (motion/plan) to the
   # baseline forward across the entire probe cycle. Strongly recommended
   # whenever target loss change can be confused with matching reshuffling.
@@ -90,6 +103,31 @@ shared_param_groups:
   - inter_gnn
   - fc_before
   - fc_after
+
+# M2 layer-level conflict — emit per-batch cosine at the named per-decoder param
+# groups (in addition to the flat base conflict on neck/fc_before/fc_after).
+# Default below = inter_gnn scope for the Planning-Aligned Task Importance run.
+layer_conflict:
+  enabled: true
+  layers:
+    - dec0_inter_gnn_0
+    - dec1_inter_gnn_0
+    - dec2_inter_gnn_0
+    - dec3_inter_gnn_0
+    - dec4_inter_gnn_0
+    - dec5_inter_gnn_0
+
+# M_PI — Planning-aligned task importance (post-hoc on layer_conflict + probe).
+# See spec docs/superpowers/specs/2026-05-23-planning-aligned-task-importance-design.md.
+planning_importance:
+  aux_tasks: [det, map, motion]
+  variant: normalized
+  steps: 1
+  plan_task: plan
+  collinear_ref: det                  # motion det-collinearity flag
+  # When null, the module auto-detects inter_gnn-scoped keys from CSV contents.
+  inter_gnn_groups: null
+  inter_gnn_layers: null
 
 output_root: gradient_analysis_results
 

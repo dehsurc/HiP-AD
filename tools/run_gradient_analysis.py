@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # so analyze_gradient_conflict is importable
 
-ALL_MODULES = "M2,M3,M4,M5,M6,M7,M_N1,M_N2,M_N10,M_AS,M_Q"
+ALL_MODULES = "M2,M3,M4,M5,M6,M7,M_N1,M_N2,M_N10,M_AS,M_Q,M_PI"
 
 
 def _import_runtime():
@@ -46,6 +46,7 @@ def _import_runtime():
     from tools.gradient_analysis.bootstrap import augment_summary_with_ci
     from tools.gradient_analysis.magnitude_dynamics import run_magnitude_dynamics
     from tools.gradient_analysis.query_sensitivity import run_query_sensitivity
+    from tools.gradient_analysis.planning_importance import run_planning_importance
 
     return {
         "HipadAdapter": HipadAdapter, "VadAdapter": VadAdapter,
@@ -60,6 +61,7 @@ def _import_runtime():
         "augment_summary_with_ci": augment_summary_with_ci,
         "run_magnitude_dynamics": run_magnitude_dynamics,
         "run_query_sensitivity": run_query_sensitivity,
+        "run_planning_importance": run_planning_importance,
     }
 
 
@@ -300,6 +302,34 @@ def run_primary_for_checkpoint(
                 model_name="HiP-AD",
                 checkpoint=ckpt_tag,
                 checkpoint_order=ckpt_order,
+            )
+
+    # M_PI — Planning-aligned task importance (post-hoc on layer_conflict + probe CSVs).
+    # Reads dec*_inter_gnn_0 cosines + per-layer probe target=plan rows, writes
+    # planning_importance/*.csv. Spec:
+    #   docs/superpowers/specs/2026-05-23-planning-aligned-task-importance-design.md
+    if "M_PI" in modules or "planning_importance" in modules:
+        pi_cfg = cfg_ana.get("planning_importance", {}) or {}
+        lc_dir = out_dir / "layer_conflict"
+        probe_csv = out_dir / "probe" / "probe_per_batch.csv"
+        if not lc_dir.exists() or not probe_csv.exists():
+            print(f"[M_PI] {ckpt_tag}: missing layer_conflict/ or probe_per_batch.csv — "
+                  f"skipping (run M2 layer_conflict + M3 first).")
+        else:
+            rt["run_planning_importance"](
+                layer_conflict_dir=lc_dir,
+                probe_csv=probe_csv,
+                out_dir=out_dir / "planning_importance",
+                aux_tasks=tuple(pi_cfg.get("aux_tasks", ("det", "map", "motion"))),
+                variant=pi_cfg.get("variant", "normalized"),
+                steps=int(pi_cfg.get("steps", 1)),
+                inter_gnn_groups=pi_cfg.get("inter_gnn_groups") or None,
+                inter_gnn_layers=pi_cfg.get("inter_gnn_layers") or None,
+                plan_task=pi_cfg.get("plan_task", "plan"),
+                collinear_ref=pi_cfg.get("collinear_ref", "det"),
+                n_boot=int(pi_cfg.get("n_boot",
+                                      cfg_ana.get("bootstrap", {}).get("n_resamples", 2000))),
+                seed=int(cfg_ana.get("seed", 42)),
             )
 
     # M4/M5/M7 assume probe_df aggregates over the full param set (one ΔL per
