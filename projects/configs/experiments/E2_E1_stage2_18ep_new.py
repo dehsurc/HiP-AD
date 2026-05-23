@@ -3,33 +3,32 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/exp/E6_E5_stage2_6ep_distill_wo_det"
+work_dir = "work_dirs/exp/E2_E1_stage2_18ep_rev"
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
 
-num_gpus = 2
-batch_size = 6
+num_gpus = 4
+batch_size = 4
 num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
-num_epochs = 6
+num_epochs = 18
 checkpoint_epoch_interval = 3
 
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
-import datetime
-wandb_project = "hipad"
-wandb_name = "E6_E5_stage2_distill_wo_det"
+wandb_project = "hipad_rev"
+wandb_name = "E2_E1_stage2_18ep_rev"
 log_config = dict(
     interval=50,
     hooks=[
         dict(type="TextLoggerHook", by_epoch=False),
         dict(
             type="WandbLoggerHook",
-            init_kwargs=dict(project=wandb_project, name=wandb_name, entity="e2ekd"),
+            init_kwargs=dict(entity="e2ekd", project=wandb_project, name=wandb_name),
             by_epoch=False,
         ),
     ],
 )
-load_from = "./work_dirs/exp/E5_stage1_12ep_distill_wo_det/latest.pth"
+load_from = "./work_dirs/exp/E1_stage1_12ep_rev/latest.pth"
 resume_from = None
 workflow = [("train", 1)]
 fp16 = dict(loss_scale=32.0)
@@ -114,16 +113,6 @@ plan_speed_refer = None
 plan_anchor_refer = ("temp", "2hz")
 plan_anchor_types = [("temp", "2hz")]
 
-# ================== distillation config ========================
-teacher_cache_path = "data/cache/det/bevfusion_teacher_train.pkl"
-distill_alpha_cls = 0.2
-distill_alpha_reg = 0.4
-distill_temperature = 4.0  # softening temperature for cls KD
-distill_score_thr = 0.1    # only use teacher proposals with score > this
-distill_last_layer_only = True  # apply KD to last decoder layer only
-distill_mode = "pseudo_gt"     # "teacher_tp" or "pseudo_gt"
-det_gt_loss_weight = 0.0        # 0.0 = distill-only (no GT det supervision)
-
 
 model = dict(
     type="SparseDetector",
@@ -176,16 +165,9 @@ model = dict(
             num_command=ego_fut_cmd,
             with_ego_instance_feature=True,
             with_incremental_plan_refine=True,
+            with_distance_attn_mask=True,
             motion_anchor=anchor_paths["motion"],
             cls_threshold_to_reg=0.05,
-            # distillation
-            distill_alpha_cls=distill_alpha_cls,
-            distill_alpha_reg=distill_alpha_reg,
-            distill_temperature=distill_temperature,
-            distill_score_thr=distill_score_thr,
-            distill_last_layer_only=distill_last_layer_only,
-            distill_mode=distill_mode,
-            det_gt_loss_weight=det_gt_loss_weight,
             # instance_bank
             det_instance_bank=dict(
                 type="InstanceBank",
@@ -255,13 +237,21 @@ model = dict(
             temp_graph_model=dict(
                 type="TemporalSeparateAttention",
                 query_select=query_select,
-                query_list=[["det"], ["map"], ["plan", "ego"]],
-                key_list=[["det"], ["map"], ["det", "map"]],
-                decouple_list=[True, False, False],
+                query_list=[["det"], ["map"], ["plan", "ego"], ["plan", "ego"]],
+                key_list=[["det"], ["map"], ["plan", "ego"], ["det", "map"]],
+                decouple_list=[True, False, False, False],
+                use_updated_query=True,
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",
                         embed_dims=embed_dims * 2,
+                        num_heads=num_groups,
+                        batch_first=True,
+                        dropout=drop_out,
+                    ),
+                    dict(
+                        type="MultiheadFlashAttention",
+                        embed_dims=embed_dims,
                         num_heads=num_groups,
                         batch_first=True,
                         dropout=drop_out,
@@ -285,8 +275,14 @@ model = dict(
             graph_model=dict(
                 type="SeparateAttention",
                 query_select=query_select,
-                separate_list=[["det"], ["map"]],
-                decouple_list=[True, False],
+                separate_list=[["det"], ["map"], ["plan", "ego"]],
+                decouple_list=[True, False, False],
+                # paper §3.2 names "map-agent, map-map, agent-map" — all
+                # cross-task pairs handled inside the unified self-attn
+                # (inter_graph_model). Per-task self-attn (this block) gets
+                # no τ·D in paper, so explicitly disable here even though
+                # the class default flipped to True.
+                with_distance_attn_mask=False,
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",
@@ -302,14 +298,22 @@ model = dict(
                         batch_first=True,
                         dropout=drop_out,
                     ),
+                    dict(
+                        type="MultiheadFlashAttention",
+                        embed_dims=embed_dims,
+                        num_heads=num_groups,
+                        batch_first=True,
+                        dropout=drop_out,
+                    ),
                 ],
             ),
             inter_graph_model=dict(
-                type="InteractiveAttention",
+                type="SeparateAttention",
                 query_select=query_select,
-                query_list=[["plan", "ego"]],
-                key_list=[["det", "map"]],
+                separate_list=[["det", "map", "plan", "ego"]],
                 decouple_list=[False],
+                with_distance_attn_mask=True,
+                with_structured_mask=True,
                 attn=[
                     dict(
                         type="MultiheadFlashAttention",
@@ -575,11 +579,8 @@ train_pipeline = [
             "gt_ego_fut_masks_2hz",
             "ego_status",
             "ego_status_mask",
-            "teacher_logits",
-            "teacher_boxes",
-            "teacher_scores",
         ],
-        meta_keys=["T_global", "T_global_inv", "timestamp", "instance_id", "token"],
+        meta_keys=["T_global", "T_global_inv", "timestamp", "instance_id"],
     ),
 ]
 
@@ -679,7 +680,6 @@ data = dict(
         with_seq_flag=True,
         sequences_split_num=2,
         keep_consistent_seq_aug=True,
-        teacher_cache_path=teacher_cache_path,
     ),
     val=dict(
         **data_basic_config,
@@ -750,4 +750,4 @@ custom_hooks = [
     )
 ]
 
-load_from = "./work_dirs/exp/E5_stage1_12ep_distill_wo_det/latest.pth"
+load_from = "./work_dirs/exp/E1_stage1_12ep_rev/latest.pth"

@@ -104,6 +104,7 @@ class NuScenes3DDataset(Dataset):
         ego_status_mask_limit_vel=20.0,
         ego_status_mask_limit_accel=40.0,
         teacher_cache_path=None,
+        map_teacher_cache_path=None,
     ):
         self.version = version
         self.load_interval = load_interval
@@ -166,6 +167,19 @@ class NuScenes3DDataset(Dataset):
                 self.teacher_cache = pickle.load(f)
             print_log(f"Loaded teacher cache: {len(self.teacher_cache)} samples", logger='root')
             self._convert_teacher_cache_convention()
+
+        # Map teacher cache for map distillation (MapTRv2 teacher).
+        # Cache format per sample_token:
+        #   logits: [100, 3] float32 — already permuted to HiP-AD class order [ped_crossing, divider, boundary]
+        #   pts:    [100, 20, 2] float32 — raw meters, ego-LiDAR frame
+        #   scores: [100] float32 — max sigmoid over classes
+        self.map_teacher_cache = None
+        if map_teacher_cache_path is not None:
+            import pickle
+            print_log(f"Loading map teacher cache from {map_teacher_cache_path}...", logger='root')
+            with open(map_teacher_cache_path, "rb") as f:
+                self.map_teacher_cache = pickle.load(f)
+            print_log(f"Loaded map teacher cache: {len(self.map_teacher_cache)} samples", logger='root')
 
     def _convert_teacher_cache_convention(self):
         """Convert BEVFusion teacher cache box format to HiP-AD student convention.
@@ -450,6 +464,22 @@ class NuScenes3DDataset(Dataset):
                 input_dict["teacher_logits"] = np.zeros((200, 10), dtype=np.float32)
                 input_dict["teacher_boxes"] = np.zeros((200, 9), dtype=np.float32)
                 input_dict["teacher_scores"] = np.zeros((200,), dtype=np.float32)
+
+        # MapTRv2 map teacher cache. pts is .copy()'d so pipeline transforms
+        # (rotation/flip) do not corrupt the shared cache tensor.
+        if self.map_teacher_cache is not None:
+            token = info["token"]
+            map_teacher = self.map_teacher_cache.get(token, None)
+            if map_teacher is not None:
+                input_dict["teacher_map_logits"] = map_teacher["logits"].astype(np.float32)       # [100, 3]
+                input_dict["teacher_map_pts"]    = map_teacher["pts"].copy().astype(np.float32)   # [100, 20, 2]
+                input_dict["teacher_map_scores"] = map_teacher["scores"].astype(np.float32)       # [100]
+            else:
+                # Fallback: zero logits + zero pts + zero scores (scores=0 makes
+                # the proposal fail score_thr so KD silently skips this sample).
+                input_dict["teacher_map_logits"] = np.full((100, 3), -1e4, dtype=np.float32)
+                input_dict["teacher_map_pts"]    = np.zeros((100, 20, 2), dtype=np.float32)
+                input_dict["teacher_map_scores"] = np.zeros((100,), dtype=np.float32)
 
         return input_dict
 

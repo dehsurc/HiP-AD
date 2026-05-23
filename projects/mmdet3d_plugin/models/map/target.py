@@ -46,7 +46,10 @@ class SparsePoint3DTarget(BaseTargetWithDenoising):
             gts = dict(lines=pts_target, labels=cls_target)
             indice = self.assigner.assign(preds, gts)
             indices.append(indice)
-        
+        # Expose matched indices so loss_map's KD branch can reuse them
+        # (mirrors det_sampler.indices pattern).
+        self.indices = indices
+
         bs, num_pred, num_cls = cls_preds.shape
         output_cls_target = cls_targets[0].new_ones([bs, num_pred], dtype=torch.long) * num_cls
         output_box_target = pts_preds.new_zeros(pts_preds.shape)

@@ -3,7 +3,7 @@ dist_params = dict(backend="nccl")
 
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
-work_dir = "work_dirs/exp/E6_E5_stage2_6ep_distill_wo_det"
+work_dir = "work_dirs/hipad_nusc_stage2_distill_only_reg10"
 
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
@@ -14,10 +14,10 @@ num_iters_per_epoch = int(length[version] // (num_gpus * batch_size))
 num_epochs = 6
 checkpoint_epoch_interval = 3
 
-checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
+checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, max_keep_ckpts=-1)
 import datetime
-wandb_project = "hipad"
-wandb_name = "E6_E5_stage2_distill_wo_det"
+wandb_project = "nusc_det_distill"
+wandb_name = "stage2_distill_only_reg10"
 log_config = dict(
     interval=50,
     hooks=[
@@ -29,7 +29,7 @@ log_config = dict(
         ),
     ],
 )
-load_from = "./work_dirs/exp/E5_stage1_12ep_distill_wo_det/latest.pth"
+load_from = "./work_dirs/hipad_nusc_stage1/latest.pth"
 resume_from = None
 workflow = [("train", 1)]
 fp16 = dict(loss_scale=32.0)
@@ -116,12 +116,12 @@ plan_anchor_types = [("temp", "2hz")]
 
 # ================== distillation config ========================
 teacher_cache_path = "data/cache/det/bevfusion_teacher_train.pkl"
-distill_alpha_cls = 0.2
-distill_alpha_reg = 0.4
+distill_alpha_cls = 0.05   # KD classification loss weight (cls scale ~ det_loss_cls ~3.3)
+distill_alpha_reg = 1.0    # KD regression loss weight (10x base 0.1; aim KD reg ~5.3, matches det_loss_box ~5.6)
 distill_temperature = 4.0  # softening temperature for cls KD
-distill_score_thr = 0.1    # only use teacher proposals with score > this
+distill_score_thr = 0.3    # only use teacher proposals with score > this
 distill_last_layer_only = True  # apply KD to last decoder layer only
-distill_mode = "pseudo_gt"     # "teacher_tp" or "pseudo_gt"
+distill_mode = "teacher_tp"     # "teacher_tp" or "pseudo_gt"
 det_gt_loss_weight = 0.0        # 0.0 = distill-only (no GT det supervision)
 
 
@@ -726,7 +726,7 @@ runner = dict(
 # ================== eval ========================
 eval_mode = dict(
     with_det=True,
-    with_tracking=False,
+    with_tracking=True,
     with_map=True,
     with_motion=True,
     with_planning=True,
@@ -734,7 +734,7 @@ eval_mode = dict(
     motion_threshhold=0.2,
 )
 evaluation = dict(
-    interval=num_iters_per_epoch * 3,
+    interval=num_iters_per_epoch * checkpoint_epoch_interval,
     jsonfile_prefix="val/",
     eval_mode=eval_mode,
     out_dir="val_vis",
@@ -750,4 +750,4 @@ custom_hooks = [
     )
 ]
 
-load_from = "./work_dirs/exp/E5_stage1_12ep_distill_wo_det/latest.pth"
+load_from = "./work_dirs/hipad_nusc_stage1/latest.pth"
