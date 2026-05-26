@@ -663,13 +663,29 @@ class InteractiveAttention(nn.Module):
         points_list = list(set(sep_query_list + sep_key_list))
         for points_type in points_list:
             if points_type == 'ego':
-                ego_vels = sep_query.new_zeros((bs, 1, 1))
+                # ego speed comes from metas['ego_status'][:, 0] (m/s), plumbed
+                # via inter_gnn call site. Fallback to 0 if not provided.
+                ego_speed = kwargs.get('ego_speed', None)
+                if ego_speed is not None:
+                    ego_vels = ego_speed.reshape(bs, 1, 1)
+                else:
+                    ego_vels = sep_query.new_zeros((bs, 1, 1))
             if points_type == 'det':
                 det_vels = torch.norm(kwargs['det_anchor'][..., 8:10], dim=-1, keepdim=True)
             if points_type == 'map':
+                # static infrastructure: physically zero velocity
                 map_vels = sep_query.new_zeros((bs, kwargs['map_anchor'].size(1), 1))
             if points_type == 'plan':
-                plan_vels = sep_query.new_zeros((bs, kwargs['plan_anchor'].size(1), 1))
+                # Plan anchor: future waypoints. Reshape to [B, Np, T, 2]
+                # (mirrors get_distance_attn_mask), derive speed from first
+                # inter-waypoint displacement. τ absorbs unit scale.
+                plan_raw = kwargs['plan_anchor']
+                plan_wp = plan_raw.reshape(bs, plan_raw.size(1), -1, 2)
+                if plan_wp.size(-2) >= 2:
+                    disp = plan_wp[:, :, 1, :] - plan_wp[:, :, 0, :]
+                    plan_vels = torch.norm(disp, dim=-1, keepdim=True)
+                else:
+                    plan_vels = sep_query.new_zeros((bs, plan_wp.size(1), 1))
 
         def get_vel(query_type, key_type):
             if query_type == 'ego':
@@ -694,11 +710,15 @@ class InteractiveAttention(nn.Module):
             else:
                 raise NotImplementedError
 
-            vels = (query_vels[:, :, None] - key_vels[:, None]).squeeze(-1)
+            # |Δspeed| — "similar speed → stronger attend" semantics. Signed
+            # diff with -max normalize (old code) gave asymmetric, hard-to-
+            # interpret gating.
+            vels = (query_vels[:, :, None] - key_vels[:, None]).abs().squeeze(-1)
 
             return vels
 
         all_query2key_vel_list = []
+        q_lens = []
         for query_type in sep_query_list:
             query2key_vel_list = []
             for key_type in sep_key_list:
@@ -706,15 +726,23 @@ class InteractiveAttention(nn.Module):
                 query2key_vel_list.append(query_key_vel)
             all_query2key_vel = torch.cat(query2key_vel_list, dim=-1)
             all_query2key_vel_list.append(all_query2key_vel)
+            q_lens.append(all_query2key_vel.shape[-2])
         velocity = torch.cat(all_query2key_vel_list, dim=-2)
-        velocity = velocity - velocity.max()
 
-        tau = velocity_tau(sep_query)
-        tau = tau.permute(0, 2, 1)
+        tau = velocity_tau(sep_query)  # [B, Nq_total, H]
 
-        attn_mask = velocity[:, None, :, :] * tau[..., None]
-        attn_mask = attn_mask.flatten(0, 1)
+        # Mirror distance-mask plan/ego exemption (paper §3.2: plan accesses all).
+        q_offset = 0
+        for q_type, q_len in zip(sep_query_list, q_lens):
+            if q_type in ("plan", "ego"):
+                tau = tau.clone()
+                tau[:, q_offset:q_offset + q_len, :] = 0.0
+            q_offset += q_len
 
+        tau = tau.permute(0, 2, 1)  # [B, H, Nq_total]
+
+        # -τ·|ΔV|: additive suppression in softmax, mirrors -τ·D shape & sign.
+        attn_mask = -velocity[:, None, :, :] * tau[..., None]  # [B, H, Nq, Nk]
         return attn_mask
 
 
