@@ -1,4 +1,5 @@
 import os
+import site
 
 import torch
 from setuptools import setup
@@ -20,6 +21,27 @@ def make_cuda_ext(
 
     define_macros = []
     extra_compile_args = {"cxx": [] + extra_args}
+    include_dirs = list(extra_include_path)
+
+    cuda_home = os.getenv("CUDA_HOME")
+    if cuda_home:
+        include_dirs.extend(
+            [
+                os.path.join(cuda_home, "include"),
+                os.path.join(cuda_home, "targets", "x86_64-linux", "include"),
+            ]
+        )
+
+    for site_dir in site.getsitepackages():
+        include_dirs.extend(
+            [
+                os.path.join(site_dir, "nvidia", "cuda_runtime", "include"),
+                os.path.join(site_dir, "nvidia", "cublas", "include"),
+                os.path.join(site_dir, "nvidia", "cusparse", "include"),
+                os.path.join(site_dir, "nvidia", "cusolver", "include"),
+                os.path.join(site_dir, "nvidia", "curand", "include"),
+            ]
+        )
 
     if torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1":
         define_macros += [("WITH_CUDA", None)]
@@ -37,7 +59,7 @@ def make_cuda_ext(
     return extension(
         name="{}.{}".format(module, name),
         sources=[os.path.join(*module.split("."), p) for p in sources],
-        include_dirs=extra_include_path,
+        include_dirs=[p for p in include_dirs if os.path.isdir(p)],
         define_macros=define_macros,
         extra_compile_args=extra_compile_args,
     )

@@ -4,8 +4,8 @@ dist_params = dict(backend="nccl")
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 
-num_gpus = 8
-batch_size = 6
+num_gpus = 2
+batch_size = 24
 num_iters_per_epoch = int(234769 // (num_gpus * batch_size))
 num_epochs = 18
 checkpoint_epoch_interval = 20
@@ -20,7 +20,7 @@ log_config = dict(
 load_from = None
 resume_from = None
 workflow = [("train", 1)]
-fp16 = dict(loss_scale=32.0)
+fp16 = dict(loss_scale='dynamic')
 input_shape = (640, 352)
 num_cams = 6
 
@@ -74,7 +74,7 @@ operation_order = single_frame_layer * num_single_frame_decoder + \
                   temporal_frame_layer * (num_decoder - num_single_frame_decoder)
 
 # anchors
-project_dir = "/opt/data/private/project/HiP-AD"
+project_dir = "/home/hanyan_arch/yongjae/HiP-AD"
 
 anchor_paths = {
     "det" : f"{project_dir}/data/kmeans/b2d_det_900.npy",
@@ -225,7 +225,7 @@ model = dict(
             ),
             # operation
             custom_op=dict(type="CustomOperation"),
-            temp_graph_model=dict(
+                =dict(
                 type="TemporalSeparateAttention",
                 query_select=query_select,
                 query_list=[["det"], ["map"], ["plan", "ego"], ["plan", "ego"]],

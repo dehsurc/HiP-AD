@@ -842,6 +842,10 @@ class SparseOneDecoder(BaseModule):
                 )
 
             elif op == "inter_gnn":
+                # ego_status[:, 0] is ego speed in m/s (see bench2drive_dataset.py:891)
+                ego_speed = None
+                if self.with_velocity_attn_mask and metas.get('ego_status', None) is not None:
+                    ego_speed = metas['ego_status'][:, 0:1]
                 instance_feature = self.graph_model(
                     i,
                     instance_feature,
@@ -857,6 +861,7 @@ class SparseOneDecoder(BaseModule):
                     plan_anchor=plan_anchor,
                     distance_tau=self.distance_tau if self.with_distance_attn_mask else None,
                     velocity_tau=self.velocity_tau if self.with_velocity_attn_mask else None,
+                    ego_speed=ego_speed,
                     fc_before=self.fc_before,
                     fc_after=self.fc_after,
                 )

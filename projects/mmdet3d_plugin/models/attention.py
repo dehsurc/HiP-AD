@@ -18,11 +18,19 @@ import torch.utils.checkpoint as cp
 from einops import rearrange
 try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+    from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+    HAS_FLASH_ATTN = True
     print('Use flash_attn_unpadded_kvpacked_func')
-except:
-    from flash_attn.flash_attn_interface import  flash_attn_varlen_kvpacked_func as flash_attn_unpadded_kvpacked_func
-    print('Use flash_attn_varlen_kvpacked_func')
-from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+except ImportError:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func as flash_attn_unpadded_kvpacked_func
+        from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+        HAS_FLASH_ATTN = True
+        print('Use flash_attn_varlen_kvpacked_func')
+    except ImportError:
+        flash_attn_unpadded_kvpacked_func = None
+        HAS_FLASH_ATTN = False
+        print('flash-attn not found; use torch scaled_dot_product_attention fallback')
 
 
 def _in_projection_packed(q, k, v, w, b = None):
@@ -67,6 +75,24 @@ class FlashAttention(nn.Module):
 
         batch_size = q.shape[0]
         seqlen_q, seqlen_k = q.shape[1], kv.shape[1]
+        if not HAS_FLASH_ATTN:
+            query = q.transpose(1, 2)
+            key = kv[:, :, 0].transpose(1, 2)
+            value = kv[:, :, 1].transpose(1, 2)
+            attn_mask = None
+            if key_padding_mask is not None:
+                attn_mask = key_padding_mask[:, None, None, :].to(torch.bool)
+            output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=causal,
+                scale=self.softmax_scale,
+            )
+            return output.transpose(1, 2), None
+
         if key_padding_mask is None:
             q, kv = rearrange(q, 'b s ... -> (b s) ...'), rearrange(kv, 'b s ... -> (b s) ...')
             max_sq, max_sk = seqlen_q, seqlen_k 
@@ -268,35 +294,34 @@ class MultiheadFlashAttention(BaseModule):
         if key_pos is not None:
             key = key + key_pos
 
+        # The dataflow('key', 'query', 'value') of ``FlashAttention`` is (batch, num_query, embed_dims).
         if not self.batch_first:
             query = query.transpose(0, 1)
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
 
-        fmha = self.attn
-        q, k, v = _in_projection_packed(query, key, value, fmha.in_proj_weight, fmha.in_proj_bias)
-        q = rearrange(q, 'b s (h d) -> b h s d', h=fmha.num_heads)
-        k = rearrange(k, 'b s (h d) -> b h s d', h=fmha.num_heads)
-        v = rearrange(v, 'b s (h d) -> b h s d', h=fmha.num_heads)
-
-        final_mask = attn_mask
-        if key_padding_mask is not None:
-            kpm = torch.zeros_like(key_padding_mask, dtype=q.dtype)
-            kpm = kpm.masked_fill(key_padding_mask, float('-inf'))
-            kpm = kpm[:, None, None, :]
-            final_mask = kpm if final_mask is None else (final_mask + kpm)
-
-        dropout_p = fmha.inner_attn.dropout_p if self.training else 0.0
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if final_mask is not None:
-            attn = attn + final_mask
-        attn = attn.softmax(dim=-1)
-        if dropout_p > 0:
-            attn = F.dropout(attn, p=dropout_p, training=self.training)
-        context = torch.matmul(attn, v)
-        out = rearrange(context, 'b h s d -> b s (h d)')
-        out = fmha.out_proj(out)
+        if attn_mask is None:
+            out = self.attn(
+                q=query,
+                k=key,
+                v=value,
+                key_padding_mask=key_padding_mask)[0]
+        else:
+            fmha = self.attn
+            q, k, v = _in_projection_packed(query, key, value, fmha.in_proj_weight, fmha.in_proj_bias)
+            q = rearrange(q, 'b s (h d) -> b h s d', h=fmha.num_heads)
+            k = rearrange(k, 'b s (h d) -> b h s d', h=fmha.num_heads)
+            v = rearrange(v, 'b s (h d) -> b h s d', h=fmha.num_heads)
+            final_mask = attn_mask
+            if key_padding_mask is not None:
+                kpm = torch.zeros_like(key_padding_mask, dtype=q.dtype)
+                kpm = kpm.masked_fill(key_padding_mask, float('-inf'))
+                kpm = kpm[:, None, None, :]
+                final_mask = kpm if final_mask is None else (final_mask + kpm)
+            dropout_p = fmha.inner_attn.dropout_p if self.training else 0.0
+            context = F.scaled_dot_product_attention(q, k, v, attn_mask=final_mask, dropout_p=dropout_p)
+            out = rearrange(context, 'b h s d -> b s (h d)')
+            out = fmha.out_proj(out)
 
         if not self.batch_first:
             out = out.transpose(0, 1)
