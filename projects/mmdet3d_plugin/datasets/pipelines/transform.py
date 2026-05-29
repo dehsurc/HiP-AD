@@ -164,6 +164,7 @@ class NuScenesSparse4DAdaptor(object):
         for key in [
             'teacher_logits', 'teacher_boxes', 'teacher_scores',
             'teacher_map_logits', 'teacher_map_pts', 'teacher_map_scores',
+            'teacher_map_features',
         ]:
             if key in input_dict:
                 input_dict[key] = DC(to_tensor(input_dict[key]), stack=True, cpu_only=False, pad_dims=None)

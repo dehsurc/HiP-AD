@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 from mmcv.cnn import Linear
 from mmcv.cnn.bricks.registry import (
     ATTENTION,
@@ -171,6 +172,15 @@ class SparseOneDecoder(BaseModule):
             map_distill_mode="teacher_tp",  # "teacher_tp" or "pseudo_gt"
             map_gt_loss_weight=1.0,     # weight for GT map losses (0.0 = distill-only)
             map_distill_dist_thr=5.0,   # distance cutoff for teacher_tp matching (m)
+            map_feature_distill_alpha=0.0,
+            map_feature_distill_layers=(3, 4, 5),
+            map_feature_distill_weights=(0.5, 0.75, 1.0),
+            map_feature_distill_teacher_dim=256,
+            map_feature_distill_kd_dim=256,
+            map_feature_distill_num_classes=3,
+            map_feature_distill_cls_cost_weight=1.0,
+            map_feature_distill_line_cost_weight=1.0,
+            map_feature_distill_beta=1.0,
 
             **kwargs,
     ):
@@ -223,6 +233,21 @@ class SparseOneDecoder(BaseModule):
         self.map_distill_mode = map_distill_mode
         self.map_gt_loss_weight = map_gt_loss_weight
         self.map_distill_dist_thr = map_distill_dist_thr
+        self.map_feature_distill_alpha = map_feature_distill_alpha
+        self.map_feature_distill_layers = list(map_feature_distill_layers)
+        self.map_feature_distill_weights = list(map_feature_distill_weights)
+        self.map_feature_distill_teacher_dim = map_feature_distill_teacher_dim
+        self.map_feature_distill_kd_dim = map_feature_distill_kd_dim
+        self.map_feature_distill_num_classes = map_feature_distill_num_classes
+        self.map_feature_distill_cls_cost_weight = map_feature_distill_cls_cost_weight
+        self.map_feature_distill_line_cost_weight = map_feature_distill_line_cost_weight
+        self.map_feature_distill_beta = map_feature_distill_beta
+        self.map_use_feature_distill = map_feature_distill_alpha > 0
+        if len(self.map_feature_distill_layers) != len(self.map_feature_distill_weights):
+            raise ValueError(
+                "map_feature_distill_layers and map_feature_distill_weights "
+                "must have the same length"
+            )
 
         self.independent_gnn = independent_gnn
         self.independent_temp_gnn = independent_temp_gnn
@@ -287,6 +312,20 @@ class SparseOneDecoder(BaseModule):
                     nn.Linear(embed_dims * 20 // 4, embed_dims),
                     nn.ReLU(),
                     nn.Linear(embed_dims, embed_dims),
+                )
+
+            if self.map_use_feature_distill:
+                student_in_dim = embed_dims + self.map_feature_distill_num_classes + 2
+                teacher_in_dim = self.map_feature_distill_teacher_dim + self.map_feature_distill_num_classes + 2
+                self.map_feature_student_proj = nn.Sequential(
+                    nn.Linear(student_in_dim, self.map_feature_distill_kd_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(self.map_feature_distill_kd_dim, self.map_feature_distill_kd_dim),
+                )
+                self.map_feature_teacher_proj = nn.Sequential(
+                    nn.Linear(teacher_in_dim, self.map_feature_distill_kd_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(self.map_feature_distill_kd_dim, self.map_feature_distill_kd_dim),
                 )
 
         if 'ego' in self.query_select:
@@ -668,6 +707,7 @@ class SparseOneDecoder(BaseModule):
         map_prediction = []
         map_classification = []
         map_quality = []
+        map_instance_features = []
 
         ego_prediction = []
         ego_classification = []
@@ -953,6 +993,7 @@ class SparseOneDecoder(BaseModule):
                                                 : self.det_instance_bank_list[bank_idx].num_temp_instances]
 
                 if "map" in self.task_select:
+                    map_instance_features.append(map_instance_feature)
                     map_anchor, map_cls, map_qt = self.map_refine[refine_i](
                         map_instance_feature, map_anchor, map_anchor_embed, time_interval=time_interval,
                         return_cls=True)
@@ -1090,6 +1131,7 @@ class SparseOneDecoder(BaseModule):
             "prediction": map_prediction,
             "quality": map_quality,
             "instance_feature": map_instance_feature,
+            "instance_features": map_instance_features,
             "anchor_embed": map_anchor_embed,
         }
         ego_output = {
@@ -1650,6 +1692,199 @@ class SparseOneDecoder(BaseModule):
         kd_reg_loss = self.map_distill_alpha_reg * total_kd_reg / num_matched
         return kd_cls_loss, kd_reg_loss
 
+    def _map_feature_dummy_zero(self, ref):
+        zero = ref.sum() * 0.0
+        if self.map_use_feature_distill:
+            zero = zero + sum(p.sum() * 0.0 for p in self.map_feature_student_proj.parameters())
+            zero = zero + sum(p.sum() * 0.0 for p in self.map_feature_teacher_proj.parameters())
+        return zero
+
+    def _select_teacher_map_feature_layer(self, teacher_features, layer_pos, layer_idx):
+        if teacher_features.dim() != 5:
+            raise ValueError(
+                "teacher_map_features must have shape [B, L, N, P, C], "
+                f"got {tuple(teacher_features.shape)}"
+            )
+        num_cached_layers = teacher_features.size(1)
+        if num_cached_layers > layer_idx:
+            return teacher_features[:, layer_idx]
+        if num_cached_layers == len(self.map_feature_distill_layers):
+            return teacher_features[:, layer_pos]
+        raise ValueError(
+            "teacher_map_features must cache all decoder layers or exactly "
+            "the configured feature distill layers; got "
+            f"{num_cached_layers} layers for {self.map_feature_distill_layers}"
+        )
+
+    def _match_map_teacher_student(self, student_cls, student_reg, data):
+        """Hungarian match final-layer student map queries to teacher polylines."""
+        teacher_logits = data["teacher_map_logits"]
+        teacher_pts = data["teacher_map_pts"]
+        teacher_scores = data["teacher_map_scores"]
+
+        bs = student_cls.shape[0]
+        device = student_cls.device
+        num_cls = min(
+            student_cls.shape[-1],
+            teacher_logits.shape[-1],
+            self.map_feature_distill_num_classes,
+        )
+        student_pts = student_reg[..., : len(self.map_reg_weights)].reshape(
+            bs, student_reg.shape[1], -1, 2)
+
+        matches = []
+        with torch.no_grad():
+            for b in range(bs):
+                score_mask = teacher_scores[b] > self.map_distill_score_thr
+                teacher_valid = torch.nonzero(score_mask, as_tuple=False).squeeze(-1)
+                if teacher_valid.numel() == 0 or student_pts.shape[1] == 0:
+                    matches.append(None)
+                    continue
+
+                s_pts = student_pts[b]
+                t_pts = teacher_pts[b, teacher_valid]
+                num_pts = min(s_pts.shape[-2], t_pts.shape[-2])
+                s_pts = s_pts[:, :num_pts]
+                t_pts = t_pts[:, :num_pts]
+
+                dist_fwd = (s_pts[:, None] - t_pts[None]).abs().sum(-1).mean(-1)
+                dist_rev = (s_pts[:, None] - t_pts.flip(dims=[1])[None]).abs().sum(-1).mean(-1)
+                line_cost = torch.minimum(dist_fwd, dist_rev)
+                reverse = dist_rev < dist_fwd
+
+                s_prob = student_cls[b, :, :num_cls].sigmoid()
+                t_prob = teacher_logits[b, teacher_valid, :num_cls].sigmoid()
+                cls_cost = F.binary_cross_entropy(
+                    s_prob[:, None].expand(-1, t_prob.shape[0], -1),
+                    t_prob[None].expand(s_prob.shape[0], -1, -1),
+                    reduction="none",
+                ).sum(-1)
+
+                cost = (self.map_feature_distill_line_cost_weight * line_cost +
+                        self.map_feature_distill_cls_cost_weight * cls_cost)
+                row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
+                if len(row_ind) == 0:
+                    matches.append(None)
+                    continue
+
+                student_idx = torch.as_tensor(row_ind, dtype=torch.long, device=device)
+                valid_col_idx = torch.as_tensor(col_ind, dtype=torch.long, device=device)
+                keep = line_cost[student_idx, valid_col_idx] <= self.map_distill_dist_thr
+                if not keep.any():
+                    matches.append(None)
+                    continue
+                student_idx = student_idx[keep]
+                valid_col_idx = valid_col_idx[keep]
+                teacher_idx = teacher_valid[valid_col_idx]
+                reverse_flag = reverse[student_idx, valid_col_idx]
+                matches.append((student_idx, teacher_idx, reverse_flag))
+
+        return matches
+
+    def _compute_map_feature_distill_loss(self, model_outs, data):
+        """Point-query feature KD for MapTRv2 teacher and HiP-AD map queries.
+
+        Matching is computed once from the final-layer geometry/class cost and
+        then reused for every configured feature KD layer.
+        """
+        ref = model_outs["prediction"][-1]
+        output = {}
+        if not self.map_use_feature_distill:
+            return output
+
+        zero = self._map_feature_dummy_zero(ref)
+        if "teacher_map_features" not in data:
+            output["map_loss_kd_feat"] = zero
+            return output
+
+        student_features = model_outs.get("instance_features", [])
+        cls_scores = model_outs["classification"]
+        reg_preds = model_outs["prediction"]
+        teacher_features = data["teacher_map_features"]
+        teacher_logits = data["teacher_map_logits"]
+        teacher_pts = data["teacher_map_pts"]
+
+        matches = self._match_map_teacher_student(cls_scores[-1], reg_preds[-1], data)
+        kd_losses = []
+
+        for layer_pos, (layer_idx, layer_weight) in enumerate(
+                zip(self.map_feature_distill_layers, self.map_feature_distill_weights)):
+            if layer_idx >= len(student_features) or layer_idx >= len(cls_scores) or layer_idx >= len(reg_preds):
+                kd_losses.append(zero)
+                continue
+
+            t_feature_layer = self._select_teacher_map_feature_layer(
+                teacher_features, layer_pos, layer_idx)
+
+            s_feature_layer = student_features[layer_idx]
+            s_cls_layer = cls_scores[layer_idx]
+            s_pts_layer = reg_preds[layer_idx][..., : len(self.map_reg_weights)].reshape(
+                reg_preds[layer_idx].shape[0], reg_preds[layer_idx].shape[1], -1, 2)
+            num_cls = min(
+                s_cls_layer.shape[-1],
+                teacher_logits.shape[-1],
+                self.map_feature_distill_num_classes,
+            )
+
+            layer_loss = zero
+            num_terms = 0
+            for b, match in enumerate(matches):
+                if match is None:
+                    continue
+                student_idx, teacher_idx, reverse_flag = match
+                if student_idx.numel() == 0:
+                    continue
+
+                s_feat = s_feature_layer[b, student_idx]
+                s_pts = s_pts_layer[b, student_idx].detach()
+                s_cls = s_cls_layer[b, student_idx, :num_cls].detach().sigmoid()
+                t_feat = t_feature_layer[b, teacher_idx]
+                t_pts = teacher_pts[b, teacher_idx].detach()
+                t_cls = teacher_logits[b, teacher_idx, :num_cls].detach().sigmoid()
+
+                if reverse_flag.any():
+                    t_feat = t_feat.clone()
+                    t_pts = t_pts.clone()
+                    t_feat[reverse_flag] = t_feat[reverse_flag].flip(dims=[1])
+                    t_pts[reverse_flag] = t_pts[reverse_flag].flip(dims=[1])
+
+                num_pts = min(s_pts.shape[-2], t_feat.shape[-2], t_pts.shape[-2])
+                s_pts = s_pts[:, :num_pts]
+                t_pts = t_pts[:, :num_pts]
+                t_feat = t_feat[:, :num_pts]
+
+                s_feat = s_feat[:, None].expand(-1, num_pts, -1)
+                s_cls = s_cls[:, None].expand(-1, num_pts, -1)
+                t_cls = t_cls[:, None].expand(-1, num_pts, -1)
+
+                s_input = torch.cat([s_feat, s_cls, s_pts], dim=-1)
+                t_input = torch.cat([t_feat, t_cls, t_pts], dim=-1)
+                s_proj = self.map_feature_student_proj(s_input)
+                t_proj = self.map_feature_teacher_proj(t_input)
+
+                layer_loss = layer_loss + F.smooth_l1_loss(
+                    s_proj, t_proj, reduction="sum",
+                    beta=self.map_feature_distill_beta)
+                num_terms += int(student_idx.numel()) * num_pts
+
+            if num_terms > 0:
+                layer_loss = (
+                    self.map_feature_distill_alpha *
+                    float(layer_weight) *
+                    layer_loss / num_terms
+                )
+            kd_losses.append(layer_loss)
+
+        if self.combine_layer_loss:
+            total_loss = zero
+            for loss in kd_losses:
+                total_loss = total_loss + loss
+            output["map_loss_kd_feat"] = total_loss
+        else:
+            for layer_idx, loss in zip(self.map_feature_distill_layers, kd_losses):
+                output[f"map_loss_kd_feat_{layer_idx}"] = loss
+        return output
+
     @force_fp32(apply_to=("model_outs"))
     def loss_map(self, model_outs, data):
         quality = model_outs["quality"]
@@ -1778,6 +2013,9 @@ class SparseOneDecoder(BaseModule):
             last_reg = reg_preds[-1][..., : len(self.map_reg_weights)]
             self.map_sampler.sample(
                 last_cls, last_reg, data["gt_map_labels"], data["gt_map_pts"])
+
+        if self.map_use_feature_distill:
+            output.update(self._compute_map_feature_distill_loss(model_outs, data))
 
         return output
 

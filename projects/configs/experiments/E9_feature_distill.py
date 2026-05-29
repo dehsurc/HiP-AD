@@ -2,7 +2,7 @@ log_level = 'INFO'
 dist_params = dict(backend='nccl')
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
-work_dir = 'work_dirs/exp/Mask2map_110ep_map_distill_stage1'
+work_dir = 'work_dirs/exp/E9_feature_distill'
 version = 'trainval'
 length = dict(trainval=28130, mini=323)
 num_gpus = 2
@@ -12,7 +12,7 @@ num_epochs = 12
 checkpoint_epoch_interval = 3
 checkpoint_config = dict(interval=1758, max_keep_ckpts=-1)
 wandb_project = 'hipad'
-wandb_name = 'E9_stage1_12ep_distill_mask2map'
+wandb_name = 'E9_feature_distill'
 log_config = dict(
     interval=50,
     hooks=[
@@ -22,7 +22,7 @@ log_config = dict(
             init_kwargs=dict(
                 entity='e2ekd',
                 project='hipad',
-                name='E9_stage1_12ep_distill_mask2map'),
+                name='E9_feature_distill'),
             by_epoch=False)
     ])
 load_from = None
@@ -93,12 +93,22 @@ plan_anchor_paths = 'data/kmeans/kmeans_plan_6.npy'
 plan_speed_refer = None
 plan_anchor_refer = ('temp', '2hz')
 plan_anchor_types = [('temp', '2hz')]
-map_teacher_cache_path = 'data/cache/map/mask2map_110ep_phase2_train.pkl'
-map_distill_alpha_cls = 0.4
-map_distill_alpha_reg = 0.2
+map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l345.pkl'
+map_distill_alpha_cls = 0.1
+map_distill_alpha_reg = 1.0
 map_distill_temperature = 4.0
 map_distill_score_thr = 0.3
+map_distill_dist_thr = 4.0
 map_distill_last_layer_only = True
+map_feature_distill_alpha = 1.0
+map_feature_distill_layers = (3, 4, 5)
+map_feature_distill_weights = (0.5, 0.75, 1.0)
+map_feature_distill_teacher_dim = 256
+map_feature_distill_kd_dim = 256
+map_feature_distill_num_classes = 3
+map_feature_distill_cls_cost_weight = 1.0
+map_feature_distill_line_cost_weight = 1.0
+map_feature_distill_beta = 1.0
 # Real-GT + teacher pseudo-GT map distillation. The pseudo-GT map path
 # converts teacher logits to hard labels and provides both original/reversed
 # polyline directions before Hungarian assignment.
@@ -115,7 +125,7 @@ model = dict(
         frozen_stages=-1,
         norm_eval=False,
         style='pytorch',
-        with_cp=False,
+        with_cp=True,
         out_indices=(0, 1, 2, 3),
         norm_cfg=dict(type='BN', requires_grad=True),
         pretrained='ckpts/resnet50-19c8e357.pth'),
@@ -167,13 +177,23 @@ model = dict(
             with_incremental_plan_refine=True,
             motion_anchor='data/kmeans/kmeans_motion_6.npy',
             cls_threshold_to_reg=0.05,
-            map_distill_alpha_cls=0.4,
-            map_distill_alpha_reg=0.2,
+            map_distill_alpha_cls=map_distill_alpha_cls,
+            map_distill_alpha_reg=map_distill_alpha_reg,
             map_distill_temperature=4.0,
             map_distill_score_thr=0.3,
+            map_distill_dist_thr=map_distill_dist_thr,
             map_distill_last_layer_only=True,
             map_gt_loss_weight=map_gt_loss_weight,
             map_distill_mode=map_distill_mode,
+            map_feature_distill_alpha=map_feature_distill_alpha,
+            map_feature_distill_layers=map_feature_distill_layers,
+            map_feature_distill_weights=map_feature_distill_weights,
+            map_feature_distill_teacher_dim=map_feature_distill_teacher_dim,
+            map_feature_distill_kd_dim=map_feature_distill_kd_dim,
+            map_feature_distill_num_classes=map_feature_distill_num_classes,
+            map_feature_distill_cls_cost_weight=map_feature_distill_cls_cost_weight,
+            map_feature_distill_line_cost_weight=map_feature_distill_line_cost_weight,
+            map_feature_distill_beta=map_feature_distill_beta,
             det_instance_bank=dict(
                 type='InstanceBank',
                 num_anchor=900,
@@ -543,10 +563,10 @@ train_pipeline = [
             'gt_ego_fut_trajs', 'gt_ego_fut_masks', 'gt_ego_fut_cmd',
             'gt_ego_fut_trajs_2hz', 'gt_ego_fut_masks_2hz', 'ego_status',
             'ego_status_mask', 'teacher_map_logits', 'teacher_map_pts',
-            'teacher_map_scores'
+            'teacher_map_scores', 'teacher_map_features'
         ],
         meta_keys=[
-            'T_global', 'T_global_inv', 'timestamp', 'instance_id', 'token'
+            'T_global', 'T_global_inv', 'timestamp', 'instance_id'
         ])
 ]
 test_pipeline = [
@@ -611,7 +631,7 @@ data_basic_config = dict(
         use_map=False,
         use_external=False),
     version='v1.0-trainval',
-    work_dir='work_dirs/exp/Mask2map_110ep_map_distill_stage1')
+    work_dir='work_dirs/exp/E9_feature_distill')
 eval_config = dict(
     type='NuScenes3DDataset',
     data_root='data/nuscenes/',
@@ -628,7 +648,7 @@ eval_config = dict(
         use_map=False,
         use_external=False),
     version='v1.0-trainval',
-    work_dir='work_dirs/exp/Mask2map_110ep_map_distill_stage1',
+    work_dir='work_dirs/exp/E9_feature_distill',
     eval_data_root='data/infos/nuscenes/',
     ann_file='data/infos/nuscenes_infos_val.pkl',
     pipeline=[
@@ -685,7 +705,7 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir='work_dirs/exp/Mask2map_110ep_map_distill_stage1',
+        work_dir='work_dirs/exp/E9_feature_distill',
         ann_file='data/infos/nuscenes_infos_train.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -732,11 +752,11 @@ data = dict(
                     'gt_ego_fut_masks', 'gt_ego_fut_cmd',
                     'gt_ego_fut_trajs_2hz', 'gt_ego_fut_masks_2hz',
                     'ego_status', 'ego_status_mask', 'teacher_map_logits',
-                    'teacher_map_pts', 'teacher_map_scores'
+                    'teacher_map_pts', 'teacher_map_scores',
+                    'teacher_map_features'
                 ],
                 meta_keys=[
-                    'T_global', 'T_global_inv', 'timestamp', 'instance_id',
-                    'token'
+                    'T_global', 'T_global_inv', 'timestamp', 'instance_id'
                 ])
         ],
         test_mode=False,
@@ -752,8 +772,12 @@ data = dict(
         with_seq_flag=True,
         sequences_split_num=2,
         keep_consistent_seq_aug=True,
-        map_teacher_cache_path='data/cache/map/mask2map_110ep_phase2_train.pkl'
-    ),
+        map_teacher_cache_path=map_teacher_cache_path,
+        map_teacher_num_layers=3,
+        map_teacher_num_queries=20,
+        map_teacher_num_pts=20,
+        map_teacher_feature_dim=256,
+        map_teacher_require_features=True),
     val=dict(
         type='NuScenes3DDataset',
         data_root='data/nuscenes/',
@@ -770,7 +794,7 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir='work_dirs/exp/Mask2map_110ep_map_distill_stage1',
+        work_dir='work_dirs/exp/E9_feature_distill',
         ann_file='data/infos/nuscenes_infos_val.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -816,7 +840,7 @@ data = dict(
                 use_map=False,
                 use_external=False),
             version='v1.0-trainval',
-            work_dir='work_dirs/exp/Mask2map_110ep_map_distill_stage1',
+            work_dir='work_dirs/exp/E9_feature_distill',
             eval_data_root='data/infos/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
@@ -862,7 +886,7 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir='work_dirs/exp/Mask2map_110ep_map_distill_stage1',
+        work_dir='work_dirs/exp/E9_feature_distill',
         ann_file='data/infos/nuscenes_infos_val.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -908,7 +932,7 @@ data = dict(
                 use_map=False,
                 use_external=False),
             version='v1.0-trainval',
-            work_dir='work_dirs/exp/Mask2map_110ep_map_distill_stage1',
+            work_dir='work_dirs/exp/E9_feature_distill',
             eval_data_root='data/infos/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[

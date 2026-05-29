@@ -105,6 +105,11 @@ class NuScenes3DDataset(Dataset):
         ego_status_mask_limit_accel=40.0,
         teacher_cache_path=None,
         map_teacher_cache_path=None,
+        map_teacher_num_layers=6,
+        map_teacher_num_queries=100,
+        map_teacher_num_pts=20,
+        map_teacher_feature_dim=256,
+        map_teacher_require_features=False,
     ):
         self.version = version
         self.load_interval = load_interval
@@ -157,6 +162,11 @@ class NuScenes3DDataset(Dataset):
         self.ego_status_dims = ego_status_dims
         self.ego_status_mask_limit_vel = ego_status_mask_limit_vel
         self.ego_status_mask_limit_accel = ego_status_mask_limit_accel
+        self.map_teacher_num_layers = map_teacher_num_layers
+        self.map_teacher_num_queries = map_teacher_num_queries
+        self.map_teacher_num_pts = map_teacher_num_pts
+        self.map_teacher_feature_dim = map_teacher_feature_dim
+        self.map_teacher_require_features = map_teacher_require_features
 
         # Teacher cache for distillation
         self.teacher_cache = None
@@ -472,12 +482,61 @@ class NuScenes3DDataset(Dataset):
                 input_dict["teacher_map_logits"] = map_teacher["logits"].astype(np.float32)  # [100, 3]
                 input_dict["teacher_map_pts"]    = map_teacher["pts"].copy().astype(np.float32)  # [100, 20, 2]
                 input_dict["teacher_map_scores"] = map_teacher["scores"].astype(np.float32)  # [100]
+                teacher_map_features = self._get_map_teacher_features(map_teacher)
+                if teacher_map_features is not None:
+                    input_dict["teacher_map_features"] = teacher_map_features
             else:
                 input_dict["teacher_map_logits"] = np.full((100, 3), -1e4, dtype=np.float32)
                 input_dict["teacher_map_pts"]    = np.zeros((100, 20, 2), dtype=np.float32)
                 input_dict["teacher_map_scores"] = np.zeros((100,), dtype=np.float32)
+                input_dict["teacher_map_features"] = self._empty_map_teacher_features()
 
         return input_dict
+
+    def _empty_map_teacher_features(self):
+        return np.zeros(
+            (
+                self.map_teacher_num_layers,
+                self.map_teacher_num_queries,
+                self.map_teacher_num_pts,
+                self.map_teacher_feature_dim,
+            ),
+            dtype=np.float32,
+        )
+
+    def _get_map_teacher_features(self, map_teacher):
+        """Read optional MapTRv2 decoder point-query features from a cache item."""
+        feature_keys = (
+            "features",
+            "decoder_features",
+            "hidden_states",
+            "decoder_hidden_states",
+        )
+        features = None
+        for key in feature_keys:
+            if key in map_teacher:
+                features = map_teacher[key]
+                break
+        if features is None:
+            if self.map_teacher_require_features:
+                raise KeyError(
+                    "Map teacher cache item does not contain decoder features. "
+                    "Expected one of: " + ", ".join(feature_keys)
+                )
+            return self._empty_map_teacher_features()
+
+        if isinstance(features, (list, tuple)):
+            features = np.stack([np.asarray(x, dtype=np.float32) for x in features], axis=0)
+        else:
+            features = np.asarray(features, dtype=np.float32)
+        if features.ndim == 3:
+            features = features[None]
+        if features.ndim != 4:
+            raise ValueError(
+                "Map teacher features must have shape [L, N, P, C] "
+                f"or [N, P, C], got {features.shape}"
+            )
+        return features
 
     def _build_ego_status(self, info):
         status = info["ego_status"].astype(np.float32)
