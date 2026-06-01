@@ -2,7 +2,7 @@ log_level = 'INFO'
 dist_params = dict(backend='nccl')
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
-work_dir = 'work_dirs/exp/E9_feature_distill'
+work_dir = 'work_dirs/exp/E9_scratch_gt_weak_feat_kd_l5_warmup'
 version = 'trainval'
 length = dict(trainval=28130, mini=323)
 num_gpus = 2
@@ -10,19 +10,23 @@ batch_size = 8
 num_iters_per_epoch = 1758
 num_epochs = 12
 checkpoint_epoch_interval = 3
-checkpoint_config = dict(interval=1758, max_keep_ckpts=-1)
+checkpoint_config = dict(interval=1758, max_keep_ckpts=2)
 wandb_project = 'hipad'
-wandb_name = 'E9_feature_distill'
+wandb_name = 'E9_scratch_gt_weak_feat_kd_l5_warmup'
 log_config = dict(
     interval=50,
     hooks=[
-        dict(type='TextLoggerHook', by_epoch=False),
+        dict(
+            type='ScientificTextLoggerHook',
+            by_epoch=False,
+            sci_keys=['map_loss_kd_feat'],
+            sci_prefixes=['map_loss_kd_feat_']),
         dict(
             type='WandbLoggerHook',
             init_kwargs=dict(
                 entity='e2ekd',
                 project='hipad',
-                name='E9_feature_distill'),
+                name=wandb_name),
             by_epoch=False)
     ])
 load_from = None
@@ -36,6 +40,9 @@ det_class_names = [
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 map_class_names = ['ped_crossing', 'divider', 'boundary']
+map_teacher_class_names = ['divider', 'ped_crossing', 'boundary']
+map_teacher_to_student_class_perm = tuple(
+    map_teacher_class_names.index(name) for name in map_class_names)
 num_det_classes = 10
 num_map_classes = 3
 map_roi_size = (30, 60)
@@ -94,25 +101,28 @@ plan_speed_refer = None
 plan_anchor_refer = ('temp', '2hz')
 plan_anchor_types = [('temp', '2hz')]
 map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l345.pkl'
-map_distill_alpha_cls = 0.1
-map_distill_alpha_reg = 1.0
+map_distill_alpha_cls = 0.0
+map_distill_alpha_reg = 0.0
 map_distill_temperature = 4.0
-map_distill_score_thr = 0.3
-map_distill_dist_thr = 4.0
+map_distill_score_thr = 0.5
+map_distill_dist_thr = 2.0
 map_distill_last_layer_only = True
-map_feature_distill_alpha = 1.0
-map_feature_distill_layers = (3, 4, 5)
-map_feature_distill_weights = (0.5, 0.75, 1.0)
+map_feature_distill_alpha = 0.01
+map_feature_distill_layers = (5,)
+map_feature_distill_weights = (1.0,)
+map_feature_distill_cached_layers = (3, 4, 5)
 map_feature_distill_teacher_dim = 256
 map_feature_distill_kd_dim = 256
 map_feature_distill_num_classes = 3
 map_feature_distill_cls_cost_weight = 1.0
 map_feature_distill_line_cost_weight = 1.0
 map_feature_distill_beta = 1.0
-# Real-GT + teacher pseudo-GT map distillation. The pseudo-GT map path
-# converts teacher logits to hard labels and provides both original/reversed
-# polyline directions before Hungarian assignment.
-map_gt_loss_weight = 0.0
+map_feature_distill_warmup_start_alpha = 0.001
+map_feature_distill_warmup_start_iter = num_iters_per_epoch * 2
+map_feature_distill_warmup_iters = num_iters_per_epoch * 4
+# Use real GT map supervision as the main signal and keep feature KD weak.
+# The zero map_distill_alpha_* values disable pseudo-GT / teacher-TP map KD.
+map_gt_loss_weight = 1.0
 map_distill_mode = 'pseudo_gt'
 model = dict(
     type='SparseDetector',
@@ -180,7 +190,7 @@ model = dict(
             map_distill_alpha_cls=map_distill_alpha_cls,
             map_distill_alpha_reg=map_distill_alpha_reg,
             map_distill_temperature=4.0,
-            map_distill_score_thr=0.3,
+            map_distill_score_thr=map_distill_score_thr,
             map_distill_dist_thr=map_distill_dist_thr,
             map_distill_last_layer_only=True,
             map_gt_loss_weight=map_gt_loss_weight,
@@ -188,12 +198,17 @@ model = dict(
             map_feature_distill_alpha=map_feature_distill_alpha,
             map_feature_distill_layers=map_feature_distill_layers,
             map_feature_distill_weights=map_feature_distill_weights,
+            map_feature_distill_cached_layers=map_feature_distill_cached_layers,
             map_feature_distill_teacher_dim=map_feature_distill_teacher_dim,
             map_feature_distill_kd_dim=map_feature_distill_kd_dim,
             map_feature_distill_num_classes=map_feature_distill_num_classes,
             map_feature_distill_cls_cost_weight=map_feature_distill_cls_cost_weight,
             map_feature_distill_line_cost_weight=map_feature_distill_line_cost_weight,
             map_feature_distill_beta=map_feature_distill_beta,
+            map_feature_distill_warmup_start_alpha=map_feature_distill_warmup_start_alpha,
+            map_feature_distill_warmup_start_iter=map_feature_distill_warmup_start_iter,
+            map_feature_distill_warmup_iters=map_feature_distill_warmup_iters,
+            map_teacher_to_student_class_perm=map_teacher_to_student_class_perm,
             det_instance_bank=dict(
                 type='InstanceBank',
                 num_anchor=900,
@@ -631,7 +646,7 @@ data_basic_config = dict(
         use_map=False,
         use_external=False),
     version='v1.0-trainval',
-    work_dir='work_dirs/exp/E9_feature_distill')
+    work_dir=work_dir)
 eval_config = dict(
     type='NuScenes3DDataset',
     data_root='data/nuscenes/',
@@ -648,7 +663,7 @@ eval_config = dict(
         use_map=False,
         use_external=False),
     version='v1.0-trainval',
-    work_dir='work_dirs/exp/E9_feature_distill',
+    work_dir=work_dir,
     eval_data_root='data/infos/nuscenes/',
     ann_file='data/infos/nuscenes_infos_val.pkl',
     pipeline=[
@@ -705,7 +720,7 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir='work_dirs/exp/E9_feature_distill',
+        work_dir=work_dir,
         ann_file='data/infos/nuscenes_infos_train.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -794,7 +809,7 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir='work_dirs/exp/E9_feature_distill',
+        work_dir=work_dir,
         ann_file='data/infos/nuscenes_infos_val.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -840,7 +855,7 @@ data = dict(
                 use_map=False,
                 use_external=False),
             version='v1.0-trainval',
-            work_dir='work_dirs/exp/E9_feature_distill',
+            work_dir=work_dir,
             eval_data_root='data/infos/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
@@ -886,7 +901,7 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir='work_dirs/exp/E9_feature_distill',
+        work_dir=work_dir,
         ann_file='data/infos/nuscenes_infos_val.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -932,7 +947,7 @@ data = dict(
                 use_map=False,
                 use_external=False),
             version='v1.0-trainval',
-            work_dir='work_dirs/exp/E9_feature_distill',
+            work_dir=work_dir,
             eval_data_root='data/infos/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[

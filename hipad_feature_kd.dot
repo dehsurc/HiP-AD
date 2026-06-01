@@ -1,0 +1,73 @@
+digraph HiPAD_FeatureKD {
+    rankdir=TB;
+    bgcolor="white";
+    fontname="Helvetica";
+    labelloc="t";
+    fontsize=20;
+    label="HiP-AD  —  (계획) Map Query Feature Distillation\ntap = map_instance_feature (256-d),  active at decoder layers 3 / 4 / 5";
+    node [fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=10];
+
+    /* ===================== LEFT: layer stack ===================== */
+    subgraph cluster_stack {
+        label="Unified Decoder (6 layers)";
+        labelloc="t"; fontsize=14; style="rounded"; color="#9E9E9E"; bgcolor="#FAFAFA";
+
+        L1 [shape=box, style="filled,rounded", fillcolor="#E0E0E0",
+            label="Layer 1  (single-frame, no temp_gnn)"];
+        L2 [shape=box, style="filled,rounded", fillcolor="#E0E0E0",
+            label="Layer 2  (temporal)"];
+        L3 [shape=box, style="filled,rounded", fillcolor="#C8E6C9", color="#2E7D32", penwidth=2.5,
+            label="Layer 3  (temporal)   ★ map feature KD"];
+        L4 [shape=box, style="filled,rounded", fillcolor="#C8E6C9", color="#2E7D32", penwidth=2.5,
+            label="Layer 4  (temporal)   ★ map feature KD"];
+        L5 [shape=box, style="filled,rounded", fillcolor="#C8E6C9", color="#2E7D32", penwidth=2.5,
+            label="Layer 5  (temporal)   ★ map feature KD"];
+        L6 [shape=box, style="filled,rounded", fillcolor="#E0E0E0",
+            label="Layer 6  (temporal)"];
+
+        L1 -> L2 -> L3 -> L4 -> L5 -> L6 [label="anchor 갱신 →", fontsize=9, fontcolor="#4527A0"];
+    }
+
+    heads [shape=box, style="filled,rounded", fillcolor="#F3E5F5", color="#4527A0",
+           label="Det / Map / Plan / Ego Heads"];
+    L6 -> heads;
+
+    /* ===================== KD branch ===================== */
+    teacher [shape=box, style="filled", fillcolor="#FFE0B2", color="#E65100", penwidth=2,
+             label="Teacher  map query features\n(map_instance_feature, 256-d)\n[same layer 3/4/5]"];
+    kdloss  [shape=box, style="filled", fillcolor="#FFCDD2", color="#C62828", penwidth=2.5,
+             label="Feature KD loss\nL2 / cosine\n(student ↔ teacher map feat)"];
+
+    L3 -> kdloss [color="#C62828", style=dashed, penwidth=2,
+                  label="map_instance_feature", fontcolor="#C62828", constraint=false];
+    L4 -> kdloss [color="#C62828", style=dashed, penwidth=2, constraint=false];
+    L5 -> kdloss [color="#C62828", style=dashed, penwidth=2, constraint=false];
+    teacher -> kdloss [color="#E65100", penwidth=2];
+
+    /* ===================== RIGHT: zoom of one layer ===================== */
+    subgraph cluster_zoom {
+        label="zoom: 한 layer 내부 — map feature를 어디서 tap 하나";
+        labelloc="t"; fontsize=13; style="rounded,filled"; fillcolor="#F5F5F5"; color="#616161";
+
+        z_pre [shape=box, style="filled", fillcolor="#EEEEEE",
+               label="1~6:  concat → (temp_gnn) → gnn → inter_gnn → norm → split"];
+        z_df  [shape=box, style="filled", fillcolor="#FFCDD2", color="#C62828",
+               label="7. deformable\nmap query ← image feature 샘플링\nresidual=cat → 512"];
+        z_ffn [shape=box, style="filled", fillcolor="#FFF9C4", color="#F9A825",
+               label="8.concat → 9.ffn(512→256) → 10.norm → 11.split"];
+        z_tap [shape=box, style="filled", fillcolor="#C8E6C9", color="#2E7D32", penwidth=2.5,
+               label="map_instance_feature  (256-d)  ◀ TAP\n(layer 출력 = refine 입력 & 다음 layer로 전달)"];
+        z_rf  [shape=box, style="filled", fillcolor="#D1C4E9", color="#4527A0",
+               label="12. refine (map head)\nmap_cls / map_line + anchor 갱신"];
+
+        z_pre -> z_df -> z_ffn -> z_tap -> z_rf;
+        z_tap -> kdloss [color="#C62828", style=dashed, penwidth=2,
+                         label="여기서 KD tap", fontcolor="#C62828", constraint=false];
+    }
+
+    /* note */
+    note [shape=note, style="filled", fillcolor="#FFF9C4",
+          fontsize=10,
+          label="참고\n• 이건 '계획' 도식 — 현재 코드엔 feature KD 없음.\n• 현재 코드의 KD = logit/prediction KD (refine 출력 cls+reg),\n  E8 기준 last-layer-only(layer 6).\n• tap 대안: deformable 직후 512-d 를 쓸 수도 있음(설계 선택)."];
+}

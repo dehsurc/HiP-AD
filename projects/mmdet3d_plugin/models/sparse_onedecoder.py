@@ -175,12 +175,17 @@ class SparseOneDecoder(BaseModule):
             map_feature_distill_alpha=0.0,
             map_feature_distill_layers=(3, 4, 5),
             map_feature_distill_weights=(0.5, 0.75, 1.0),
+            map_feature_distill_cached_layers=None,
             map_feature_distill_teacher_dim=256,
             map_feature_distill_kd_dim=256,
             map_feature_distill_num_classes=3,
             map_feature_distill_cls_cost_weight=1.0,
             map_feature_distill_line_cost_weight=1.0,
             map_feature_distill_beta=1.0,
+            map_feature_distill_warmup_start_alpha=None,
+            map_feature_distill_warmup_start_iter=0,
+            map_feature_distill_warmup_iters=0,
+            map_teacher_to_student_class_perm=None,
 
             **kwargs,
     ):
@@ -236,12 +241,34 @@ class SparseOneDecoder(BaseModule):
         self.map_feature_distill_alpha = map_feature_distill_alpha
         self.map_feature_distill_layers = list(map_feature_distill_layers)
         self.map_feature_distill_weights = list(map_feature_distill_weights)
+        self.map_feature_distill_cached_layers = (
+            None if map_feature_distill_cached_layers is None
+            else list(map_feature_distill_cached_layers)
+        )
         self.map_feature_distill_teacher_dim = map_feature_distill_teacher_dim
         self.map_feature_distill_kd_dim = map_feature_distill_kd_dim
         self.map_feature_distill_num_classes = map_feature_distill_num_classes
         self.map_feature_distill_cls_cost_weight = map_feature_distill_cls_cost_weight
         self.map_feature_distill_line_cost_weight = map_feature_distill_line_cost_weight
         self.map_feature_distill_beta = map_feature_distill_beta
+        self.map_feature_distill_warmup_start_alpha = (
+            map_feature_distill_alpha
+            if map_feature_distill_warmup_start_alpha is None
+            else map_feature_distill_warmup_start_alpha
+        )
+        self.map_feature_distill_warmup_start_iter = int(
+            map_feature_distill_warmup_start_iter)
+        self.map_feature_distill_warmup_iters = int(
+            map_feature_distill_warmup_iters)
+        self.map_teacher_to_student_class_perm = (
+            None if map_teacher_to_student_class_perm is None
+            else tuple(map_teacher_to_student_class_perm)
+        )
+        self.register_buffer(
+            "map_feature_distill_step",
+            torch.zeros((), dtype=torch.long),
+            persistent=True,
+        )
         self.map_use_feature_distill = map_feature_distill_alpha > 0
         if len(self.map_feature_distill_layers) != len(self.map_feature_distill_weights):
             raise ValueError(
@@ -317,16 +344,17 @@ class SparseOneDecoder(BaseModule):
             if self.map_use_feature_distill:
                 student_in_dim = embed_dims + self.map_feature_distill_num_classes + 2
                 teacher_in_dim = self.map_feature_distill_teacher_dim + self.map_feature_distill_num_classes + 2
+                self.map_feature_anchor_proj = nn.Sequential(
+                    nn.Linear(2, embed_dims),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(embed_dims, embed_dims),
+                )
                 self.map_feature_student_proj = nn.Sequential(
                     nn.Linear(student_in_dim, self.map_feature_distill_kd_dim),
                     nn.ReLU(inplace=True),
-                    nn.Linear(self.map_feature_distill_kd_dim, self.map_feature_distill_kd_dim),
+                    nn.Linear(self.map_feature_distill_kd_dim, teacher_in_dim),
                 )
-                self.map_feature_teacher_proj = nn.Sequential(
-                    nn.Linear(teacher_in_dim, self.map_feature_distill_kd_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(self.map_feature_distill_kd_dim, self.map_feature_distill_kd_dim),
-                )
+                self.map_feature_teacher_proj = nn.Identity()
 
         if 'ego' in self.query_select:
             self.ego_instance_bank = build(ego_instance_bank, PLUGIN_LAYERS)
@@ -1586,7 +1614,8 @@ class SparseOneDecoder(BaseModule):
             pseudo_gt_labels: list of [N_valid] long tensors
             pseudo_gt_pts:    list of [N_valid, 2, num_pts, 2] float tensors
         """
-        teacher_logits = data["teacher_map_logits"]   # [B, 100, 3]
+        teacher_logits = self._remap_teacher_map_logits(
+            data["teacher_map_logits"])               # [B, 100, C_student]
         teacher_pts    = data["teacher_map_pts"]      # [B, 100, num_pts, 2]
         teacher_scores = data["teacher_map_scores"]   # [B, 100]
         bs = teacher_scores.shape[0]
@@ -1619,7 +1648,8 @@ class SparseOneDecoder(BaseModule):
             kd_cls_loss, kd_reg_loss
         """
         T = self.map_distill_temperature
-        teacher_logits = data["teacher_map_logits"]   # [B, 100, 3]
+        teacher_logits = self._remap_teacher_map_logits(
+            data["teacher_map_logits"])               # [B, 100, C_student]
         teacher_pts    = data["teacher_map_pts"]      # [B, 100, num_pts, 2]
         teacher_scores = data["teacher_map_scores"]   # [B, 100]
 
@@ -1692,12 +1722,48 @@ class SparseOneDecoder(BaseModule):
         kd_reg_loss = self.map_distill_alpha_reg * total_kd_reg / num_matched
         return kd_cls_loss, kd_reg_loss
 
+    def _remap_teacher_map_logits(self, teacher_logits):
+        if self.map_teacher_to_student_class_perm is None:
+            return teacher_logits
+        perm = torch.as_tensor(
+            self.map_teacher_to_student_class_perm,
+            dtype=torch.long,
+            device=teacher_logits.device)
+        if teacher_logits.shape[-1] <= int(perm.max()):
+            raise ValueError(
+                "teacher_map_logits has fewer classes than required by "
+                f"map_teacher_to_student_class_perm: "
+                f"{teacher_logits.shape[-1]} <= {int(perm.max())}"
+            )
+        return teacher_logits.index_select(-1, perm)
+
     def _map_feature_dummy_zero(self, ref):
         zero = ref.sum() * 0.0
         if self.map_use_feature_distill:
+            zero = zero + sum(p.sum() * 0.0 for p in self.map_feature_anchor_proj.parameters())
             zero = zero + sum(p.sum() * 0.0 for p in self.map_feature_student_proj.parameters())
             zero = zero + sum(p.sum() * 0.0 for p in self.map_feature_teacher_proj.parameters())
         return zero
+
+    def _get_map_feature_distill_alpha(self, ref):
+        target_alpha = ref.new_tensor(float(self.map_feature_distill_alpha))
+        if (not self.training) or self.map_feature_distill_warmup_iters <= 0:
+            return target_alpha
+
+        step = self.map_feature_distill_step.to(
+            device=ref.device, dtype=ref.dtype)
+        start_iter = ref.new_tensor(
+            float(self.map_feature_distill_warmup_start_iter))
+        warmup_iters = ref.new_tensor(
+            float(max(self.map_feature_distill_warmup_iters, 1)))
+        start_alpha = ref.new_tensor(
+            float(self.map_feature_distill_warmup_start_alpha))
+        progress = ((step - start_iter) / warmup_iters).clamp(0.0, 1.0)
+        return start_alpha + (target_alpha - start_alpha) * progress
+
+    def _advance_map_feature_distill_step(self):
+        if self.training:
+            self.map_feature_distill_step.add_(1)
 
     def _select_teacher_map_feature_layer(self, teacher_features, layer_pos, layer_idx):
         if teacher_features.dim() != 5:
@@ -1706,6 +1772,23 @@ class SparseOneDecoder(BaseModule):
                 f"got {tuple(teacher_features.shape)}"
             )
         num_cached_layers = teacher_features.size(1)
+        if self.map_feature_distill_cached_layers is not None:
+            if num_cached_layers != len(self.map_feature_distill_cached_layers):
+                raise ValueError(
+                    "teacher_map_features cached layer count does not match "
+                    "map_feature_distill_cached_layers: got "
+                    f"{num_cached_layers} features for "
+                    f"{self.map_feature_distill_cached_layers}"
+                )
+            if layer_idx not in self.map_feature_distill_cached_layers:
+                raise ValueError(
+                    "configured map_feature_distill_layers must be present in "
+                    "map_feature_distill_cached_layers; got layer "
+                    f"{layer_idx} from {self.map_feature_distill_layers}, "
+                    f"cache has {self.map_feature_distill_cached_layers}"
+                )
+            return teacher_features[
+                :, self.map_feature_distill_cached_layers.index(layer_idx)]
         if num_cached_layers > layer_idx:
             return teacher_features[:, layer_idx]
         if num_cached_layers == len(self.map_feature_distill_layers):
@@ -1718,7 +1801,8 @@ class SparseOneDecoder(BaseModule):
 
     def _match_map_teacher_student(self, student_cls, student_reg, data):
         """Hungarian match final-layer student map queries to teacher polylines."""
-        teacher_logits = data["teacher_map_logits"]
+        teacher_logits = self._remap_teacher_map_logits(
+            data["teacher_map_logits"])
         teacher_pts = data["teacher_map_pts"]
         teacher_scores = data["teacher_map_scores"]
 
@@ -1782,7 +1866,7 @@ class SparseOneDecoder(BaseModule):
         return matches
 
     def _compute_map_feature_distill_loss(self, model_outs, data):
-        """Point-query feature KD for MapTRv2 teacher and HiP-AD map queries.
+        """Point-conditioned feature KD for MapTRv2 teacher and HiP-AD map queries.
 
         Matching is computed once from the final-layer geometry/class cost and
         then reused for every configured feature KD layer.
@@ -1793,18 +1877,25 @@ class SparseOneDecoder(BaseModule):
             return output
 
         zero = self._map_feature_dummy_zero(ref)
+        effective_alpha = self._get_map_feature_distill_alpha(ref)
         if "teacher_map_features" not in data:
             output["map_loss_kd_feat"] = zero
+            output["map_kd_feat_matches"] = zero
+            output["map_kd_feat_alpha"] = effective_alpha.detach()
+            self._advance_map_feature_distill_step()
             return output
 
         student_features = model_outs.get("instance_features", [])
         cls_scores = model_outs["classification"]
         reg_preds = model_outs["prediction"]
         teacher_features = data["teacher_map_features"]
-        teacher_logits = data["teacher_map_logits"]
+        teacher_logits = self._remap_teacher_map_logits(
+            data["teacher_map_logits"])
         teacher_pts = data["teacher_map_pts"]
 
         matches = self._match_map_teacher_student(cls_scores[-1], reg_preds[-1], data)
+        matched_queries = sum(
+            int(match[0].numel()) for match in matches if match is not None)
         kd_losses = []
 
         for layer_pos, (layer_idx, layer_weight) in enumerate(
@@ -1853,12 +1944,13 @@ class SparseOneDecoder(BaseModule):
                 t_pts = t_pts[:, :num_pts]
                 t_feat = t_feat[:, :num_pts]
 
-                s_feat = s_feat[:, None].expand(-1, num_pts, -1)
+                s_point_embed = self.map_feature_anchor_proj(s_pts)
+                s_feat = s_feat[:, None].expand(-1, num_pts, -1) + s_point_embed
                 s_cls = s_cls[:, None].expand(-1, num_pts, -1)
                 t_cls = t_cls[:, None].expand(-1, num_pts, -1)
 
                 s_input = torch.cat([s_feat, s_cls, s_pts], dim=-1)
-                t_input = torch.cat([t_feat, t_cls, t_pts], dim=-1)
+                t_input = torch.cat([t_feat, t_cls, t_pts], dim=-1).detach()
                 s_proj = self.map_feature_student_proj(s_input)
                 t_proj = self.map_feature_teacher_proj(t_input)
 
@@ -1869,7 +1961,7 @@ class SparseOneDecoder(BaseModule):
 
             if num_terms > 0:
                 layer_loss = (
-                    self.map_feature_distill_alpha *
+                    effective_alpha *
                     float(layer_weight) *
                     layer_loss / num_terms
                 )
@@ -1883,6 +1975,10 @@ class SparseOneDecoder(BaseModule):
         else:
             for layer_idx, loss in zip(self.map_feature_distill_layers, kd_losses):
                 output[f"map_loss_kd_feat_{layer_idx}"] = loss
+        output["map_kd_feat_matches"] = zero + ref.new_tensor(
+            float(matched_queries))
+        output["map_kd_feat_alpha"] = effective_alpha.detach()
+        self._advance_map_feature_distill_step()
         return output
 
     @force_fp32(apply_to=("model_outs"))

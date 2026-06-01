@@ -1,1 +1,2 @@
 from .wandb_val_vis_hook import WandbValVisHook
+from .scientific_text_logger_hook import ScientificTextLoggerHook
