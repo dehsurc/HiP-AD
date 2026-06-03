@@ -2,7 +2,7 @@ log_level = 'INFO'
 dist_params = dict(backend='nccl')
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
-work_dir = 'work_dirs/exp/E9_scratch_gt_weak_feat_kd_l5_warmup'
+work_dir = 'work_dirs/exp/E9_scratch_gt_feat_kd_l345_cos_shared'
 version = 'trainval'
 length = dict(trainval=28130, mini=323)
 num_gpus = 2
@@ -12,7 +12,7 @@ num_epochs = 12
 checkpoint_epoch_interval = 3
 checkpoint_config = dict(interval=1758, max_keep_ckpts=2)
 wandb_project = 'hipad'
-wandb_name = 'E9_scratch_gt_weak_feat_kd_l5_warmup'
+wandb_name = 'E9_scratch_gt_feat_kd_l345_cos_shared'
 log_config = dict(
     interval=50,
     hooks=[
@@ -104,12 +104,23 @@ map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l345.p
 map_distill_alpha_cls = 0.0
 map_distill_alpha_reg = 0.0
 map_distill_temperature = 4.0
-map_distill_score_thr = 0.5
+# Lower teacher score threshold -> match more teacher polylines -> denser,
+# less sparse KD supervision (was 0.5, only ~5-6 matches/sample).
+map_distill_score_thr = 0.3
 map_distill_dist_thr = 2.0
 map_distill_last_layer_only = True
-map_feature_distill_alpha = 0.01
-map_feature_distill_layers = (5,)
-map_feature_distill_weights = (1.0,)
+# Performance-oriented feature-KD setup (shared-space cosine objective):
+#   - distill all cached map decoder layers (3,4,5), indices aligned
+#     student<->teacher; matching from the final layer is shared to 3,4.
+#   - layer weights sum to ~1.0 so adding layers does NOT inflate total KD
+#     magnitude (more magnitude was shown to hurt map mAP at alpha=0.05).
+#   - NOTE: the objective changed from smooth-L1 on raw teacher features
+#     (loss ~25) to an L2-normalized cosine distance (per term in [0,2]), so
+#     alpha is on a completely different scale. alpha=0.25 here is NOT
+#     comparable to the old 0.01/0.05; it is the primary knob to sweep next.
+map_feature_distill_alpha = 0.25
+map_feature_distill_layers = (3, 4, 5)
+map_feature_distill_weights = (0.22, 0.33, 0.45)
 map_feature_distill_cached_layers = (3, 4, 5)
 map_feature_distill_teacher_dim = 256
 map_feature_distill_kd_dim = 256
@@ -117,7 +128,7 @@ map_feature_distill_num_classes = 3
 map_feature_distill_cls_cost_weight = 1.0
 map_feature_distill_line_cost_weight = 1.0
 map_feature_distill_beta = 1.0
-map_feature_distill_warmup_start_alpha = 0.001
+map_feature_distill_warmup_start_alpha = 0.025
 map_feature_distill_warmup_start_iter = num_iters_per_epoch * 2
 map_feature_distill_warmup_iters = num_iters_per_epoch * 4
 # Use real GT map supervision as the main signal and keep feature KD weak.
