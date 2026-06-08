@@ -2,7 +2,7 @@ log_level = 'INFO'
 dist_params = dict(backend='nccl')
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
-work_dir = 'work_dirs/exp/E9_scratch_gt_weak_feat_kd_l45_cos_a0p05_repro1'
+work_dir = 'work_dirs/exp/E10_l345_a0p05_gt1_identity_teacher'
 version = 'trainval'
 length = dict(trainval=28130, mini=323)
 num_gpus = 2
@@ -12,7 +12,7 @@ num_epochs = 12
 checkpoint_epoch_interval = 3
 checkpoint_config = dict(interval=1758, max_keep_ckpts=2)
 wandb_project = 'hipad'
-wandb_name = 'E9_scratch_gt_weak_feat_kd_l45_cos_a0p05_repro1'
+wandb_name = 'E10_l345_a0p05_gt1_identity_teacher'
 log_config = dict(
     interval=50,
     hooks=[
@@ -40,9 +40,10 @@ det_class_names = [
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 map_class_names = ['ped_crossing', 'divider', 'boundary']
-map_teacher_class_names = ['divider', 'ped_crossing', 'boundary']
-map_teacher_to_student_class_perm = tuple(
-    map_teacher_class_names.index(name) for name in map_class_names)
+# The cached top20_l345 teacher pkl was empirically evaluated in this order.
+# Do not apply the original MapTR [divider, ped_crossing, boundary] swap here.
+map_teacher_class_names = ['ped_crossing', 'divider', 'boundary']
+map_teacher_to_student_class_perm = None
 num_det_classes = 10
 num_map_classes = 3
 map_roi_size = (30, 60)
@@ -101,21 +102,14 @@ plan_speed_refer = None
 plan_anchor_refer = ('temp', '2hz')
 plan_anchor_types = [('temp', '2hz')]
 map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l345.pkl'
-map_distill_alpha_cls = 0.0
-map_distill_alpha_reg = 0.0
-map_distill_temperature = 4.0
-# Lower teacher score threshold -> match more teacher polylines -> denser,
-# less sparse KD supervision (was 0.5, only ~5-6 matches/sample).
-map_distill_score_thr = 0.3
-map_distill_dist_thr = 2.0
-map_distill_last_layer_only = True
-# Weak l45 feature-KD reproduction (shared-space cosine objective):
-#   - use the best balanced l45 setup from the previous run.
-#   - the cache file stores layers 3/4/5, but only layers 4/5 are distilled.
-#   - weights sum to 1.0, so total KD magnitude is controlled by alpha.
-map_feature_distill_alpha = 0.05
-map_feature_distill_layers = (4, 5)
-map_feature_distill_weights = (0.42, 0.58)
+# Keep teacher matching moderately dense, matching the weak-KD E9/E11 setup.
+map_feature_match_score_thr = 0.3
+map_feature_match_dist_thr = 2.0
+# Weak L345 feature KD with the teacher cache class order fixed to identity.
+# Weights sum to 1.0, so adding layer 3 does not inflate total KD magnitude.
+map_feature_distill_alpha = 0.1
+map_feature_distill_layers = (3, 4, 5)
+map_feature_distill_weights = (0.22, 0.33, 0.45)
 map_feature_distill_cached_layers = (3, 4, 5)
 map_feature_distill_teacher_dim = 256
 map_feature_distill_kd_dim = 256
@@ -126,10 +120,14 @@ map_feature_distill_beta = 1.0
 map_feature_distill_warmup_start_alpha = 0.005
 map_feature_distill_warmup_start_iter = num_iters_per_epoch * 2
 map_feature_distill_warmup_iters = num_iters_per_epoch * 4
+# Anti-absorption knobs (new in E10; consumed by SparseOneDecoder).
+map_feature_distill_student_proj_depth = 1
+map_feature_distill_detach_point_embed = True
+map_feature_distill_rkd_weight = 2.0
+# Freeze W_s entirely so FD cannot be absorbed by the projector.
+map_feature_distill_freeze_student_proj = True
 # Use real GT map supervision as the main signal and keep feature KD weak.
-# The zero map_distill_alpha_* values disable pseudo-GT / teacher-TP map KD.
 map_gt_loss_weight = 1.0
-map_distill_mode = 'pseudo_gt'
 model = dict(
     type='SparseDetector',
     use_grid_mask=True,
@@ -193,14 +191,11 @@ model = dict(
             with_incremental_plan_refine=True,
             motion_anchor='data/kmeans/kmeans_motion_6.npy',
             cls_threshold_to_reg=0.05,
-            map_distill_alpha_cls=map_distill_alpha_cls,
-            map_distill_alpha_reg=map_distill_alpha_reg,
-            map_distill_temperature=4.0,
-            map_distill_score_thr=map_distill_score_thr,
-            map_distill_dist_thr=map_distill_dist_thr,
-            map_distill_last_layer_only=True,
+            # These two constructor args are used by feature-KD matching here:
+            # teacher score filtering and student/teacher polyline distance gate.
+            map_distill_score_thr=map_feature_match_score_thr,
+            map_distill_dist_thr=map_feature_match_dist_thr,
             map_gt_loss_weight=map_gt_loss_weight,
-            map_distill_mode=map_distill_mode,
             map_feature_distill_alpha=map_feature_distill_alpha,
             map_feature_distill_layers=map_feature_distill_layers,
             map_feature_distill_weights=map_feature_distill_weights,
@@ -214,6 +209,10 @@ model = dict(
             map_feature_distill_warmup_start_alpha=map_feature_distill_warmup_start_alpha,
             map_feature_distill_warmup_start_iter=map_feature_distill_warmup_start_iter,
             map_feature_distill_warmup_iters=map_feature_distill_warmup_iters,
+            map_feature_distill_student_proj_depth=map_feature_distill_student_proj_depth,
+            map_feature_distill_detach_point_embed=map_feature_distill_detach_point_embed,
+            map_feature_distill_rkd_weight=map_feature_distill_rkd_weight,
+            map_feature_distill_freeze_student_proj=map_feature_distill_freeze_student_proj,
             map_teacher_to_student_class_perm=map_teacher_to_student_class_perm,
             det_instance_bank=dict(
                 type='InstanceBank',

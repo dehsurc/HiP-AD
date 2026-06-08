@@ -285,8 +285,8 @@ class SparsePlanDecoder(object):
         ego_box = ego_box[:, None, None].repeat(1, num_anchor, num_motion_mode, 1, 1, 1).flatten(0, -2)
         motion_box = motion_box.unsqueeze(3).repeat(1, 1, 1, num_ego_mode, 1, 1).flatten(0, -2)
 
-        ego_box[0] += offset * torch.cos(ego_box[6])
-        ego_box[1] += offset * torch.sin(ego_box[6])
+        ego_box[:, X] += offset * torch.cos(ego_box[:, YAW])
+        ego_box[:, Y] += offset * torch.sin(ego_box[:, YAW])
         col = check_collision(ego_box, motion_box)
         col = col.reshape(bs, num_anchor, num_motion_mode, num_ego_mode, ts).permute(0, 3, 1, 2, 4)
         col = col.flatten(2, -1).any(dim=-1)

@@ -66,10 +66,25 @@ class VectorEvaluate(object):
         Returns:
             sampled_points (array): interpolated coordinates
         '''
-        line = LineString(vector)
-        distances = np.linspace(0, line.length, num_pts)
-        sampled_points = np.array([list(line.interpolate(distance).coords) 
-            for distance in distances]).squeeze()
+        vector = np.asarray(vector, dtype=np.float32)
+        if len(vector) == 0:
+            return np.zeros((num_pts, 2), dtype=np.float32)
+        if len(vector) == 1:
+            return np.repeat(vector, num_pts, axis=0)
+
+        seg_vec = vector[1:] - vector[:-1]
+        seg_len = np.linalg.norm(seg_vec, axis=1)
+        cum_len = np.concatenate([np.zeros(1, dtype=np.float32), np.cumsum(seg_len)])
+        total_len = float(cum_len[-1])
+        if total_len <= 1e-8:
+            return np.repeat(vector[:1], num_pts, axis=0)
+
+        distances = np.linspace(0, total_len, num_pts, dtype=np.float32)
+        seg_idx = np.searchsorted(cum_len, distances, side='right') - 1
+        seg_idx = np.clip(seg_idx, 0, len(seg_len) - 1)
+        denom = np.maximum(seg_len[seg_idx], 1e-8)
+        ratio = ((distances - cum_len[seg_idx]) / denom)[:, None]
+        sampled_points = vector[seg_idx] + ratio * seg_vec[seg_idx]
         
         return sampled_points
     

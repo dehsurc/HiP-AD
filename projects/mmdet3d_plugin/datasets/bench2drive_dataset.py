@@ -1138,7 +1138,8 @@ class Bench2DriveDataset(Dataset):
             else:
                 raise NotImplementedError
 
-            ego_spatial_trajs, ego_spatial_masks = self.get_ego_spatial_trajs(index, self.spatial_points, spatial_strategy)
+            ego_spatial_trajs, ego_spatial_masks = self.get_ego_spatial_trajs(
+                index, self.spatial_points, spatial_strategy, with_fitting=True)
             plan_results['gt_ego_spat_trajs_{}'.format(plan_anchor[1])] = ego_spatial_trajs
             plan_results['gt_ego_spat_masks_{}'.format(plan_anchor[1])] = ego_spatial_masks
 

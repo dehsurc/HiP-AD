@@ -185,6 +185,23 @@ class SparseOneDecoder(BaseModule):
             map_feature_distill_warmup_start_alpha=None,
             map_feature_distill_warmup_start_iter=0,
             map_feature_distill_warmup_iters=0,
+            # --- anti-absorption controls (see _compute_map_feature_distill_loss) ---
+            # Freeze the trainable student projector so the KD gradient cannot be
+            # absorbed by W_s and is forced into instance_features (the backbone
+            # representation we actually want to improve).
+            map_feature_distill_freeze_student_proj=False,
+            # Single-linear (depth=1) student projector keeps just enough capacity
+            # to bridge the HiP-AD<->MapTRv2 feature spaces while minimizing the
+            # projector's freedom to "solve" the alignment on its own.
+            map_feature_distill_student_proj_depth=2,
+            # Detach the learnable anchor point-embed inside the KD path so the
+            # only trainable tensor feeding the loss is instance_features.
+            map_feature_distill_detach_point_embed=False,
+            # Relational KD weight. Adds an RKD-distance term that matches the
+            # pairwise geometry of matched student queries to the teacher's.
+            # A per-query projector cannot fake cross-query structure, so this
+            # term keeps producing gradient after the pointwise cosine saturates.
+            map_feature_distill_rkd_weight=0.0,
             map_teacher_to_student_class_perm=None,
 
             **kwargs,
@@ -260,6 +277,14 @@ class SparseOneDecoder(BaseModule):
             map_feature_distill_warmup_start_iter)
         self.map_feature_distill_warmup_iters = int(
             map_feature_distill_warmup_iters)
+        self.map_feature_distill_freeze_student_proj = bool(
+            map_feature_distill_freeze_student_proj)
+        self.map_feature_distill_student_proj_depth = int(
+            map_feature_distill_student_proj_depth)
+        self.map_feature_distill_detach_point_embed = bool(
+            map_feature_distill_detach_point_embed)
+        self.map_feature_distill_rkd_weight = float(
+            map_feature_distill_rkd_weight)
         self.map_teacher_to_student_class_perm = (
             None if map_teacher_to_student_class_perm is None
             else tuple(map_teacher_to_student_class_perm)
@@ -344,17 +369,45 @@ class SparseOneDecoder(BaseModule):
             if self.map_use_feature_distill:
                 student_in_dim = embed_dims + self.map_feature_distill_num_classes + 2
                 teacher_in_dim = self.map_feature_distill_teacher_dim + self.map_feature_distill_num_classes + 2
+                kd_dim = self.map_feature_distill_kd_dim
                 self.map_feature_anchor_proj = nn.Sequential(
                     nn.Linear(2, embed_dims),
                     nn.ReLU(inplace=True),
                     nn.Linear(embed_dims, embed_dims),
                 )
-                self.map_feature_student_proj = nn.Sequential(
-                    nn.Linear(student_in_dim, self.map_feature_distill_kd_dim),
+                # Symmetric projection into a shared KD space (kd_dim): student
+                # and teacher are each mapped by an MLP, then aligned with an
+                # L2-normalized cosine objective (see
+                # _compute_map_feature_distill_loss). This replaces the previous
+                # asymmetric setup (student MLP -> raw teacher dim, Identity
+                # teacher) whose smooth-L1 regression onto un-normalized teacher
+                # features plateaued (~25 floor). The teacher projector is kept
+                # frozen (stop-grad target) so the shared space cannot collapse
+                # to a trivial constant.
+                if self.map_feature_distill_student_proj_depth <= 1:
+                    # Minimal regressor: a single linear is enough to bridge the
+                    # two feature spaces but gives the projector little room to
+                    # absorb the alignment on its own.
+                    self.map_feature_student_proj = nn.Sequential(
+                        nn.Linear(student_in_dim, kd_dim),
+                    )
+                else:
+                    self.map_feature_student_proj = nn.Sequential(
+                        nn.Linear(student_in_dim, kd_dim),
+                        nn.ReLU(inplace=True),
+                        nn.Linear(kd_dim, kd_dim),
+                    )
+                self.map_feature_teacher_proj = nn.Sequential(
+                    nn.Linear(teacher_in_dim, kd_dim),
                     nn.ReLU(inplace=True),
-                    nn.Linear(self.map_feature_distill_kd_dim, teacher_in_dim),
+                    nn.Linear(kd_dim, kd_dim),
                 )
-                self.map_feature_teacher_proj = nn.Identity()
+                if self.map_feature_distill_freeze_student_proj:
+                    # Freeze W_s as a fixed random map: the only trainable tensor
+                    # left in the KD path is instance_features, so all KD gradient
+                    # is forced into the student representation we want to teach.
+                    for p in self.map_feature_student_proj.parameters():
+                        p.requires_grad_(False)
 
         if 'ego' in self.query_select:
             self.ego_instance_bank = build(ego_instance_bank, PLUGIN_LAYERS)
@@ -1615,9 +1668,9 @@ class SparseOneDecoder(BaseModule):
             pseudo_gt_pts:    list of [N_valid, 2, num_pts, 2] float tensors
         """
         teacher_logits = self._remap_teacher_map_logits(
-            data["teacher_map_logits"])               # [B, 100, C_student]
-        teacher_pts    = data["teacher_map_pts"]      # [B, 100, num_pts, 2]
-        teacher_scores = data["teacher_map_scores"]   # [B, 100]
+            data["teacher_map_logits"])               # [B, N_t, C_student]
+        teacher_pts    = data["teacher_map_pts"]      # [B, N_t, num_pts, 2]
+        teacher_scores = data["teacher_map_scores"]   # [B, N_t]
         bs = teacher_scores.shape[0]
         num_pts = teacher_pts.shape[-2]
 
@@ -1649,9 +1702,9 @@ class SparseOneDecoder(BaseModule):
         """
         T = self.map_distill_temperature
         teacher_logits = self._remap_teacher_map_logits(
-            data["teacher_map_logits"])               # [B, 100, C_student]
-        teacher_pts    = data["teacher_map_pts"]      # [B, 100, num_pts, 2]
-        teacher_scores = data["teacher_map_scores"]   # [B, 100]
+            data["teacher_map_logits"])               # [B, N_t, C_student]
+        teacher_pts    = data["teacher_map_pts"]      # [B, N_t, num_pts, 2]
+        teacher_scores = data["teacher_map_scores"]   # [B, N_t]
 
         bs = student_cls.shape[0]
 
@@ -1673,14 +1726,14 @@ class SparseOneDecoder(BaseModule):
                 continue
 
             gt_map_pts_b = data["gt_map_pts"][b]       # [N_gt, num_perm, num_pts, 2]
-            t_pts_b      = teacher_pts[b]              # [100, num_pts, 2]
-            t_logits_b   = teacher_logits[b]           # [100, 3]
-            t_scores_b   = teacher_scores[b]           # [100]
+            t_pts_b      = teacher_pts[b]              # [N_t, num_pts, 2]
+            t_logits_b   = teacher_logits[b]           # [N_t, C_student]
+            t_scores_b   = teacher_scores[b]           # [N_t]
 
             score_mask = t_scores_b > self.map_distill_score_thr
             if not score_mask.any():
                 continue
-            t_centers = t_pts_b.mean(dim=1)            # [100, 2]
+            t_centers = t_pts_b.mean(dim=1)            # [N_t, 2]
 
             for i in range(len(gt_idx)):
                 gt_i      = int(gt_idx[i])
@@ -1919,6 +1972,8 @@ class SparseOneDecoder(BaseModule):
 
             layer_loss = zero
             num_terms = 0
+            layer_rkd = zero
+            num_rkd = 0
             for b, match in enumerate(matches):
                 if match is None:
                     continue
@@ -1945,6 +2000,10 @@ class SparseOneDecoder(BaseModule):
                 t_feat = t_feat[:, :num_pts]
 
                 s_point_embed = self.map_feature_anchor_proj(s_pts)
+                if self.map_feature_distill_detach_point_embed:
+                    # Keep the learnable anchor_proj out of the KD gradient path so
+                    # it cannot absorb the alignment instead of instance_features.
+                    s_point_embed = s_point_embed.detach()
                 s_feat = s_feat[:, None].expand(-1, num_pts, -1) + s_point_embed
                 s_cls = s_cls[:, None].expand(-1, num_pts, -1)
                 t_cls = t_cls[:, None].expand(-1, num_pts, -1)
@@ -1952,18 +2011,47 @@ class SparseOneDecoder(BaseModule):
                 s_input = torch.cat([s_feat, s_cls, s_pts], dim=-1)
                 t_input = torch.cat([t_feat, t_cls, t_pts], dim=-1).detach()
                 s_proj = self.map_feature_student_proj(s_input)
-                t_proj = self.map_feature_teacher_proj(t_input)
+                # Teacher is a fixed target in the shared KD space: stop-grad on
+                # both the cached features and the teacher projector, so this is
+                # pure feature KD and the shared space cannot collapse.
+                with torch.no_grad():
+                    t_proj = self.map_feature_teacher_proj(t_input)
 
-                layer_loss = layer_loss + F.smooth_l1_loss(
-                    s_proj, t_proj, reduction="sum",
-                    beta=self.map_feature_distill_beta)
+                # Align by direction (L2-normalized cosine distance), which
+                # removes the feature-norm-scale floor that smooth-L1 regression
+                # onto raw teacher features hit (~25 plateau). Per matched point
+                # the loss is (1 - cos) in [0, 2]; averaged over num_terms below.
+                s_proj = F.normalize(s_proj, dim=-1)
+                t_proj = F.normalize(t_proj, dim=-1)
+                layer_loss = layer_loss + (1.0 - (s_proj * t_proj).sum(-1)).sum()
                 num_terms += int(student_idx.numel()) * num_pts
 
+                # Relational KD (RKD-distance): match the pairwise geometry of the
+                # matched student queries to the teacher's. A per-query projector
+                # cannot reproduce cross-query structure, so this term keeps
+                # producing gradient into instance_features after the pointwise
+                # cosine has saturated. Pool over points -> one embedding/query.
+                if self.map_feature_distill_rkd_weight > 0 and student_idx.numel() >= 2:
+                    s_q = s_proj.mean(dim=1)            # [Q, kd_dim], grad on
+                    t_q = t_proj.mean(dim=1).detach()   # [Q, kd_dim], fixed target
+                    s_d = torch.cdist(s_q, s_q)
+                    t_d = torch.cdist(t_q, t_q)
+                    # scale-invariant normalization by mean of nonzero distances
+                    s_mu = s_d.mean().clamp_min(1e-6)
+                    t_mu = t_d.mean().clamp_min(1e-6)
+                    layer_rkd = layer_rkd + F.smooth_l1_loss(
+                        s_d / s_mu, t_d / t_mu, reduction="mean")
+                    num_rkd += 1
+
             if num_terms > 0:
+                pointwise = layer_loss / num_terms
+                if num_rkd > 0:
+                    pointwise = pointwise + (
+                        self.map_feature_distill_rkd_weight * layer_rkd / num_rkd)
                 layer_loss = (
                     effective_alpha *
                     float(layer_weight) *
-                    layer_loss / num_terms
+                    pointwise
                 )
             kd_losses.append(layer_loss)
 

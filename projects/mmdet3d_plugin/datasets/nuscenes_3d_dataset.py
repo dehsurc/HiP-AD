@@ -178,8 +178,11 @@ class NuScenes3DDataset(Dataset):
             print_log(f"Loaded teacher cache: {len(self.teacher_cache)} samples", logger='root')
             self._convert_teacher_cache_convention()
 
-        # Map teacher cache for map distillation (MapTRv1/v2 polylines)
-        # Cache schema per token: {"logits": [100, 3], "pts": [100, 20, 2], "scores": [100]}
+        # Map teacher cache for map distillation (MapTRv1/v2 polylines).
+        # Cache schema per token:
+        #   {"logits": [N_t, 3], "pts": [N_t, P, 2], "scores": [N_t],
+        #    "features": optional [L, N_t, P, C]}
+        # E9/E10 top20_l345 caches use N_t=20, L=3, P=20, C=256.
         self.map_teacher_cache = None
         if map_teacher_cache_path is not None:
             import pickle
@@ -479,9 +482,9 @@ class NuScenes3DDataset(Dataset):
             token = info["token"]
             map_teacher = self.map_teacher_cache.get(token, None)
             if map_teacher is not None:
-                input_dict["teacher_map_logits"] = map_teacher["logits"].astype(np.float32)  # [100, 3]
-                input_dict["teacher_map_pts"]    = map_teacher["pts"].copy().astype(np.float32)  # [100, 20, 2]
-                input_dict["teacher_map_scores"] = map_teacher["scores"].astype(np.float32)  # [100]
+                input_dict["teacher_map_logits"] = map_teacher["logits"].astype(np.float32)  # [N_t, 3]
+                input_dict["teacher_map_pts"]    = map_teacher["pts"].copy().astype(np.float32)  # [N_t, P, 2]
+                input_dict["teacher_map_scores"] = map_teacher["scores"].astype(np.float32)  # [N_t]
                 teacher_map_features = self._get_map_teacher_features(map_teacher)
                 if teacher_map_features is not None:
                     input_dict["teacher_map_features"] = teacher_map_features
