@@ -181,26 +181,10 @@ class SparseOneDecoder(BaseModule):
             map_feature_distill_num_classes=3,
             map_feature_distill_cls_cost_weight=1.0,
             map_feature_distill_line_cost_weight=1.0,
-            map_feature_distill_beta=1.0,
-            map_feature_distill_warmup_start_alpha=None,
-            map_feature_distill_warmup_start_iter=0,
-            map_feature_distill_warmup_iters=0,
-            # --- anti-absorption controls (see _compute_map_feature_distill_loss) ---
-            # Freeze the trainable student projector so the KD gradient cannot be
-            # absorbed by W_s and is forced into instance_features (the backbone
-            # representation we actually want to improve).
+            # Optional controls for the point-conditioned feature KD path.
             map_feature_distill_freeze_student_proj=False,
-            # Single-linear (depth=1) student projector keeps just enough capacity
-            # to bridge the HiP-AD<->MapTRv2 feature spaces while minimizing the
-            # projector's freedom to "solve" the alignment on its own.
             map_feature_distill_student_proj_depth=2,
-            # Detach the learnable anchor point-embed inside the KD path so the
-            # only trainable tensor feeding the loss is instance_features.
             map_feature_distill_detach_point_embed=False,
-            # Relational KD weight. Adds an RKD-distance term that matches the
-            # pairwise geometry of matched student queries to the teacher's.
-            # A per-query projector cannot fake cross-query structure, so this
-            # term keeps producing gradient after the pointwise cosine saturates.
             map_feature_distill_rkd_weight=0.0,
             map_teacher_to_student_class_perm=None,
 
@@ -267,16 +251,6 @@ class SparseOneDecoder(BaseModule):
         self.map_feature_distill_num_classes = map_feature_distill_num_classes
         self.map_feature_distill_cls_cost_weight = map_feature_distill_cls_cost_weight
         self.map_feature_distill_line_cost_weight = map_feature_distill_line_cost_weight
-        self.map_feature_distill_beta = map_feature_distill_beta
-        self.map_feature_distill_warmup_start_alpha = (
-            map_feature_distill_alpha
-            if map_feature_distill_warmup_start_alpha is None
-            else map_feature_distill_warmup_start_alpha
-        )
-        self.map_feature_distill_warmup_start_iter = int(
-            map_feature_distill_warmup_start_iter)
-        self.map_feature_distill_warmup_iters = int(
-            map_feature_distill_warmup_iters)
         self.map_feature_distill_freeze_student_proj = bool(
             map_feature_distill_freeze_student_proj)
         self.map_feature_distill_student_proj_depth = int(
@@ -288,11 +262,6 @@ class SparseOneDecoder(BaseModule):
         self.map_teacher_to_student_class_perm = (
             None if map_teacher_to_student_class_perm is None
             else tuple(map_teacher_to_student_class_perm)
-        )
-        self.register_buffer(
-            "map_feature_distill_step",
-            torch.zeros((), dtype=torch.long),
-            persistent=True,
         )
         self.map_use_feature_distill = map_feature_distill_alpha > 0
         if len(self.map_feature_distill_layers) != len(self.map_feature_distill_weights):
@@ -402,10 +371,9 @@ class SparseOneDecoder(BaseModule):
                     nn.ReLU(inplace=True),
                     nn.Linear(kd_dim, kd_dim),
                 )
+                for p in self.map_feature_teacher_proj.parameters():
+                    p.requires_grad_(False)
                 if self.map_feature_distill_freeze_student_proj:
-                    # Freeze W_s as a fixed random map: the only trainable tensor
-                    # left in the KD path is instance_features, so all KD gradient
-                    # is forced into the student representation we want to teach.
                     for p in self.map_feature_student_proj.parameters():
                         p.requires_grad_(False)
 
@@ -1798,30 +1766,16 @@ class SparseOneDecoder(BaseModule):
     def _map_feature_dummy_zero(self, ref):
         zero = ref.sum() * 0.0
         if self.map_use_feature_distill:
-            zero = zero + sum(p.sum() * 0.0 for p in self.map_feature_anchor_proj.parameters())
-            zero = zero + sum(p.sum() * 0.0 for p in self.map_feature_student_proj.parameters())
-            zero = zero + sum(p.sum() * 0.0 for p in self.map_feature_teacher_proj.parameters())
+            modules = (
+                self.map_feature_anchor_proj,
+                self.map_feature_student_proj,
+                self.map_feature_teacher_proj,
+            )
+            for module in modules:
+                zero = zero + sum(
+                    p.sum() * 0.0 for p in module.parameters()
+                    if p.requires_grad)
         return zero
-
-    def _get_map_feature_distill_alpha(self, ref):
-        target_alpha = ref.new_tensor(float(self.map_feature_distill_alpha))
-        if (not self.training) or self.map_feature_distill_warmup_iters <= 0:
-            return target_alpha
-
-        step = self.map_feature_distill_step.to(
-            device=ref.device, dtype=ref.dtype)
-        start_iter = ref.new_tensor(
-            float(self.map_feature_distill_warmup_start_iter))
-        warmup_iters = ref.new_tensor(
-            float(max(self.map_feature_distill_warmup_iters, 1)))
-        start_alpha = ref.new_tensor(
-            float(self.map_feature_distill_warmup_start_alpha))
-        progress = ((step - start_iter) / warmup_iters).clamp(0.0, 1.0)
-        return start_alpha + (target_alpha - start_alpha) * progress
-
-    def _advance_map_feature_distill_step(self):
-        if self.training:
-            self.map_feature_distill_step.add_(1)
 
     def _select_teacher_map_feature_layer(self, teacher_features, layer_pos, layer_idx):
         if teacher_features.dim() != 5:
@@ -1894,15 +1848,16 @@ class SparseOneDecoder(BaseModule):
                 line_cost = torch.minimum(dist_fwd, dist_rev)
                 reverse = dist_rev < dist_fwd
 
-                s_prob = student_cls[b, :, :num_cls].sigmoid()
-                t_prob = teacher_logits[b, teacher_valid, :num_cls].sigmoid()
-                cls_cost = F.binary_cross_entropy(
-                    s_prob[:, None].expand(-1, t_prob.shape[0], -1),
-                    t_prob[None].expand(s_prob.shape[0], -1, -1),
-                    reduction="none",
-                ).sum(-1)
-
-                cost = (self.map_feature_distill_line_cost_weight * line_cost +
+                cost = self.map_feature_distill_line_cost_weight * line_cost
+                if self.map_feature_distill_cls_cost_weight > 0:
+                    s_prob = student_cls[b, :, :num_cls].sigmoid()
+                    t_prob = teacher_logits[b, teacher_valid, :num_cls].sigmoid()
+                    cls_cost = F.binary_cross_entropy(
+                        s_prob[:, None].expand(-1, t_prob.shape[0], -1),
+                        t_prob[None].expand(s_prob.shape[0], -1, -1),
+                        reduction="none",
+                    ).sum(-1)
+                    cost = cost + (
                         self.map_feature_distill_cls_cost_weight * cls_cost)
                 row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
                 if len(row_ind) == 0:
@@ -1935,12 +1890,13 @@ class SparseOneDecoder(BaseModule):
             return output
 
         zero = self._map_feature_dummy_zero(ref)
-        effective_alpha = self._get_map_feature_distill_alpha(ref)
+        effective_alpha = ref.new_tensor(float(self.map_feature_distill_alpha))
         if "teacher_map_features" not in data:
             output["map_loss_kd_feat"] = zero
             output["map_kd_feat_matches"] = zero
             output["map_kd_feat_alpha"] = effective_alpha.detach()
-            self._advance_map_feature_distill_step()
+            output["map_kd_feat_point"] = zero.detach()
+            output["map_kd_feat_rkd"] = zero.detach()
             return output
 
         student_features = model_outs.get("instance_features", [])
@@ -1955,6 +1911,8 @@ class SparseOneDecoder(BaseModule):
         matched_queries = sum(
             int(match[0].numel()) for match in matches if match is not None)
         kd_losses = []
+        point_metrics = []
+        rkd_metrics = []
 
         for layer_pos, (layer_idx, layer_weight) in enumerate(
                 zip(self.map_feature_distill_layers, self.map_feature_distill_weights)):
@@ -2041,23 +1999,33 @@ class SparseOneDecoder(BaseModule):
                     t_q = t_proj.mean(dim=1).detach()   # [Q, kd_dim], fixed target
                     s_d = torch.cdist(s_q, s_q)
                     t_d = torch.cdist(t_q, t_q)
-                    # scale-invariant normalization by mean of nonzero distances
-                    s_mu = s_d.mean().clamp_min(1e-6)
-                    t_mu = t_d.mean().clamp_min(1e-6)
-                    layer_rkd = layer_rkd + F.smooth_l1_loss(
-                        s_d / s_mu, t_d / t_mu, reduction="mean")
-                    num_rkd += 1
+                    offdiag = ~torch.eye(
+                        s_d.size(0), dtype=torch.bool, device=s_d.device)
+                    s_d = s_d[offdiag]
+                    t_d = t_d[offdiag]
+                    if s_d.numel() > 0:
+                        s_mu = s_d.mean().clamp_min(1e-6)
+                        t_mu = t_d.mean().clamp_min(1e-6)
+                        layer_rkd = layer_rkd + F.smooth_l1_loss(
+                            s_d / s_mu, t_d / t_mu, reduction="mean")
+                        num_rkd += 1
 
             if num_terms > 0:
                 pointwise = layer_loss / num_terms
+                rkd = zero
                 if num_rkd > 0:
-                    pointwise = pointwise + (
+                    rkd = (
                         self.map_feature_distill_rkd_weight * layer_rkd / num_rkd)
+                layer_scale = effective_alpha * float(layer_weight)
                 layer_loss = (
-                    effective_alpha *
-                    float(layer_weight) *
-                    pointwise
+                    layer_scale *
+                    (pointwise + rkd)
                 )
+                point_metrics.append((layer_scale * pointwise).detach())
+                rkd_metrics.append((layer_scale * rkd).detach())
+            else:
+                point_metrics.append(zero.detach())
+                rkd_metrics.append(zero.detach())
             kd_losses.append(layer_loss)
 
         if self.combine_layer_loss:
@@ -2071,7 +2039,8 @@ class SparseOneDecoder(BaseModule):
         output["map_kd_feat_matches"] = zero + ref.new_tensor(
             float(matched_queries))
         output["map_kd_feat_alpha"] = effective_alpha.detach()
-        self._advance_map_feature_distill_step()
+        output["map_kd_feat_point"] = sum(point_metrics, zero.detach())
+        output["map_kd_feat_rkd"] = sum(rkd_metrics, zero.detach())
         return output
 
     @force_fp32(apply_to=("model_outs"))

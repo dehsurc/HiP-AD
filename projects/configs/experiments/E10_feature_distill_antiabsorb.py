@@ -102,11 +102,8 @@ plan_speed_refer = None
 plan_anchor_refer = ('temp', '2hz')
 plan_anchor_types = [('temp', '2hz')]
 map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l345.pkl'
-# Keep teacher matching moderately dense, matching the weak-KD E9/E11 setup.
 map_feature_match_score_thr = 0.3
 map_feature_match_dist_thr = 2.0
-# Weak L345 feature KD with the teacher cache class order fixed to identity.
-# Weights sum to 1.0, so adding layer 3 does not inflate total KD magnitude.
 map_feature_distill_alpha = 0.1
 map_feature_distill_layers = (3, 4, 5)
 map_feature_distill_weights = (0.22, 0.33, 0.45)
@@ -114,19 +111,12 @@ map_feature_distill_cached_layers = (3, 4, 5)
 map_feature_distill_teacher_dim = 256
 map_feature_distill_kd_dim = 256
 map_feature_distill_num_classes = 3
-map_feature_distill_cls_cost_weight = 1.0
+map_feature_distill_cls_cost_weight = 0.0
 map_feature_distill_line_cost_weight = 1.0
-map_feature_distill_beta = 1.0
-map_feature_distill_warmup_start_alpha = 0.005
-map_feature_distill_warmup_start_iter = num_iters_per_epoch * 2
-map_feature_distill_warmup_iters = num_iters_per_epoch * 4
-# Anti-absorption knobs (new in E10; consumed by SparseOneDecoder).
 map_feature_distill_student_proj_depth = 1
 map_feature_distill_detach_point_embed = True
-map_feature_distill_rkd_weight = 2.0
-# Freeze W_s entirely so FD cannot be absorbed by the projector.
-map_feature_distill_freeze_student_proj = True
-# Use real GT map supervision as the main signal and keep feature KD weak.
+map_feature_distill_rkd_weight = 0.0
+map_feature_distill_freeze_student_proj = False
 map_gt_loss_weight = 1.0
 model = dict(
     type='SparseDetector',
@@ -205,10 +195,6 @@ model = dict(
             map_feature_distill_num_classes=map_feature_distill_num_classes,
             map_feature_distill_cls_cost_weight=map_feature_distill_cls_cost_weight,
             map_feature_distill_line_cost_weight=map_feature_distill_line_cost_weight,
-            map_feature_distill_beta=map_feature_distill_beta,
-            map_feature_distill_warmup_start_alpha=map_feature_distill_warmup_start_alpha,
-            map_feature_distill_warmup_start_iter=map_feature_distill_warmup_start_iter,
-            map_feature_distill_warmup_iters=map_feature_distill_warmup_iters,
             map_feature_distill_student_proj_depth=map_feature_distill_student_proj_depth,
             map_feature_distill_detach_point_embed=map_feature_distill_detach_point_embed,
             map_feature_distill_rkd_weight=map_feature_distill_rkd_weight,

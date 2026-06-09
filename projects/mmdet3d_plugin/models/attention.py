@@ -1,6 +1,5 @@
 import warnings
 import math
-import os
 
 import torch
 import torch.nn as nn
@@ -21,20 +20,17 @@ try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
     from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
     HAS_FLASH_ATTN = True
-    if os.environ.get("HIPAD_SHOW_STARTUP_PRINTS") == "1":
-        print('Use flash_attn_unpadded_kvpacked_func')
+    print('Use flash_attn_unpadded_kvpacked_func')
 except ImportError:
     try:
         from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func as flash_attn_unpadded_kvpacked_func
         from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
         HAS_FLASH_ATTN = True
-        if os.environ.get("HIPAD_SHOW_STARTUP_PRINTS") == "1":
-            print('Use flash_attn_varlen_kvpacked_func')
+        print('Use flash_attn_varlen_kvpacked_func')
     except ImportError:
         flash_attn_unpadded_kvpacked_func = None
         HAS_FLASH_ATTN = False
-        if os.environ.get("HIPAD_SHOW_STARTUP_PRINTS") == "1":
-            print('flash-attn not found; use torch scaled_dot_product_attention fallback')
+        print('flash-attn not found; use torch scaled_dot_product_attention fallback')
 
 
 def _in_projection_packed(q, k, v, w, b = None):

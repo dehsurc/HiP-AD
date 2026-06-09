@@ -66,9 +66,11 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     bbox_results = []
     mask_results = []
     dataset = data_loader.dataset
+    dataset_size = len(dataset)
     rank, world_size = get_dist_info()
     if rank == 0:
-        prog_bar = mmcv.ProgressBar(len(dataset))
+        prog_bar = mmcv.ProgressBar(dataset_size)
+        progress_count = 0
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
     have_mask = False
     for i, data in enumerate(data_loader):
@@ -94,25 +96,37 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                 bbox_results.extend(result)
 
         if rank == 0:
-            for _ in range(batch_size * world_size):
+            # Eval samplers may keep temporal sequences intact, so rank 0 can
+            # process more than len(dataset) / world_size samples. Clamp the
+            # display to the real dataset size; collection below already trims
+            # padded/extra results to dataset_size.
+            update_count = min(
+                batch_size * world_size, dataset_size - progress_count
+            )
+            for _ in range(update_count):
                 prog_bar.update()
+            progress_count += update_count
 
     # collect results from all ranks
     if gpu_collect:
-        bbox_results = collect_results_gpu(bbox_results, len(dataset))
+        bbox_results = collect_results_gpu(bbox_results, dataset_size)
         if have_mask:
-            mask_results = collect_results_gpu(mask_results, len(dataset))
+            mask_results = collect_results_gpu(mask_results, dataset_size)
         else:
             mask_results = None
     else:
-        bbox_results = collect_results_cpu(bbox_results, len(dataset), tmpdir)
+        bbox_results = collect_results_cpu(bbox_results, dataset_size, tmpdir)
         tmpdir = tmpdir + "_mask" if tmpdir is not None else None
         if have_mask:
             mask_results = collect_results_cpu(
-                mask_results, len(dataset), tmpdir
+                mask_results, dataset_size, tmpdir
             )
         else:
             mask_results = None
+
+    if rank == 0 and progress_count < dataset_size:
+        for _ in range(dataset_size - progress_count):
+            prog_bar.update()
 
     if mask_results is None:
         return bbox_results
@@ -168,4 +182,4 @@ def collect_results_cpu(result_part, size, tmpdir=None):
 
 
 def collect_results_gpu(result_part, size):
-    collect_results_cpu(result_part, size)
+    return collect_results_cpu(result_part, size)

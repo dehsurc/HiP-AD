@@ -40,9 +40,8 @@ det_class_names = [
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 map_class_names = ['ped_crossing', 'divider', 'boundary']
-map_teacher_class_names = ['divider', 'ped_crossing', 'boundary']
-map_teacher_to_student_class_perm = tuple(
-    map_teacher_class_names.index(name) for name in map_class_names)
+map_teacher_class_names = ['ped_crossing', 'divider', 'boundary']
+map_teacher_to_student_class_perm = None
 num_det_classes = 10
 num_map_classes = 3
 map_roi_size = (30, 60)
@@ -104,30 +103,22 @@ map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l345.p
 map_distill_alpha_cls = 0.0
 map_distill_alpha_reg = 0.0
 map_distill_temperature = 4.0
-# Lower teacher score threshold -> match more teacher polylines -> denser,
-# less sparse KD supervision (was 0.5, only ~5-6 matches/sample).
 map_distill_score_thr = 0.3
 map_distill_dist_thr = 2.0
 map_distill_last_layer_only = True
-# Weak l45 feature-KD reproduction (shared-space cosine objective):
-#   - use the best balanced l45 setup from the previous run.
-#   - the cache file stores layers 3/4/5, but only layers 4/5 are distilled.
-#   - weights sum to 1.0, so total KD magnitude is controlled by alpha.
 map_feature_distill_alpha = 0.05
-map_feature_distill_layers = (4, 5)
-map_feature_distill_weights = (0.42, 0.58)
+map_feature_distill_layers = (3, 4, 5)
+map_feature_distill_weights = (0.22, 0.33, 0.45)
 map_feature_distill_cached_layers = (3, 4, 5)
 map_feature_distill_teacher_dim = 256
 map_feature_distill_kd_dim = 256
 map_feature_distill_num_classes = 3
-map_feature_distill_cls_cost_weight = 1.0
+map_feature_distill_cls_cost_weight = 0.0
 map_feature_distill_line_cost_weight = 1.0
-map_feature_distill_beta = 1.0
-map_feature_distill_warmup_start_alpha = 0.005
-map_feature_distill_warmup_start_iter = num_iters_per_epoch * 2
-map_feature_distill_warmup_iters = num_iters_per_epoch * 4
-# Use real GT map supervision as the main signal and keep feature KD weak.
-# The zero map_distill_alpha_* values disable pseudo-GT / teacher-TP map KD.
+map_feature_distill_student_proj_depth = 1
+map_feature_distill_detach_point_embed = True
+map_feature_distill_rkd_weight = 0.0
+map_feature_distill_freeze_student_proj = False
 map_gt_loss_weight = 1.0
 map_distill_mode = 'pseudo_gt'
 model = dict(
@@ -210,10 +201,10 @@ model = dict(
             map_feature_distill_num_classes=map_feature_distill_num_classes,
             map_feature_distill_cls_cost_weight=map_feature_distill_cls_cost_weight,
             map_feature_distill_line_cost_weight=map_feature_distill_line_cost_weight,
-            map_feature_distill_beta=map_feature_distill_beta,
-            map_feature_distill_warmup_start_alpha=map_feature_distill_warmup_start_alpha,
-            map_feature_distill_warmup_start_iter=map_feature_distill_warmup_start_iter,
-            map_feature_distill_warmup_iters=map_feature_distill_warmup_iters,
+            map_feature_distill_student_proj_depth=map_feature_distill_student_proj_depth,
+            map_feature_distill_detach_point_embed=map_feature_distill_detach_point_embed,
+            map_feature_distill_rkd_weight=map_feature_distill_rkd_weight,
+            map_feature_distill_freeze_student_proj=map_feature_distill_freeze_student_proj,
             map_teacher_to_student_class_perm=map_teacher_to_student_class_perm,
             det_instance_bank=dict(
                 type='InstanceBank',

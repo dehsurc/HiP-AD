@@ -127,6 +127,10 @@ class BBoxRotation(object):
             results["teacher_boxes"] = self.box_rotate(
                 results["teacher_boxes"], angle
             )
+        if "teacher_map_pts" in results and angle != 0:
+            results["teacher_map_pts"] = self.map_pts_rotate(
+                results["teacher_map_pts"], angle
+            )
         return results
 
     @staticmethod
@@ -142,6 +146,13 @@ class BBoxRotation(object):
             vel_dims = bbox_3d[:, 7:].shape[-1]
             bbox_3d[:, 7:] = bbox_3d[:, 7:] @ rot_mat_T[:vel_dims, :vel_dims]
         return bbox_3d
+
+    @staticmethod
+    def map_pts_rotate(map_pts, angle):
+        rot_cos = np.cos(angle)
+        rot_sin = np.sin(angle)
+        rot_mat_T = np.array([[rot_cos, rot_sin], [-rot_sin, rot_cos]])
+        return map_pts @ rot_mat_T
 
 
 @PIPELINES.register_module()
