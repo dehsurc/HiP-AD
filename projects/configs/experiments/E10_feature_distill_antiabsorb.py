@@ -7,10 +7,12 @@ version = 'trainval'
 length = dict(trainval=28130, mini=323)
 num_gpus = 2
 batch_size = 8
-num_iters_per_epoch = 1758
+# dataset size (28128 = old 1758 iters * old global batch 16); keep epochs fixed
+# regardless of batch by deriving iters from the current global batch.
+num_iters_per_epoch = 28128 // (num_gpus * batch_size)
 num_epochs = 12
 checkpoint_epoch_interval = 3
-checkpoint_config = dict(interval=1758, max_keep_ckpts=2)
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=2)
 wandb_project = 'hipad'
 wandb_name = 'E10_l345_a0p05_gt1_identity_teacher'
 log_config = dict(
@@ -179,6 +181,7 @@ model = dict(
             num_command=3,
             with_ego_instance_feature=True,
             with_incremental_plan_refine=True,
+            with_distance_attn_mask=True,
             motion_anchor='data/kmeans/kmeans_motion_6.npy',
             cls_threshold_to_reg=0.05,
             # These two constructor args are used by feature-KD matching here:
@@ -263,13 +266,20 @@ model = dict(
             temp_graph_model=dict(
                 type='TemporalSeparateAttention',
                 query_select=['det', 'map', 'plan', 'ego'],
-                query_list=[['det'], ['map'], ['plan', 'ego']],
-                key_list=[['det'], ['map'], ['det', 'map']],
-                decouple_list=[True, False, False],
+                query_list=[['det'], ['map'], ['plan', 'ego'], ['plan', 'ego']],
+                key_list=[['det'], ['map'], ['plan', 'ego'], ['det', 'map']],
+                decouple_list=[True, False, False, False],
+                use_updated_query=True,
                 attn=[
                     dict(
                         type='MultiheadFlashAttention',
                         embed_dims=512,
+                        num_heads=8,
+                        batch_first=True,
+                        dropout=0.1),
+                    dict(
+                        type='MultiheadFlashAttention',
+                        embed_dims=256,
                         num_heads=8,
                         batch_first=True,
                         dropout=0.1),
@@ -289,8 +299,9 @@ model = dict(
             graph_model=dict(
                 type='SeparateAttention',
                 query_select=['det', 'map', 'plan', 'ego'],
-                separate_list=[['det'], ['map']],
-                decouple_list=[True, False],
+                separate_list=[['det'], ['map'], ['plan', 'ego']],
+                decouple_list=[True, False, False],
+                with_distance_attn_mask=False,
                 attn=[
                     dict(
                         type='MultiheadFlashAttention',
@@ -303,14 +314,21 @@ model = dict(
                         embed_dims=256,
                         num_heads=8,
                         batch_first=True,
+                        dropout=0.1),
+                    dict(
+                        type='MultiheadFlashAttention',
+                        embed_dims=256,
+                        num_heads=8,
+                        batch_first=True,
                         dropout=0.1)
                 ]),
             inter_graph_model=dict(
-                type='InteractiveAttention',
+                type='SeparateAttention',
                 query_select=['det', 'map', 'plan', 'ego'],
-                query_list=[['plan', 'ego']],
-                key_list=[['det', 'map']],
+                separate_list=[['det', 'map', 'plan', 'ego']],
                 decouple_list=[False],
+                with_distance_attn_mask=True,
+                with_structured_mask=True,
                 attn=[
                     dict(
                         type='MultiheadFlashAttention',
@@ -471,7 +489,8 @@ model = dict(
                 loss_box=dict(type='L1Loss', loss_weight=0.25),
                 loss_centerness=dict(
                     type='CrossEntropyLoss', use_sigmoid=True),
-                loss_yawness=dict(type='GaussianFocalLoss')),
+                loss_yawness=dict(type='GaussianFocalLoss'),
+                cls_allow_reverse=[det_class_names.index('barrier')]),
             loss_map_cls=dict(
                 type='FocalLoss',
                 use_sigmoid=True,
@@ -693,7 +712,7 @@ data_aug_conf = dict(
     rand_flip=True,
     rot3d_range=[0, 0])
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=batch_size,
     workers_per_gpu=8,
     train=dict(
         type='NuScenes3DDataset',
@@ -980,7 +999,7 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=0.3333333333333333,
     min_lr_ratio=0.001)
-runner = dict(type='IterBasedRunner', max_iters=21096)
+runner = dict(type='IterBasedRunner', max_iters=num_iters_per_epoch * num_epochs)
 eval_mode = dict(
     with_det=True,
     with_tracking=False,
@@ -990,7 +1009,7 @@ eval_mode = dict(
     tracking_threshold=0.2,
     motion_threshhold=0.2)
 evaluation = dict(
-    interval=5274,
+    interval=num_iters_per_epoch * checkpoint_epoch_interval,
     jsonfile_prefix='val/',
     eval_mode=dict(
         with_det=True,

@@ -9,8 +9,11 @@ if not getattr(_torch_for_patch.load, "_hipad_legacy_default_patched", False):
     _torch_for_patch.load = _patched_torch_load
 
 # torch 2.6+ `_get_stream` requires torch.device; mmcv 1.7.1 still passes int indices.
+# On torch < 2.6 (e.g. 1.13) `_get_stream(device: int)` indexes a list by int,
+# so converting to torch.device breaks it -- only apply the patch on 2.6+.
 from torch.nn.parallel import _functions as _torch_parallel_funcs
-if not getattr(_torch_parallel_funcs._get_stream, "_hipad_intdev_patched", False):
+_torch_ver = tuple(int(x) for x in _torch_for_patch.__version__.split("+")[0].split(".")[:2])
+if _torch_ver >= (2, 6) and not getattr(_torch_parallel_funcs._get_stream, "_hipad_intdev_patched", False):
     _orig_get_stream = _torch_parallel_funcs._get_stream
     def _patched_get_stream(device):
         if isinstance(device, int):

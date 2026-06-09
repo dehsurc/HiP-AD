@@ -99,7 +99,9 @@ class PlanningMetric():
             box_coll = self.evaluate_single_coll(trajs[i], fut_boxes)
             box_coll = torch.logical_and(box_coll, torch.logical_not(gt_box_coll))
             
-            obj_coll_sum += gt_box_coll.long()
+            # obj_coll: predicted trajectory vs future boxes, raw (no GT-filter)
+            pred_box_coll = self.evaluate_single_coll(trajs[i], fut_boxes)
+            obj_coll_sum += pred_box_coll.long()
             obj_box_coll_sum += box_coll.long()
 
         return obj_coll_sum, obj_box_coll_sum

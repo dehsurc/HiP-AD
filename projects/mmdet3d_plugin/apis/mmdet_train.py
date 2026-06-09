@@ -33,6 +33,7 @@ from projects.mmdet3d_plugin.core.evaluation.eval_hooks import (
     CustomDistEvalHook,
 )
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
+from projects.mmdet3d_plugin.core.hooks import PCGradOptimizerHook
 
 
 def custom_train_detector(
@@ -137,9 +138,18 @@ def custom_train_detector(
     # an ugly workaround to make .log and .log.json filenames the same
     runner.timestamp = timestamp
 
-    # fp16 setting
+    # fp16 / PCGrad setting
+    pcgrad_cfg = cfg.get("pcgrad", None)
     fp16_cfg = cfg.get("fp16", None)
-    if fp16_cfg is not None:
+    if pcgrad_cfg is not None:
+        # Flip the per-task loss grouping inside SparseDetector.train_step
+        inner = model.module if hasattr(model, 'module') else model
+        inner._pcgrad_enabled = True
+        # PCGrad replaces the standard optimizer hook
+        grad_clip = cfg.optimizer_config.get('grad_clip', None)
+        optimizer_config = PCGradOptimizerHook(
+            grad_clip=grad_clip, **pcgrad_cfg)
+    elif fp16_cfg is not None:
         optimizer_config = Fp16OptimizerHook(
             **cfg.optimizer_config, **fp16_cfg, distributed=distributed
         )
