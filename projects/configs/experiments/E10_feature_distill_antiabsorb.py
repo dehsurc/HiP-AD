@@ -5,8 +5,8 @@ plugin_dir = 'projects/mmdet3d_plugin/'
 work_dir = 'work_dirs/exp/E10_l345_a0p05_gt1_identity_teacher'
 version = 'trainval'
 length = dict(trainval=28130, mini=323)
-num_gpus = 2
-batch_size = 8
+num_gpus = 4
+batch_size = 4
 # dataset size (28128 = old 1758 iters * old global batch 16); keep epochs fixed
 # regardless of batch by deriving iters from the current global batch.
 num_iters_per_epoch = 28128 // (num_gpus * batch_size)
@@ -113,12 +113,25 @@ map_feature_distill_cached_layers = (3, 4, 5)
 map_feature_distill_teacher_dim = 256
 map_feature_distill_kd_dim = 256
 map_feature_distill_num_classes = 3
-map_feature_distill_cls_cost_weight = 0.0
-map_feature_distill_line_cost_weight = 1.0
+# Match E8's MapQueriesCost weights (FocalLossCost 1.0 : LinesL1Cost 10.0).
+# Only the cls:line ratio matters for Hungarian matching; the dist_thr cutoff
+# is applied to the unweighted line cost, so it is unaffected by this scaling.
+map_feature_distill_cls_cost_weight = 1.0
+map_feature_distill_line_cost_weight = 10.0
 map_feature_distill_student_proj_depth = 1
 map_feature_distill_detach_point_embed = True
 map_feature_distill_rkd_weight = 0.0
-map_feature_distill_freeze_student_proj = False
+# Close the two KD-metric inflation paths:
+# (1) feat_only: drop the cls-prob/xy concat from projector inputs. Matched
+#     pairs have near-identical coords, so a projector reading them can reach
+#     high cosine while ignoring the 256-dim feature.
+# (2) freeze_student_proj: with BOTH projectors frozen at random init, nothing
+#     learnable sits between instance_features and the loss — the only way to
+#     reduce it is to move the features themselves (no absorption possible).
+# Track map_kd_feat_raw_rel (projector-free pairwise-distance correlation) to
+# verify transfer actually reaches the raw features.
+map_feature_distill_feat_only = True
+map_feature_distill_freeze_student_proj = True
 map_gt_loss_weight = 1.0
 model = dict(
     type='SparseDetector',
@@ -201,6 +214,7 @@ model = dict(
             map_feature_distill_student_proj_depth=map_feature_distill_student_proj_depth,
             map_feature_distill_detach_point_embed=map_feature_distill_detach_point_embed,
             map_feature_distill_rkd_weight=map_feature_distill_rkd_weight,
+            map_feature_distill_feat_only=map_feature_distill_feat_only,
             map_feature_distill_freeze_student_proj=map_feature_distill_freeze_student_proj,
             map_teacher_to_student_class_perm=map_teacher_to_student_class_perm,
             det_instance_bank=dict(

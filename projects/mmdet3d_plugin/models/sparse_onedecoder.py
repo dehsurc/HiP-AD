@@ -186,6 +186,12 @@ class SparseOneDecoder(BaseModule):
             map_feature_distill_student_proj_depth=2,
             map_feature_distill_detach_point_embed=False,
             map_feature_distill_rkd_weight=0.0,
+            # When True, projector inputs are features only (student:
+            # instance_feature + point_embed, teacher: cached feature). The
+            # cls-prob/xy concat is dropped: matched pairs have near-identical
+            # coords, so a projector reading them can score high cosine while
+            # ignoring the 256-dim feature entirely.
+            map_feature_distill_feat_only=False,
             map_teacher_to_student_class_perm=None,
 
             **kwargs,
@@ -259,6 +265,8 @@ class SparseOneDecoder(BaseModule):
             map_feature_distill_detach_point_embed)
         self.map_feature_distill_rkd_weight = float(
             map_feature_distill_rkd_weight)
+        self.map_feature_distill_feat_only = bool(
+            map_feature_distill_feat_only)
         self.map_teacher_to_student_class_perm = (
             None if map_teacher_to_student_class_perm is None
             else tuple(map_teacher_to_student_class_perm)
@@ -336,8 +344,12 @@ class SparseOneDecoder(BaseModule):
                 )
 
             if self.map_use_feature_distill:
-                student_in_dim = embed_dims + self.map_feature_distill_num_classes + 2
-                teacher_in_dim = self.map_feature_distill_teacher_dim + self.map_feature_distill_num_classes + 2
+                if self.map_feature_distill_feat_only:
+                    student_in_dim = embed_dims
+                    teacher_in_dim = self.map_feature_distill_teacher_dim
+                else:
+                    student_in_dim = embed_dims + self.map_feature_distill_num_classes + 2
+                    teacher_in_dim = self.map_feature_distill_teacher_dim + self.map_feature_distill_num_classes + 2
                 kd_dim = self.map_feature_distill_kd_dim
                 self.map_feature_anchor_proj = nn.Sequential(
                     nn.Linear(2, embed_dims),
@@ -1897,6 +1909,7 @@ class SparseOneDecoder(BaseModule):
             output["map_kd_feat_alpha"] = effective_alpha.detach()
             output["map_kd_feat_point"] = zero.detach()
             output["map_kd_feat_rkd"] = zero.detach()
+            output["map_kd_feat_raw_rel"] = zero.detach()
             return output
 
         student_features = model_outs.get("instance_features", [])
@@ -1971,8 +1984,12 @@ class SparseOneDecoder(BaseModule):
                 s_cls = s_cls[:, None].expand(-1, num_pts, -1)
                 t_cls = t_cls[:, None].expand(-1, num_pts, -1)
 
-                s_input = torch.cat([s_feat, s_cls, s_pts], dim=-1)
-                t_input = torch.cat([t_feat, t_cls, t_pts], dim=-1).detach()
+                if self.map_feature_distill_feat_only:
+                    s_input = s_feat
+                    t_input = t_feat.detach()
+                else:
+                    s_input = torch.cat([s_feat, s_cls, s_pts], dim=-1)
+                    t_input = torch.cat([t_feat, t_cls, t_pts], dim=-1).detach()
                 s_proj = self.map_feature_student_proj(s_input)
                 # Teacher is a fixed target in the shared KD space: stop-grad on
                 # both the cached features and the teacher projector, so this is
@@ -2041,7 +2058,54 @@ class SparseOneDecoder(BaseModule):
         output["map_kd_feat_alpha"] = effective_alpha.detach()
         output["map_kd_feat_point"] = sum(point_metrics, zero.detach())
         output["map_kd_feat_rkd"] = sum(rkd_metrics, zero.detach())
+        output["map_kd_feat_raw_rel"] = (
+            zero.detach() + self._map_feature_raw_relation_metric(
+                student_features, teacher_features, matches))
         return output
+
+    def _map_feature_raw_relation_metric(
+            self, student_features, teacher_features, matches):
+        """Projector-free transfer gauge for the map feature KD path.
+
+        Pearson correlation between raw student and raw teacher pairwise
+        feature distances over matched queries (final KD layer, teacher
+        features mean-pooled over points). Pairwise distances are invariant
+        to a basis change, so this is meaningful across the two encoders'
+        different feature spaces, and no learnable module sits between the
+        features and the metric — it cannot be inflated by projector
+        absorption. If KD actually reshapes instance_features this rises;
+        if only the projector is absorbing the loss it stays flat.
+        """
+        last_idx = self.map_feature_distill_layers[-1]
+        if len(student_features) <= last_idx:
+            return 0.0
+        s_feature_layer = student_features[last_idx]
+        t_feature_layer = self._select_teacher_map_feature_layer(
+            teacher_features, len(self.map_feature_distill_layers) - 1,
+            last_idx)
+        corrs = []
+        with torch.no_grad():
+            for b, match in enumerate(matches):
+                if match is None or match[0].numel() < 3:
+                    continue
+                student_idx, teacher_idx, _ = match
+                s_q = F.normalize(
+                    s_feature_layer[b, student_idx].float(), dim=-1)
+                t_q = F.normalize(
+                    t_feature_layer[b, teacher_idx].float().mean(dim=1),
+                    dim=-1)
+                offdiag = ~torch.eye(
+                    s_q.size(0), dtype=torch.bool, device=s_q.device)
+                s_d = torch.cdist(s_q, s_q)[offdiag]
+                t_d = torch.cdist(t_q, t_q)[offdiag]
+                s_d = s_d - s_d.mean()
+                t_d = t_d - t_d.mean()
+                denom = s_d.norm() * t_d.norm()
+                if denom > 1e-6:
+                    corrs.append((s_d * t_d).sum() / denom)
+        if not corrs:
+            return 0.0
+        return torch.stack(corrs).mean().detach()
 
     @force_fp32(apply_to=("model_outs"))
     def loss_map(self, model_outs, data):
