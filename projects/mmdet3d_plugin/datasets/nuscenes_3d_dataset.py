@@ -387,14 +387,33 @@ class NuScenes3DDataset(Dataset):
                 geom = LineString(anno)
                 map_geoms[label].append(geom)
         return map_geoms
-    
+
+    def _rebase_path(self, path):
+        """Rebase an absolute data path stored in the infos pkl onto the local
+        ``data_root``.
+
+        The infos may have been generated on another machine, so paths like
+        ``/some/other/root/nuscenes/samples/CAM_FRONT/xxx.jpg`` are stored as
+        absolute. We relocate them by the nuScenes-relative segment
+        (``samples/``/``sweeps/``/``maps/``) so the dataset works regardless of
+        where it was preprocessed, as long as ``data_root`` points to the local
+        nuScenes root.
+        """
+        if not path or not self.data_root:
+            return path
+        for seg in ("samples/", "sweeps/", "maps/"):
+            idx = path.find("/" + seg)
+            if idx != -1:
+                return osp.join(self.data_root, path[idx + 1:])
+        return path
+
     def get_data_info(self, index):
         info = self.data_infos[index]
         ego_status, ego_status_mask = self._build_ego_status(info)
         input_dict = dict(
             token=info["token"],
             map_location=info["map_location"],
-            pts_filename=info["lidar_path"],
+            pts_filename=self._rebase_path(info["lidar_path"]),
             sweeps=info["sweeps"],
             timestamp=info["timestamp"] / 1e6,
             lidar2ego_translation=info["lidar2ego_translation"],
@@ -426,7 +445,7 @@ class NuScenes3DDataset(Dataset):
             lidar2cam_rts = []
             cam_intrinsic = []
             for cam_type, cam_info in info["cams"].items():
-                image_paths.append(cam_info["data_path"])
+                image_paths.append(self._rebase_path(cam_info["data_path"]))
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info["sensor2lidar_rotation"])
                 lidar2cam_t = (

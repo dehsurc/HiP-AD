@@ -522,7 +522,7 @@ model = dict(
 # ================== data ========================
 dataset_type = "NuScenes3DDataset"
 data_root = "data/nuscenes/"
-eval_data_root = "data/infos/nuscenes/"
+eval_data_root = "data/nuscenes/"
 anno_root = "data/infos/" if version == 'trainval' else "data/infos/mini/"
 file_client_args = dict(backend="disk")
 

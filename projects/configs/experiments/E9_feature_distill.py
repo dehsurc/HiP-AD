@@ -100,7 +100,10 @@ plan_speed_refer = None
 plan_anchor_refer = ('temp', '2hz')
 plan_anchor_types = [('temp', '2hz')]
 map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l345.pkl'
-map_distill_alpha_cls = 0.0
+# 메인 동력: teacher 예측을 pseudo-GT로 student map head에 직접 supervision (metric 정렬).
+# pseudo_gt 모드에서 alpha는 on/off 게이트일 뿐 — 실제 KD weight는 loss_map_cls/reg(1.0/10.0)가
+# 담당하고, real GT loss(map_gt_loss_weight=1.0)와 별개로 매 decoder layer에 더해진다.
+map_distill_alpha_cls = 1.0
 map_distill_alpha_reg = 0.0
 map_distill_temperature = 4.0
 map_distill_score_thr = 0.3
@@ -117,7 +120,9 @@ map_feature_distill_cls_cost_weight = 0.0
 map_feature_distill_line_cost_weight = 1.0
 map_feature_distill_student_proj_depth = 1
 map_feature_distill_detach_point_embed = True
-map_feature_distill_rkd_weight = 0.0
+# 흡수 방지: per-query projector가 혼자 위조 못 하는 관계(pairwise)항 → feature KD가 실제로
+# instance_features에 gradient를 흘리도록 (보조 hint 역할 유지, alpha=0.05).
+map_feature_distill_rkd_weight = 0.5
 map_feature_distill_freeze_student_proj = False
 map_gt_loss_weight = 1.0
 map_distill_mode = 'pseudo_gt'
@@ -182,6 +187,7 @@ model = dict(
             num_command=3,
             with_ego_instance_feature=True,
             with_incremental_plan_refine=True,
+            with_distance_attn_mask=True,
             motion_anchor='data/kmeans/kmeans_motion_6.npy',
             cls_threshold_to_reg=0.05,
             map_distill_alpha_cls=map_distill_alpha_cls,
@@ -266,16 +272,24 @@ model = dict(
                 num_sample=6,
                 return_points_embed=True),
             custom_op=dict(type='CustomOperation'),
+            # === E10과 동일한 decoder 구조 (revision baseline) ===
             temp_graph_model=dict(
                 type='TemporalSeparateAttention',
                 query_select=['det', 'map', 'plan', 'ego'],
-                query_list=[['det'], ['map'], ['plan', 'ego']],
-                key_list=[['det'], ['map'], ['det', 'map']],
-                decouple_list=[True, False, False],
+                query_list=[['det'], ['map'], ['plan', 'ego'], ['plan', 'ego']],
+                key_list=[['det'], ['map'], ['plan', 'ego'], ['det', 'map']],
+                decouple_list=[True, False, False, False],
+                use_updated_query=True,
                 attn=[
                     dict(
                         type='MultiheadFlashAttention',
                         embed_dims=512,
+                        num_heads=8,
+                        batch_first=True,
+                        dropout=0.1),
+                    dict(
+                        type='MultiheadFlashAttention',
+                        embed_dims=256,
                         num_heads=8,
                         batch_first=True,
                         dropout=0.1),
@@ -295,8 +309,10 @@ model = dict(
             graph_model=dict(
                 type='SeparateAttention',
                 query_select=['det', 'map', 'plan', 'ego'],
-                separate_list=[['det'], ['map']],
-                decouple_list=[True, False],
+                separate_list=[['det'], ['map'], ['plan', 'ego']],
+                decouple_list=[True, False, False],
+                # per-task self-attn(gnn)에는 det_anchor가 plumbing되지 않으므로 τ·D 비활성화.
+                with_distance_attn_mask=False,
                 attn=[
                     dict(
                         type='MultiheadFlashAttention',
@@ -309,14 +325,21 @@ model = dict(
                         embed_dims=256,
                         num_heads=8,
                         batch_first=True,
+                        dropout=0.1),
+                    dict(
+                        type='MultiheadFlashAttention',
+                        embed_dims=256,
+                        num_heads=8,
+                        batch_first=True,
                         dropout=0.1)
                 ]),
             inter_graph_model=dict(
-                type='InteractiveAttention',
+                type='SeparateAttention',
                 query_select=['det', 'map', 'plan', 'ego'],
-                query_list=[['plan', 'ego']],
-                key_list=[['det', 'map']],
+                separate_list=[['det', 'map', 'plan', 'ego']],
                 decouple_list=[False],
+                with_distance_attn_mask=True,
+                with_structured_mask=True,
                 attn=[
                     dict(
                         type='MultiheadFlashAttention',
@@ -477,7 +500,8 @@ model = dict(
                 loss_box=dict(type='L1Loss', loss_weight=0.25),
                 loss_centerness=dict(
                     type='CrossEntropyLoss', use_sigmoid=True),
-                loss_yawness=dict(type='GaussianFocalLoss')),
+                loss_yawness=dict(type='GaussianFocalLoss'),
+                cls_allow_reverse=[det_class_names.index('barrier')]),
             loss_map_cls=dict(
                 type='FocalLoss',
                 use_sigmoid=True,
@@ -527,7 +551,7 @@ model = dict(
             motion_decoder=dict(type='SparseMotionDecoder'))))
 dataset_type = 'NuScenes3DDataset'
 data_root = 'data/nuscenes/'
-eval_data_root = 'data/infos/nuscenes/'
+eval_data_root = 'data/nuscenes/'
 anno_root = 'data/infos/'
 file_client_args = dict(backend='disk')
 img_norm_cfg = dict(
@@ -661,7 +685,7 @@ eval_config = dict(
         use_external=False),
     version='v1.0-trainval',
     work_dir=work_dir,
-    eval_data_root='data/infos/nuscenes/',
+    eval_data_root='data/nuscenes/',
     ann_file='data/infos/nuscenes_infos_val.pkl',
     pipeline=[
         dict(
@@ -853,7 +877,7 @@ data = dict(
                 use_external=False),
             version='v1.0-trainval',
             work_dir=work_dir,
-            eval_data_root='data/infos/nuscenes/',
+            eval_data_root='data/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
                 dict(
@@ -945,7 +969,7 @@ data = dict(
                 use_external=False),
             version='v1.0-trainval',
             work_dir=work_dir,
-            eval_data_root='data/infos/nuscenes/',
+            eval_data_root='data/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
                 dict(

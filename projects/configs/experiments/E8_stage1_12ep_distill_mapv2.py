@@ -497,7 +497,7 @@ model = dict(
             motion_decoder=dict(type='SparseMotionDecoder'))))
 dataset_type = 'NuScenes3DDataset'
 data_root = 'data/nuscenes/'
-eval_data_root = 'data/infos/nuscenes/'
+eval_data_root = 'data/nuscenes/'
 anno_root = 'data/infos/'
 file_client_args = dict(backend='disk')
 img_norm_cfg = dict(
@@ -631,7 +631,7 @@ eval_config = dict(
         use_external=False),
     version='v1.0-trainval',
     work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-    eval_data_root='data/infos/nuscenes/',
+    eval_data_root='data/nuscenes/',
     ann_file='data/infos/nuscenes_infos_val.pkl',
     pipeline=[
         dict(
@@ -817,7 +817,7 @@ data = dict(
                 use_external=False),
             version='v1.0-trainval',
             work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-            eval_data_root='data/infos/nuscenes/',
+            eval_data_root='data/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
                 dict(
@@ -909,7 +909,7 @@ data = dict(
                 use_external=False),
             version='v1.0-trainval',
             work_dir='work_dirs/exp/E8_stage1_12ep_distill_mapv2',
-            eval_data_root='data/infos/nuscenes/',
+            eval_data_root='data/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
                 dict(
