@@ -181,17 +181,27 @@ class SparseOneDecoder(BaseModule):
             map_feature_distill_num_classes=3,
             map_feature_distill_cls_cost_weight=1.0,
             map_feature_distill_line_cost_weight=1.0,
-            # Optional controls for the point-conditioned feature KD path.
+            # Optional controls for the point-token feature KD path.
             map_feature_distill_freeze_student_proj=False,
             map_feature_distill_student_proj_depth=2,
             map_feature_distill_detach_point_embed=False,
-            map_feature_distill_rkd_weight=0.0,
-            # When True, projector inputs are features only (student:
-            # instance_feature + point_embed, teacher: cached feature). The
-            # cls-prob/xy concat is dropped: matched pairs have near-identical
-            # coords, so a projector reading them can score high cosine while
-            # ignoring the 256-dim feature entirely.
-            map_feature_distill_feat_only=False,
+            map_feature_distill_rkd_weight=0.0,  # legacy no-op in clean KD.
+            map_feature_distill_use_point_tokens=False,
+            map_feature_distill_point_aux_weight=0.0,
+            map_feature_distill_point_tokens_as_main=False,
+            map_feature_distill_feat_only=False,  # legacy no-op in clean KD.
+            # When True, the KD target is the raw cached teacher feature.
+            map_feature_distill_teacher_identity=False,
+            # When True, geometrically matched pairs are kept only if both
+            # sides agree on the argmax class. Geometry decides WHICH instances
+            # pair up; class only vetoes cross-class pairs (e.g. a divider
+            # matched to a parallel boundary under a loose dist_thr). Unlike a
+            # soft cls matching cost, this cannot reshuffle the assignment.
+            map_feature_distill_same_class_only=False,
+            # "direct": student prediction <-> teacher prediction matching.
+            # "gt_anchor": student and teacher are paired only when both are
+            # assigned to the same real GT map element.
+            map_feature_match_mode="direct",
             map_teacher_to_student_class_perm=None,
 
             **kwargs,
@@ -263,15 +273,31 @@ class SparseOneDecoder(BaseModule):
             map_feature_distill_student_proj_depth)
         self.map_feature_distill_detach_point_embed = bool(
             map_feature_distill_detach_point_embed)
-        self.map_feature_distill_rkd_weight = float(
-            map_feature_distill_rkd_weight)
-        self.map_feature_distill_feat_only = bool(
-            map_feature_distill_feat_only)
+        self.map_feature_distill_use_point_tokens = bool(
+            map_feature_distill_use_point_tokens)
+        self.map_feature_distill_point_aux_weight = float(
+            map_feature_distill_point_aux_weight)
+        self.map_feature_distill_point_tokens_as_main = bool(
+            map_feature_distill_point_tokens_as_main)
+        self.map_feature_distill_teacher_identity = bool(
+            map_feature_distill_teacher_identity)
+        self.map_feature_distill_same_class_only = bool(
+            map_feature_distill_same_class_only)
+        self.map_feature_match_mode = str(map_feature_match_mode)
+        if self.map_feature_match_mode not in ("direct", "gt_anchor"):
+            raise ValueError(
+                "map_feature_match_mode must be either 'direct' or "
+                f"'gt_anchor', got {self.map_feature_match_mode}")
         self.map_teacher_to_student_class_perm = (
             None if map_teacher_to_student_class_perm is None
             else tuple(map_teacher_to_student_class_perm)
         )
         self.map_use_feature_distill = map_feature_distill_alpha > 0
+        self.map_use_point_token_branch = (
+            self.map_use_feature_distill or
+            self.map_feature_distill_use_point_tokens or
+            self.map_feature_distill_point_tokens_as_main or
+            self.map_feature_distill_point_aux_weight > 0)
         if len(self.map_feature_distill_layers) != len(self.map_feature_distill_weights):
             raise ValueError(
                 "map_feature_distill_layers and map_feature_distill_weights "
@@ -343,32 +369,28 @@ class SparseOneDecoder(BaseModule):
                     nn.Linear(embed_dims, embed_dims),
                 )
 
-            if self.map_use_feature_distill:
-                if self.map_feature_distill_feat_only:
-                    student_in_dim = embed_dims
-                    teacher_in_dim = self.map_feature_distill_teacher_dim
-                else:
-                    student_in_dim = embed_dims + self.map_feature_distill_num_classes + 2
-                    teacher_in_dim = self.map_feature_distill_teacher_dim + self.map_feature_distill_num_classes + 2
+            if self.map_use_point_token_branch:
+                student_in_dim = embed_dims
+                teacher_in_dim = self.map_feature_distill_teacher_dim
                 kd_dim = self.map_feature_distill_kd_dim
                 self.map_feature_anchor_proj = nn.Sequential(
                     nn.Linear(2, embed_dims),
                     nn.ReLU(inplace=True),
                     nn.Linear(embed_dims, embed_dims),
                 )
-                # Symmetric projection into a shared KD space (kd_dim): student
-                # and teacher are each mapped by an MLP, then aligned with an
-                # L2-normalized cosine objective (see
-                # _compute_map_feature_distill_loss). This replaces the previous
-                # asymmetric setup (student MLP -> raw teacher dim, Identity
-                # teacher) whose smooth-L1 regression onto un-normalized teacher
-                # features plateaued (~25 floor). The teacher projector is kept
-                # frozen (stop-grad target) so the shared space cannot collapse
-                # to a trivial constant.
+                self.map_feature_point_token_proj = nn.Sequential(
+                    nn.Linear(embed_dims, embed_dims),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(embed_dims, embed_dims),
+                )
+                self.map_feature_point_aux_head = nn.Sequential(
+                    nn.Linear(embed_dims, embed_dims),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(embed_dims, 2),
+                )
+                # Clean point-feature KD: build a real student point token, map it
+                # into the teacher feature space, and align by normalized cosine.
                 if self.map_feature_distill_student_proj_depth <= 1:
-                    # Minimal regressor: a single linear is enough to bridge the
-                    # two feature spaces but gives the projector little room to
-                    # absorb the alignment on its own.
                     self.map_feature_student_proj = nn.Sequential(
                         nn.Linear(student_in_dim, kd_dim),
                     )
@@ -378,11 +400,19 @@ class SparseOneDecoder(BaseModule):
                         nn.ReLU(inplace=True),
                         nn.Linear(kd_dim, kd_dim),
                     )
-                self.map_feature_teacher_proj = nn.Sequential(
-                    nn.Linear(teacher_in_dim, kd_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(kd_dim, kd_dim),
-                )
+                if self.map_feature_distill_teacher_identity:
+                    if self.map_feature_distill_teacher_dim != kd_dim:
+                        raise ValueError(
+                            "map_feature_distill_teacher_identity requires "
+                            "kd_dim == teacher_dim; got "
+                            f"{kd_dim} vs {self.map_feature_distill_teacher_dim}")
+                    self.map_feature_teacher_proj = nn.Identity()
+                else:
+                    self.map_feature_teacher_proj = nn.Sequential(
+                        nn.Linear(teacher_in_dim, kd_dim),
+                        nn.ReLU(inplace=True),
+                        nn.Linear(kd_dim, kd_dim),
+                    )
                 for p in self.map_feature_teacher_proj.parameters():
                     p.requires_grad_(False)
                 if self.map_feature_distill_freeze_student_proj:
@@ -1063,6 +1093,8 @@ class SparseOneDecoder(BaseModule):
                     map_anchor, map_cls, map_qt = self.map_refine[refine_i](
                         map_instance_feature, map_anchor, map_anchor_embed, time_interval=time_interval,
                         return_cls=True)
+                    map_anchor = self._refine_map_anchor_with_point_tokens(
+                        map_instance_feature, map_anchor)
                     map_prediction.append(map_anchor)
                     map_classification.append(map_cls)
                     map_quality.append(map_qt)
@@ -1780,6 +1812,8 @@ class SparseOneDecoder(BaseModule):
         if self.map_use_feature_distill:
             modules = (
                 self.map_feature_anchor_proj,
+                self.map_feature_point_token_proj,
+                self.map_feature_point_aux_head,
                 self.map_feature_student_proj,
                 self.map_feature_teacher_proj,
             )
@@ -1822,6 +1856,46 @@ class SparseOneDecoder(BaseModule):
             "the configured feature distill layers; got "
             f"{num_cached_layers} layers for {self.map_feature_distill_layers}"
         )
+
+    def _map_point_index_encoding(self, num_pts, dim, device, dtype):
+        """Fixed sinusoidal encoding for a point's order within a polyline."""
+        position = torch.arange(
+            num_pts, device=device, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2, device=device, dtype=torch.float32) *
+            (-math.log(10000.0) / max(dim, 1)))
+        angles = position * div_term
+        pe = torch.zeros(num_pts, dim, device=device, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(angles)
+        if dim > 1:
+            pe[:, 1::2] = torch.cos(angles[:, :pe[:, 1::2].shape[1]])
+        return pe.to(dtype=dtype)
+
+    def _build_map_student_point_tokens(self, query_feature, points):
+        """Create student point tokens from one map-query feature per polyline."""
+        num_pts = points.shape[-2]
+        point_embed = self.map_feature_anchor_proj(points)
+        index_embed = self._map_point_index_encoding(
+            num_pts, point_embed.size(-1), point_embed.device,
+            point_embed.dtype)
+        while index_embed.dim() < point_embed.dim():
+            index_embed = index_embed.unsqueeze(0)
+        point_embed = point_embed + index_embed
+        if self.map_feature_distill_detach_point_embed:
+            point_embed = point_embed.detach()
+        if query_feature.dim() == 2:
+            point_seed = query_feature[:, None, :] + point_embed
+        else:
+            point_seed = query_feature[:, :, None, :] + point_embed
+        return self.map_feature_point_token_proj(point_seed)
+
+    def _refine_map_anchor_with_point_tokens(self, query_feature, anchor):
+        if not self.map_feature_distill_point_tokens_as_main:
+            return anchor
+        points = anchor.reshape(anchor.shape[0], anchor.shape[1], -1, 2)
+        point_tokens = self._build_map_student_point_tokens(query_feature, points)
+        points = points + self.map_feature_point_aux_head(point_tokens)
+        return points.flatten(-2, -1)
 
     def _match_map_teacher_student(self, student_cls, student_reg, data):
         """Hungarian match final-layer student map queries to teacher polylines."""
@@ -1886,7 +1960,136 @@ class SparseOneDecoder(BaseModule):
                 valid_col_idx = valid_col_idx[keep]
                 teacher_idx = teacher_valid[valid_col_idx]
                 reverse_flag = reverse[student_idx, valid_col_idx]
-                matches.append((student_idx, teacher_idx, reverse_flag))
+                match_dist = line_cost[student_idx, valid_col_idx]
+                if self.map_feature_distill_same_class_only:
+                    s_lbl = student_cls[b, student_idx, :num_cls].argmax(-1)
+                    t_lbl = teacher_logits[b, teacher_idx, :num_cls].argmax(-1)
+                    same = s_lbl == t_lbl
+                    if not same.any():
+                        matches.append(None)
+                        continue
+                    student_idx = student_idx[same]
+                    teacher_idx = teacher_idx[same]
+                    reverse_flag = reverse_flag[same]
+                    match_dist = match_dist[same]
+                teacher_label = teacher_logits[
+                    b, teacher_idx, :num_cls].argmax(-1)
+                teacher_score = teacher_scores[b, teacher_idx]
+                matches.append((
+                    student_idx, teacher_idx, reverse_flag,
+                    teacher_label, teacher_score, match_dist))
+
+        return matches
+
+    def _match_map_teacher_student_gt_anchor(self, student_cls, student_reg, data):
+        """Pair student/teacher map queries through the same real GT polyline."""
+        teacher_logits = self._remap_teacher_map_logits(
+            data["teacher_map_logits"])
+        teacher_pts = data["teacher_map_pts"]
+        teacher_scores = data["teacher_map_scores"]
+        gt_labels = data.get("gt_map_labels", None)
+        gt_pts = data.get("gt_map_pts", None)
+        sampler_indices = getattr(self.map_sampler, "indices", None)
+
+        bs = student_cls.shape[0]
+        device = student_cls.device
+        num_cls = min(
+            student_cls.shape[-1],
+            teacher_logits.shape[-1],
+            self.map_feature_distill_num_classes,
+        )
+        student_pts = student_reg[..., : len(self.map_reg_weights)].reshape(
+            bs, student_reg.shape[1], -1, 2)
+
+        if gt_labels is None or gt_pts is None or sampler_indices is None:
+            return [None for _ in range(bs)]
+
+        matches = []
+        with torch.no_grad():
+            for b in range(bs):
+                if b >= len(sampler_indices) or sampler_indices[b] is None:
+                    matches.append(None)
+                    continue
+
+                pred_idx, gt_idx = sampler_indices[b][0], sampler_indices[b][1]
+                if pred_idx is None or gt_idx is None or len(pred_idx) == 0:
+                    matches.append(None)
+                    continue
+
+                pred_idx = torch.as_tensor(pred_idx, dtype=torch.long, device=device)
+                gt_idx = torch.as_tensor(gt_idx, dtype=torch.long, device=device)
+                gt_labels_b = gt_labels[b].to(device=device, dtype=torch.long)
+                gt_pts_b = gt_pts[b].to(device=device)
+                if gt_pts_b.dim() == 3:
+                    gt_pts_b = gt_pts_b[:, None]
+                if gt_labels_b.numel() == 0:
+                    matches.append(None)
+                    continue
+
+                score_mask = teacher_scores[b] > self.map_distill_score_thr
+                teacher_valid = torch.nonzero(score_mask, as_tuple=False).squeeze(-1)
+                if teacher_valid.numel() == 0:
+                    matches.append(None)
+                    continue
+
+                row_gt_labels = gt_labels_b[gt_idx]
+                t_logits = teacher_logits[b, teacher_valid, :num_cls]
+                t_labels = t_logits.argmax(-1)
+                t_pts = teacher_pts[b, teacher_valid]
+                num_pts = min(t_pts.shape[-2], gt_pts_b.shape[-2])
+                t_pts = t_pts[:, :num_pts]
+                gt_perm = gt_pts_b[gt_idx, :, :num_pts]
+
+                # line_cost[row, col]: teacher col's best line distance to
+                # the GT represented by row, minimizing over GT permutations.
+                diff = (gt_perm[:, None] - t_pts[None, :, None]).abs()
+                line_cost = diff.sum(-1).mean(-1).amin(-1)
+                if self.map_feature_distill_same_class_only:
+                    same = row_gt_labels[:, None] == t_labels[None]
+                    line_cost = torch.where(
+                        same, line_cost, torch.full_like(line_cost, 1e8))
+
+                if line_cost.numel() == 0:
+                    matches.append(None)
+                    continue
+
+                cost = self.map_feature_distill_line_cost_weight * line_cost
+                row_ind, col_ind = linear_sum_assignment(
+                    cost.detach().cpu().numpy())
+                if len(row_ind) == 0:
+                    matches.append(None)
+                    continue
+
+                row_ind = torch.as_tensor(row_ind, dtype=torch.long, device=device)
+                col_ind = torch.as_tensor(col_ind, dtype=torch.long, device=device)
+                match_dist = line_cost[row_ind, col_ind]
+                keep = match_dist <= self.map_distill_dist_thr
+                if not keep.any():
+                    matches.append(None)
+                    continue
+
+                row_ind = row_ind[keep]
+                col_ind = col_ind[keep]
+                match_dist = match_dist[keep]
+                student_idx = pred_idx[row_ind]
+                teacher_idx = teacher_valid[col_ind]
+
+                s_pts_pair = student_pts[b, student_idx]
+                t_pts_pair = teacher_pts[b, teacher_idx]
+                num_pair_pts = min(s_pts_pair.shape[-2], t_pts_pair.shape[-2])
+                s_pts_pair = s_pts_pair[:, :num_pair_pts]
+                t_pts_pair = t_pts_pair[:, :num_pair_pts]
+                dist_fwd = (s_pts_pair - t_pts_pair).abs().sum(-1).mean(-1)
+                dist_rev = (
+                    s_pts_pair - t_pts_pair.flip(dims=[1])).abs().sum(-1).mean(-1)
+                reverse_flag = dist_rev < dist_fwd
+
+                teacher_label = teacher_logits[
+                    b, teacher_idx, :num_cls].argmax(-1)
+                teacher_score = teacher_scores[b, teacher_idx]
+                matches.append((
+                    student_idx, teacher_idx, reverse_flag,
+                    teacher_label, teacher_score, match_dist))
 
         return matches
 
@@ -1907,25 +2110,23 @@ class SparseOneDecoder(BaseModule):
             output["map_loss_kd_feat"] = zero
             output["map_kd_feat_matches"] = zero
             output["map_kd_feat_alpha"] = effective_alpha.detach()
-            output["map_kd_feat_point"] = zero.detach()
-            output["map_kd_feat_rkd"] = zero.detach()
-            output["map_kd_feat_raw_rel"] = zero.detach()
             return output
 
         student_features = model_outs.get("instance_features", [])
         cls_scores = model_outs["classification"]
         reg_preds = model_outs["prediction"]
         teacher_features = data["teacher_map_features"]
-        teacher_logits = self._remap_teacher_map_logits(
-            data["teacher_map_logits"])
         teacher_pts = data["teacher_map_pts"]
 
-        matches = self._match_map_teacher_student(cls_scores[-1], reg_preds[-1], data)
+        if self.map_feature_match_mode == "gt_anchor":
+            matches = self._match_map_teacher_student_gt_anchor(
+                cls_scores[-1], reg_preds[-1], data)
+        else:
+            matches = self._match_map_teacher_student(
+                cls_scores[-1], reg_preds[-1], data)
         matched_queries = sum(
             int(match[0].numel()) for match in matches if match is not None)
         kd_losses = []
-        point_metrics = []
-        rkd_metrics = []
 
         for layer_pos, (layer_idx, layer_weight) in enumerate(
                 zip(self.map_feature_distill_layers, self.map_feature_distill_weights)):
@@ -1937,32 +2138,22 @@ class SparseOneDecoder(BaseModule):
                 teacher_features, layer_pos, layer_idx)
 
             s_feature_layer = student_features[layer_idx]
-            s_cls_layer = cls_scores[layer_idx]
             s_pts_layer = reg_preds[layer_idx][..., : len(self.map_reg_weights)].reshape(
                 reg_preds[layer_idx].shape[0], reg_preds[layer_idx].shape[1], -1, 2)
-            num_cls = min(
-                s_cls_layer.shape[-1],
-                teacher_logits.shape[-1],
-                self.map_feature_distill_num_classes,
-            )
 
             layer_loss = zero
             num_terms = 0
-            layer_rkd = zero
-            num_rkd = 0
             for b, match in enumerate(matches):
                 if match is None:
                     continue
-                student_idx, teacher_idx, reverse_flag = match
+                student_idx, teacher_idx, reverse_flag = match[:3]
                 if student_idx.numel() == 0:
                     continue
 
                 s_feat = s_feature_layer[b, student_idx]
                 s_pts = s_pts_layer[b, student_idx].detach()
-                s_cls = s_cls_layer[b, student_idx, :num_cls].detach().sigmoid()
                 t_feat = t_feature_layer[b, teacher_idx]
                 t_pts = teacher_pts[b, teacher_idx].detach()
-                t_cls = teacher_logits[b, teacher_idx, :num_cls].detach().sigmoid()
 
                 if reverse_flag.any():
                     t_feat = t_feat.clone()
@@ -1975,74 +2166,30 @@ class SparseOneDecoder(BaseModule):
                 t_pts = t_pts[:, :num_pts]
                 t_feat = t_feat[:, :num_pts]
 
-                s_point_embed = self.map_feature_anchor_proj(s_pts)
-                if self.map_feature_distill_detach_point_embed:
-                    # Keep the learnable anchor_proj out of the KD gradient path so
-                    # it cannot absorb the alignment instead of instance_features.
-                    s_point_embed = s_point_embed.detach()
-                s_feat = s_feat[:, None].expand(-1, num_pts, -1) + s_point_embed
-                s_cls = s_cls[:, None].expand(-1, num_pts, -1)
-                t_cls = t_cls[:, None].expand(-1, num_pts, -1)
-
-                if self.map_feature_distill_feat_only:
-                    s_input = s_feat
-                    t_input = t_feat.detach()
+                if self.map_feature_distill_use_point_tokens:
+                    s_token = self._build_map_student_point_tokens(s_feat, s_pts)
                 else:
-                    s_input = torch.cat([s_feat, s_cls, s_pts], dim=-1)
-                    t_input = torch.cat([t_feat, t_cls, t_pts], dim=-1).detach()
-                s_proj = self.map_feature_student_proj(s_input)
-                # Teacher is a fixed target in the shared KD space: stop-grad on
-                # both the cached features and the teacher projector, so this is
-                # pure feature KD and the shared space cannot collapse.
+                    point_embed = self.map_feature_anchor_proj(s_pts)
+                    point_embed = point_embed + self._map_point_index_encoding(
+                        num_pts, point_embed.size(-1), point_embed.device,
+                        point_embed.dtype)[None]
+                    if self.map_feature_distill_detach_point_embed:
+                        point_embed = point_embed.detach()
+                    s_token = s_feat[:, None].expand(-1, num_pts, -1) + point_embed
+                s_proj = self.map_feature_student_proj(s_token)
                 with torch.no_grad():
-                    t_proj = self.map_feature_teacher_proj(t_input)
+                    t_proj = self.map_feature_teacher_proj(t_feat.detach())
 
-                # Align by direction (L2-normalized cosine distance), which
-                # removes the feature-norm-scale floor that smooth-L1 regression
-                # onto raw teacher features hit (~25 plateau). Per matched point
-                # the loss is (1 - cos) in [0, 2]; averaged over num_terms below.
                 s_proj = F.normalize(s_proj, dim=-1)
                 t_proj = F.normalize(t_proj, dim=-1)
                 layer_loss = layer_loss + (1.0 - (s_proj * t_proj).sum(-1)).sum()
                 num_terms += int(student_idx.numel()) * num_pts
 
-                # Relational KD (RKD-distance): match the pairwise geometry of the
-                # matched student queries to the teacher's. A per-query projector
-                # cannot reproduce cross-query structure, so this term keeps
-                # producing gradient into instance_features after the pointwise
-                # cosine has saturated. Pool over points -> one embedding/query.
-                if self.map_feature_distill_rkd_weight > 0 and student_idx.numel() >= 2:
-                    s_q = s_proj.mean(dim=1)            # [Q, kd_dim], grad on
-                    t_q = t_proj.mean(dim=1).detach()   # [Q, kd_dim], fixed target
-                    s_d = torch.cdist(s_q, s_q)
-                    t_d = torch.cdist(t_q, t_q)
-                    offdiag = ~torch.eye(
-                        s_d.size(0), dtype=torch.bool, device=s_d.device)
-                    s_d = s_d[offdiag]
-                    t_d = t_d[offdiag]
-                    if s_d.numel() > 0:
-                        s_mu = s_d.mean().clamp_min(1e-6)
-                        t_mu = t_d.mean().clamp_min(1e-6)
-                        layer_rkd = layer_rkd + F.smooth_l1_loss(
-                            s_d / s_mu, t_d / t_mu, reduction="mean")
-                        num_rkd += 1
-
             if num_terms > 0:
-                pointwise = layer_loss / num_terms
-                rkd = zero
-                if num_rkd > 0:
-                    rkd = (
-                        self.map_feature_distill_rkd_weight * layer_rkd / num_rkd)
                 layer_scale = effective_alpha * float(layer_weight)
-                layer_loss = (
-                    layer_scale *
-                    (pointwise + rkd)
-                )
-                point_metrics.append((layer_scale * pointwise).detach())
-                rkd_metrics.append((layer_scale * rkd).detach())
+                layer_loss = layer_scale * (layer_loss / num_terms)
             else:
-                point_metrics.append(zero.detach())
-                rkd_metrics.append(zero.detach())
+                layer_loss = zero
             kd_losses.append(layer_loss)
 
         if self.combine_layer_loss:
@@ -2056,56 +2203,36 @@ class SparseOneDecoder(BaseModule):
         output["map_kd_feat_matches"] = zero + ref.new_tensor(
             float(matched_queries))
         output["map_kd_feat_alpha"] = effective_alpha.detach()
-        output["map_kd_feat_point"] = sum(point_metrics, zero.detach())
-        output["map_kd_feat_rkd"] = sum(rkd_metrics, zero.detach())
-        output["map_kd_feat_raw_rel"] = (
-            zero.detach() + self._map_feature_raw_relation_metric(
-                student_features, teacher_features, matches))
         return output
 
-    def _map_feature_raw_relation_metric(
-            self, student_features, teacher_features, matches):
-        """Projector-free transfer gauge for the map feature KD path.
+    def _compute_map_point_aux_loss(
+            self, query_feature, reg_pred, reg_target, reg_weights, mask,
+            num_pos, decoder_idx):
+        if (not self.map_use_feature_distill or
+                not self.map_feature_distill_use_point_tokens or
+                self.map_feature_distill_point_tokens_as_main or
+                self.map_feature_distill_point_aux_weight <= 0):
+            return None
 
-        Pearson correlation between raw student and raw teacher pairwise
-        feature distances over matched queries (final KD layer, teacher
-        features mean-pooled over points). Pairwise distances are invariant
-        to a basis change, so this is meaningful across the two encoders'
-        different feature spaces, and no learnable module sits between the
-        features and the metric — it cannot be inflated by projector
-        absorption. If KD actually reshapes instance_features this rises;
-        if only the projector is absorbing the loss it stays flat.
-        """
-        last_idx = self.map_feature_distill_layers[-1]
-        if len(student_features) <= last_idx:
-            return 0.0
-        s_feature_layer = student_features[last_idx]
-        t_feature_layer = self._select_teacher_map_feature_layer(
-            teacher_features, len(self.map_feature_distill_layers) - 1,
-            last_idx)
-        corrs = []
-        with torch.no_grad():
-            for b, match in enumerate(matches):
-                if match is None or match[0].numel() < 3:
-                    continue
-                student_idx, teacher_idx, _ = match
-                s_q = F.normalize(
-                    s_feature_layer[b, student_idx].float(), dim=-1)
-                t_q = F.normalize(
-                    t_feature_layer[b, teacher_idx].float().mean(dim=1),
-                    dim=-1)
-                offdiag = ~torch.eye(
-                    s_q.size(0), dtype=torch.bool, device=s_q.device)
-                s_d = torch.cdist(s_q, s_q)[offdiag]
-                t_d = torch.cdist(t_q, t_q)[offdiag]
-                s_d = s_d - s_d.mean()
-                t_d = t_d - t_d.mean()
-                denom = s_d.norm() * t_d.norm()
-                if denom > 1e-6:
-                    corrs.append((s_d * t_d).sum() / denom)
-        if not corrs:
-            return 0.0
-        return torch.stack(corrs).mean().detach()
+        points = reg_pred.reshape(
+            reg_pred.shape[0], reg_pred.shape[1], -1, 2).detach()
+        point_tokens = self._build_map_student_point_tokens(
+            query_feature, points)
+        aux_points = points + self.map_feature_point_aux_head(point_tokens)
+        aux_reg = aux_points.flatten(-2, -1).flatten(end_dim=1)[mask]
+        if aux_reg.numel() == 0:
+            return None
+
+        aux_target = reg_target.flatten(end_dim=1)[mask]
+        aux_target = torch.where(
+            aux_target.isnan(), aux_reg.new_tensor(0.0), aux_target)
+        aux_weights = reg_weights.flatten(end_dim=1)[mask]
+        aux_loss = self.loss_map_reg(
+            aux_reg, aux_target, weight=aux_weights, avg_factor=num_pos,
+            prefix="map_point_aux_", suffix=f"_{decoder_idx}")
+        return (
+            aux_loss[f"map_point_aux_loss_line_{decoder_idx}"] *
+            self.map_feature_distill_point_aux_weight)
 
     @force_fp32(apply_to=("model_outs"))
     def loss_map(self, model_outs, data):
@@ -2141,6 +2268,13 @@ class SparseOneDecoder(BaseModule):
 
             mask = mask.reshape(-1)
             reg_weights = reg_weights * reg.new_tensor(self.map_reg_weights)
+            point_aux_loss = None
+            if (decoder_idx in self.map_feature_distill_layers and
+                    decoder_idx < len(model_outs.get("instance_features", []))):
+                point_aux_loss = self._compute_map_point_aux_loss(
+                    model_outs["instance_features"][decoder_idx],
+                    reg_preds[decoder_idx][..., : len(self.map_reg_weights)],
+                    reg_target, reg_weights, mask, num_pos, decoder_idx)
             reg_target = reg_target.flatten(end_dim=1)[mask]
             reg = reg.flatten(end_dim=1)[mask]
             reg_weights = reg_weights.flatten(end_dim=1)[mask]
@@ -2159,10 +2293,16 @@ class SparseOneDecoder(BaseModule):
                     output["map_loss_line"] = 0.0
                 output["map_loss_cls"] += cls_loss
                 output["map_loss_line"] += reg_loss[f"map_loss_line_{decoder_idx}"] * gt_w
+                if point_aux_loss is not None:
+                    if "map_loss_point_aux" not in output:
+                        output["map_loss_point_aux"] = 0.0
+                    output["map_loss_point_aux"] += point_aux_loss
             else:
                 output[f"map_loss_cls_{decoder_idx}"] = cls_loss
                 for k, v in reg_loss.items():
                     output[k] = v * gt_w
+                if point_aux_loss is not None:
+                    output[f"map_loss_point_aux_{decoder_idx}"] = point_aux_loss
 
             # Map distillation KD loss (teacher_tp mode; mirrors det KD branch)
             if self.map_distill_mode == "teacher_tp" and self.map_use_distill and "teacher_map_logits" in data:
