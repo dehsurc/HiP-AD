@@ -225,7 +225,7 @@ model = dict(
             ),
             # operation
             custom_op=dict(type="CustomOperation"),
-                =dict(
+            temp_graph_model=dict(
                 type="TemporalSeparateAttention",
                 query_select=query_select,
                 query_list=[["det"], ["map"], ["plan", "ego"], ["plan", "ego"]],
