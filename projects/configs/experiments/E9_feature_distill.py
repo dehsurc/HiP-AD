@@ -2,7 +2,7 @@ log_level = 'INFO'
 dist_params = dict(backend='nccl')
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
-work_dir = 'work_dirs/exp/E9_fd_identity_dense_rkd_l5only'
+work_dir = 'work_dirs/exp/E9_fd_identity_dense_rkd_l01'
 num_gpus = 4
 batch_size = 4
 # dataset size (28128 = old 1758 iters * old global batch 16); keep epochs fixed
@@ -11,7 +11,7 @@ num_iters_per_epoch = 28128 // (num_gpus * batch_size)
 num_epochs = 12
 checkpoint_epoch_interval = 3
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=2)
-wandb_name = 'E9_fd_identity_dense_rkd_l5only'
+wandb_name = 'E9_fd_identity_dense_rkd_l01'
 log_config = dict(
     interval=50,
     hooks=[
@@ -37,20 +37,20 @@ det_class_names = [
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 map_class_names = ['ped_crossing', 'divider', 'boundary']
-# The cached top20_l345 teacher pkl was empirically evaluated in this order.
+# The cached top20_l01 teacher pkl was empirically evaluated in this order.
 # Do not apply the original MapTR [divider, ped_crossing, boundary] swap here.
 map_teacher_class_names = ['ped_crossing', 'divider', 'boundary']
 map_teacher_to_student_class_perm = None
-map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l345.pkl'
+map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l01.pkl'
 map_feature_match_score_thr = 0.3
 map_feature_match_dist_thr = 4.0  # gt_anchor: teacher-to-GT line-distance gate.
 map_feature_match_mode = 'gt_anchor'
-map_feature_distill_alpha = 0.1
-# Distill only at the final map decoder layer. Keep the total KD scale
-# comparable to the previous 3/4/5 recipe by using a unit layer weight.
-map_feature_distill_layers = (5,)
-map_feature_distill_weights = (1.0,)
-map_feature_distill_cached_layers = (3, 4, 5)
+map_feature_distill_alpha = 1.0
+# Distill only at the early map decoder layers. Split the unit KD scale across
+# layers so the total feature-KD weight stays comparable to the l5-only run.
+map_feature_distill_layers = (0, 1)
+map_feature_distill_weights = (0.5, 0.5)
+map_feature_distill_cached_layers = (0, 1)
 map_feature_distill_teacher_dim = 256
 map_feature_distill_kd_dim = 256
 map_feature_distill_num_classes = 3
@@ -630,7 +630,7 @@ data = dict(
         sequences_split_num=2,
         keep_consistent_seq_aug=True,
         map_teacher_cache_path=map_teacher_cache_path,
-        map_teacher_num_layers=3,
+        map_teacher_num_layers=2,
         map_teacher_num_queries=20,
         map_teacher_num_pts=20,
         map_teacher_feature_dim=256,

@@ -2340,7 +2340,10 @@ class SparseOneDecoder(BaseModule):
 
                 pgt_cls = cls_raw.flatten(end_dim=1)
                 pgt_cls_target = pgt_cls_target.flatten(end_dim=1)
-                pgt_cls_loss = self.loss_map_cls(pgt_cls, pgt_cls_target, avg_factor=pgt_num_pos)
+                pgt_cls_loss = (
+                    self.loss_map_cls(
+                        pgt_cls, pgt_cls_target, avg_factor=pgt_num_pos)
+                    * self.map_distill_alpha_cls)
 
                 pgt_mask = pgt_mask.reshape(-1)
                 pgt_reg_weights_w = pgt_reg_weights * reg_raw.new_tensor(self.map_reg_weights)
@@ -2361,11 +2364,13 @@ class SparseOneDecoder(BaseModule):
                         output["map_loss_kd_cls"] = 0.0
                         output["map_loss_kd_line"] = 0.0
                     output["map_loss_kd_cls"] += pgt_cls_loss
-                    output["map_loss_kd_line"] += pgt_reg_loss[f"map_kd_loss_line_{decoder_idx}"]
+                    output["map_loss_kd_line"] += (
+                        pgt_reg_loss[f"map_kd_loss_line_{decoder_idx}"]
+                        * self.map_distill_alpha_reg)
                 else:
                     output[f"map_loss_kd_cls_{decoder_idx}"] = pgt_cls_loss
                     for k, v in pgt_reg_loss.items():
-                        output[k] = v
+                        output[k] = v * self.map_distill_alpha_reg
 
         # Restore real GT matching for downstream tasks (motion/plan rely on
         # map_sampler.indices). pseudo_gt's last sample() call leaves indices
