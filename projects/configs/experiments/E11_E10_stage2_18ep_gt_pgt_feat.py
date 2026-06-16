@@ -2,7 +2,15 @@ _base_ = ['./E2_E1_stage2_18ep.py']
 
 work_dir = 'work_dirs/exp/E11_E10_stage2_18ep_gt_pgt_feat'
 wandb_name = 'E11_E10_stage2_18ep_gt_pgt_feat'
-load_from = '/home/chanyoung/RideFlux/HiP-AD/data/cache/map/iter_149430.pth'
+load_from = './work_dirs/exp/E10_output_kd_pgt_l5_feat_aux/latest.pth'
+
+num_gpus = 4
+batch_size = 4
+num_iters_per_epoch = 28130 // (num_gpus * batch_size)
+num_epochs = 18
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=-1)
+runner = dict(type='IterBasedRunner', max_iters=num_iters_per_epoch * num_epochs)
+evaluation = dict(interval=num_iters_per_epoch * 3)
 
 log_config = dict(
     interval=50,
@@ -91,7 +99,104 @@ model = dict(
             map_feature_distill_same_class_only=map_feature_distill_same_class_only,
             map_feature_match_mode=map_feature_match_mode,
             map_teacher_to_student_class_perm=map_teacher_to_student_class_perm,
-        )))
+            # Override the base (E2) temporal attention: split plan/ego temporal
+        # attention into a self block (plan/ego <- plan/ego) and a cross block
+        # (plan/ego <- det,map), and enable use_updated_query. The 4th attn /
+        # decouple entry is a copy of the 3rd (plan/ego self) block.
+        # base vars aren't visible here, so values are inlined:
+        # embed_dims=256, num_groups=8, drop_out=0.1.
+        temp_graph_model=dict(
+            type="TemporalSeparateAttention",
+            query_select=["det", "map", "plan", "ego"],
+            query_list=[["det"], ["map"], ["plan", "ego"], ["plan", "ego"]],
+            key_list=[["det"], ["map"], ["plan", "ego"], ["det", "map"]],
+            decouple_list=[True, False, False, False],
+            use_updated_query=True,
+            attn=[
+                dict(
+                    type="MultiheadFlashAttention",
+                    embed_dims=256 * 2,
+                    num_heads=8,
+                    batch_first=True,
+                    dropout=0.1,
+                ),
+                dict(
+                    type="MultiheadFlashAttention",
+                    embed_dims=256,
+                    num_heads=8,
+                    batch_first=True,
+                    dropout=0.1,
+                ),
+                dict(
+                    type="MultiheadFlashAttention",
+                    embed_dims=256,
+                    num_heads=8,
+                    batch_first=True,
+                    dropout=0.1,
+                ),
+                dict(
+                    type="MultiheadFlashAttention",
+                    embed_dims=256,
+                    num_heads=8,
+                    batch_first=True,
+                    dropout=0.1,
+                ),
+            ],
+        ),
+        # Match b2d/revision: graph_model adds plan/ego as a third separate
+        # group (was det/map only in E2). List keys fully replace the base.
+        graph_model=dict(
+            type="SeparateAttention",
+            query_select=["det", "map", "plan", "ego"],
+            separate_list=[["det"], ["map"], ["plan", "ego"]],
+            decouple_list=[True, False, False],
+            with_distance_attn_mask=False,
+            attn=[
+                dict(
+                    type="MultiheadFlashAttention",
+                    embed_dims=256 * 2,
+                    num_heads=8,
+                    batch_first=True,
+                    dropout=0.1,
+                ),
+                dict(
+                    type="MultiheadFlashAttention",
+                    embed_dims=256,
+                    num_heads=8,
+                    batch_first=True,
+                    dropout=0.1,
+                ),
+                dict(
+                    type="MultiheadFlashAttention",
+                    embed_dims=256,
+                    num_heads=8,
+                    batch_first=True,
+                    dropout=0.1,
+                ),
+            ],
+        ),
+        # Match b2d/revision: inter_graph_model switches from InteractiveAttention
+        # to SeparateAttention over all 4 modalities with distance + structured
+        # masks. _delete_=True is REQUIRED so the base InteractiveAttention's
+        # query_list/key_list keys don't leak into SeparateAttention.__init__.
+        inter_graph_model=dict(
+            _delete_=True,
+            type="SeparateAttention",
+            query_select=["det", "map", "plan", "ego"],
+            separate_list=[["det", "map", "plan", "ego"]],
+            decouple_list=[False],
+            with_distance_attn_mask=True,
+            with_structured_mask=True,
+            attn=[
+                dict(
+                    type="MultiheadFlashAttention",
+                    embed_dims=256,
+                    num_heads=8,
+                    batch_first=True,
+                    dropout=0.1,
+                ),
+            ],
+        ))))
 
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -160,6 +265,8 @@ train_pipeline = [
 eval_config = dict(work_dir=work_dir)
 
 data = dict(
+    samples_per_gpu=batch_size,
+    workers_per_gpu=batch_size,
     train=dict(
         work_dir=work_dir,
         pipeline=train_pipeline,

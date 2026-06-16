@@ -299,32 +299,43 @@ class MultiheadFlashAttention(BaseModule):
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
 
-        # Single manual attention path: always honors additive masks and works
-        # on torch 1.x where F.scaled_dot_product_attention is unavailable.
-        fmha = self.attn
-        q, k, v = _in_projection_packed(query, key, value, fmha.in_proj_weight, fmha.in_proj_bias)
-        q = rearrange(q, 'b s (h d) -> b h s d', h=fmha.num_heads)
-        k = rearrange(k, 'b s (h d) -> b h s d', h=fmha.num_heads)
-        v = rearrange(v, 'b s (h d) -> b h s d', h=fmha.num_heads)
+        # Fast path (matches b2d/revision): with no additive attn_mask, run
+        # FlashAttention directly -- much faster for unmasked attention (det/map
+        # gnn, etc.). key_padding_mask is still honored inside FlashMHA.
+        # The manual matmul branch below is kept for the masked case because this
+        # env is torch 1.13 (no F.scaled_dot_product_attention), so b2d/revision's
+        # SDPA else-branch is intentionally NOT adopted.
+        if attn_mask is None:
+            out = self.attn(
+                q=query,
+                k=key,
+                v=value,
+                key_padding_mask=key_padding_mask)[0]
+        else:
+            fmha = self.attn
+            q, k, v = _in_projection_packed(query, key, value, fmha.in_proj_weight, fmha.in_proj_bias)
+            q = rearrange(q, 'b s (h d) -> b h s d', h=fmha.num_heads)
+            k = rearrange(k, 'b s (h d) -> b h s d', h=fmha.num_heads)
+            v = rearrange(v, 'b s (h d) -> b h s d', h=fmha.num_heads)
 
-        final_mask = attn_mask
-        if key_padding_mask is not None:
-            kpm = torch.zeros_like(key_padding_mask, dtype=q.dtype)
-            kpm = kpm.masked_fill(key_padding_mask, float('-inf'))
-            kpm = kpm[:, None, None, :]
-            final_mask = kpm if final_mask is None else (final_mask + kpm)
+            final_mask = attn_mask
+            if key_padding_mask is not None:
+                kpm = torch.zeros_like(key_padding_mask, dtype=q.dtype)
+                kpm = kpm.masked_fill(key_padding_mask, float('-inf'))
+                kpm = kpm[:, None, None, :]
+                final_mask = kpm if final_mask is None else (final_mask + kpm)
 
-        dropout_p = fmha.inner_attn.dropout_p if self.training else 0.0
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if final_mask is not None:
-            attn = attn + final_mask
-        attn = attn.softmax(dim=-1)
-        if dropout_p > 0:
-            attn = F.dropout(attn, p=dropout_p, training=self.training)
-        context = torch.matmul(attn, v)
-        out = rearrange(context, 'b h s d -> b s (h d)')
-        out = fmha.out_proj(out)
+            dropout_p = fmha.inner_attn.dropout_p if self.training else 0.0
+            scale = 1.0 / math.sqrt(q.shape[-1])
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if final_mask is not None:
+                attn = attn + final_mask
+            attn = attn.softmax(dim=-1)
+            if dropout_p > 0:
+                attn = F.dropout(attn, p=dropout_p, training=self.training)
+            context = torch.matmul(attn, v)
+            out = rearrange(context, 'b h s d -> b s (h d)')
+            out = fmha.out_proj(out)
 
         if not self.batch_first:
             out = out.transpose(0, 1)
