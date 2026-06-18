@@ -48,8 +48,15 @@ class SparseDetector(BaseDetector):
         use_deformable_func=False,
         depth_branch=None,
         scenes_tokenizer=None,
+        ablate_tasks=None,
     ):
         super(SparseDetector, self).__init__(init_cfg=init_cfg)
+        # Leave-one-task-out transfer-gain runs: losses of these tasks are
+        # detached in forward_train — values still logged, gradients cut.
+        self.ablate_tasks = list(ablate_tasks) if ablate_tasks else []
+        for _t in self.ablate_tasks:
+            assert _t in TASK_LOSS_PREFIXES, \
+                f"ablate_tasks entry {_t!r} not in {list(TASK_LOSS_PREFIXES)}"
         if pretrained is not None:
             backbone.pretrained = pretrained
         self.img_backbone = build_backbone(img_backbone)
@@ -152,7 +159,49 @@ class SparseDetector(BaseDetector):
             output["loss_dense_depth"] = self.depth_branch.loss(
                 depths, data["gt_depth"]
             )
+        if self.ablate_tasks:
+            output = self._cut_ablated_grads(output)
         return output
+
+    def _cut_ablated_grads(self, losses):
+        """Zero an ablated task's loss gradient while keeping its value + graph.
+
+        Replaces each matched loss L with ``L*0 + L.detach()``: the value is
+        unchanged (``_parse_losses`` still logs it, so the ablated task can be
+        watched degrading), the gradient w.r.t. every parameter is exactly zero
+        (the task trains neither the shared params nor its own), and the tensor
+        stays in the autograd graph so DDP's reducer marks those parameters
+        ready exactly once.
+
+        Why not a bare ``.detach()``: that orphans the task's exclusive params
+        (e.g. motion_refine) -> with find_unused_parameters=False DDP raises
+        "Expected to have finished reduction". Why not flip
+        find_unused_parameters=True instead: it clashes with the backbone's
+        gradient checkpointing (with_cp=True) -> "mark ready only once". The
+        zero-multiply keeps the default DDP path that already works for tg_full.
+        """
+        prefixes = tuple(
+            p for t in self.ablate_tasks for p in TASK_LOSS_PREFIXES[t]
+        )
+        matched = set()
+        for key, val in losses.items():
+            if isinstance(val, torch.Tensor) and key.startswith(prefixes):
+                losses[key] = val * 0.0 + val.detach()
+                matched.add(key)
+        # Guard: any OTHER loss key belonging to an ablated task (e.g. distill
+        # keys det_kd_loss_*/det_pgt_loss_* that fall outside TASK_LOSS_PREFIXES)
+        # would silently keep training it. Fail loudly so a future config change
+        # cannot quietly invalidate the experiment.
+        leaked = [
+            k for k, v in losses.items()
+            if k not in matched and isinstance(v, torch.Tensor) and v.requires_grad
+            and any(k.startswith(f"{t}_") for t in self.ablate_tasks)
+        ]
+        assert not leaked, (
+            f"ablate_tasks={self.ablate_tasks} but these loss keys are outside "
+            f"TASK_LOSS_PREFIXES and still train the task: {leaked}"
+        )
+        return losses
 
     def train_step(self, data, optimizer):
         """Override train_step to expose per-task losses for PCGrad.

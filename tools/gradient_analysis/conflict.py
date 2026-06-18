@@ -1,12 +1,14 @@
 """M2 — Conflict Analysis (cosine + projection decomposition)."""
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 
 EPS = 1e-8
@@ -204,18 +206,26 @@ def run_m2(
     out_dir.mkdir(parents=True, exist_ok=True)
     per_pair_violin: Dict[str, np.ndarray] = {}
 
-    for a_idx, a in enumerate(tasks):
-        for b in tasks[a_idx + 1:]:
-            batches = [{a: cb["shared"].get(a, {}), b: cb["shared"].get(b, {})} for cb in cached_batches]
-            df = analyze_pair_batches(batches, a, b, group_keys)
-            if df.empty:
-                continue
-            df.to_csv(out_dir / f"conflict_{a}_{b}_per_batch.csv", index=False)
-            summary = summarize_pair(df)
-            summary.insert(0, "task_a", a)
-            summary.insert(1, "task_b", b)
-            summary.to_csv(out_dir / f"conflict_{a}_{b}_summary.csv", index=False)
-            per_pair_violin[f"{a}|{b}"] = df["cos"].to_numpy()
+    pair_list = [(a, b) for a_idx, a in enumerate(tasks) for b in tasks[a_idx + 1:]]
+    t_start = time.time()
+    for a, b in tqdm(
+        pair_list, desc=f"M2 conflict [{out_dir.name}]",
+        dynamic_ncols=True, mininterval=1.0,
+    ):
+        batches = [{a: cb["shared"].get(a, {}), b: cb["shared"].get(b, {})} for cb in cached_batches]
+        df = analyze_pair_batches(batches, a, b, group_keys)
+        if df.empty:
+            continue
+        df.to_csv(out_dir / f"conflict_{a}_{b}_per_batch.csv", index=False)
+        summary = summarize_pair(df)
+        summary.insert(0, "task_a", a)
+        summary.insert(1, "task_b", b)
+        summary.to_csv(out_dir / f"conflict_{a}_{b}_summary.csv", index=False)
+        per_pair_violin[f"{a}|{b}"] = df["cos"].to_numpy()
+    print(
+        f"[M2] {len(pair_list)} pairs × {len(cached_batches)} batches "
+        f"({out_dir.name}) done in {(time.time() - t_start)/60:.2f} min"
+    )
 
     if per_pair_violin:
         violin_by_pair(

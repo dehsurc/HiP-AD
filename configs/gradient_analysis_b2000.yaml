@@ -18,7 +18,11 @@ checkpoints:
 
 primary:
   batch_size: 6
-  num_batches: 100
+  # 2026-05-28: reduced 2000 → 1000 alongside the dec0–2 layer restriction.
+  # Target wall-clock ≈ 12h on 4 GPUs (one ckpt per GPU). Bootstrap CI is
+  # ~√2× wider than at 2000; per-cell event counts remain in the hundreds
+  # even at the lowest neg_frac (~10%) cells.
+  num_batches: 1000
 
 supplementary:
   enabled: true
@@ -29,7 +33,17 @@ supplementary:
 probe:
   alpha: 0.001
   steps: [1]
-  variants: [raw, normalized]
+  # Variant menu (probe.py):
+  #   raw                  — step = α · g_source (full magnitude direction)
+  #   normalized           — step = α · ĝ_source (unit-norm direction, fixed α)
+  #   pcgrad_strict        — step = α · g_source^⊥other, projection magnitude shrinks
+  #                          (Pythagorean √(1 − cos²)); fires only when cos < 0
+  #   pcgrad_normpreserved — step = α · (g_source^⊥other / ‖·‖) · ‖g_source‖
+  #                          (direction-only change; isolates from shrinkage)
+  # `normalized` dropped 2026-05-28 — inter_gnn analysis switches headline to
+  # `raw` (scale-stripping of α/‖g‖ overweights small-norm tasks; see
+  # phase1_gating_decision §R6). Re-add only for legacy diagnostics.
+  variants: [raw, pcgrad_strict, pcgrad_normpreserved]
   # When non-empty, M3 restricts the virtual update to these shared param
   # group keys (one cycle per layer). Output gains a `layer` column and
   # per-layer ΔL matrices. Leave empty/null for the original full-param
@@ -40,12 +54,12 @@ probe:
   # (spec docs/superpowers/specs/2026-05-23-planning-aligned-task-importance-design.md).
   # Set to [] to fall back to the full-param update.
   target_layers:
+    # 2026-05-28: dropped dec3–5. Earlier conflict analysis showed |cos<0|
+    # P95 ≤ 0.12 at dec3–5 (vs 0.18–0.50 at dec0–2), so projection effects
+    # there are too small to see above ΔL noise.
     - dec0_inter_gnn_0
     - dec1_inter_gnn_0
     - dec2_inter_gnn_0
-    - dec3_inter_gnn_0
-    - dec4_inter_gnn_0
-    - dec5_inter_gnn_0
   # Pin Hungarian matching (det/map) and mode argmin (motion/plan) to the
   # baseline forward across the entire probe cycle. Strongly recommended
   # whenever target loss change can be confused with matching reshuffling.
@@ -110,18 +124,20 @@ shared_param_groups:
 layer_conflict:
   enabled: true
   layers:
+    # Mirror of probe.target_layers (dec0–2). M2 cost is negligible so we
+    # could keep all 6 for cosine reference, but keeping the scope identical
+    # keeps M_PI's layer-level join clean (load_plan_alignment ↔ load_plan_transfer).
     - dec0_inter_gnn_0
     - dec1_inter_gnn_0
     - dec2_inter_gnn_0
-    - dec3_inter_gnn_0
-    - dec4_inter_gnn_0
-    - dec5_inter_gnn_0
 
 # M_PI — Planning-aligned task importance (post-hoc on layer_conflict + probe).
 # See spec docs/superpowers/specs/2026-05-23-planning-aligned-task-importance-design.md.
 planning_importance:
   aux_tasks: [det, map, motion]
-  variant: normalized
+  # Switched normalized → raw 2026-05-28 alongside the probe.variants change.
+  # M_PI reads only single-source rows (other_task == "_none").
+  variant: raw
   steps: 1
   plan_task: plan
   collinear_ref: det                  # motion det-collinearity flag

@@ -14,6 +14,7 @@ import argparse
 import gc
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -21,6 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
+from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -187,10 +189,16 @@ def run_primary_for_checkpoint(
     )
 
     # Collect gradients (needed for M2 + M5)
+    t_collect = time.time()
+    print(f"[{ckpt_tag}] phase: gradient collection — {num_batches} batches "
+          f"× {len(tasks)} tasks backward …")
     cached = []
+    pbar = tqdm(total=num_batches, desc=f"collect [{ckpt_tag}]",
+                dynamic_ncols=True, mininterval=2.0)
     for i, data in enumerate(dataloader):
         if i >= num_batches:
             break
+        t_b = time.time()
         bg, _ = collector.collect_batch(i, data)
         cached.append({
             "batch_idx": bg.batch_idx,
@@ -199,6 +207,15 @@ def run_primary_for_checkpoint(
             "shared_norm": bg.shared_norm,
             "loss_values": bg.loss_values,
         })
+        dt = time.time() - t_b
+        elapsed = time.time() - t_collect
+        avg = elapsed / (i + 1)
+        eta = avg * (num_batches - (i + 1))
+        pbar.set_postfix_str(f"last={dt:.2f}s avg={avg:.2f}s eta={eta/60:.1f}m")
+        pbar.update(1)
+    pbar.close()
+    print(f"[{ckpt_tag}] collect done in {(time.time() - t_collect)/60:.2f} min "
+          f"(cached {len(cached)} batches)")
 
     available_groups = list(collector.shared_param_groups.keys())
     groups = [g for g in cfg_ana["shared_param_groups"] if g in collector.shared_param_groups]

@@ -114,7 +114,7 @@ bash ./tools/dist_train.sh ./configs/hipad_b2d_stage2.py 8 --no-validate
 ### Evaluation
 **Open-Loop**
 ```bash
-bash ./tools/dist_test.sh./projects/configs/hipad_b2d_stage2.py ./work_dirs/b2d_r50_stage2/latest.pth 8 --eval bbox
+bash ./tools/dist_test.sh ./projects/configs/hipad_b2d_stage2.py ./work_dirs/b2d_r50_stage2/latest.pth 4 --eval bbox
 ```
 
 **Closed-Loop**

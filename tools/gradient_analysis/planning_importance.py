@@ -132,7 +132,7 @@ def load_plan_alignment(
 
 def load_plan_transfer(
     probe_csv,
-    variant: str = "normalized",
+    variant: str = "raw",
     steps: int = 1,
     aux_tasks: Sequence[str] = _DEFAULT_AUX,
     inter_gnn_layers: Optional[Sequence[str]] = None,
@@ -141,6 +141,11 @@ def load_plan_transfer(
     """1-step probe rows where target=plan, source∈aux_tasks, filtered to inter_gnn.
 
     Returns long df with ``gain = -delta`` so positive = helpful.
+
+    Pcgrad-variant rows (``other_task != "_none"``) are excluded — the
+    planning-aligned importance question (does aux help plan?) is defined on
+    the single-source step, not on a paired projection. Their analysis lives
+    in the dedicated projection-probe report.
     """
     cols = ["aux_task", "batch_idx", "layer", "delta", "gain", "grad_dot", "grad_norm"]
     p = Path(probe_csv)
@@ -158,6 +163,8 @@ def load_plan_transfer(
         & (df["variant"] == variant)
         & (df["steps"] == steps)
     )
+    if "other_task" in df.columns:
+        mask &= df["other_task"].fillna("_none") == "_none"
     keep = ["source_task", "batch_idx", "layer", "delta", "grad_dot", "grad_norm"]
     keep = [c for c in keep if c in df.columns]
     sub = df.loc[mask, keep].copy().rename(columns={"source_task": "aux_task"})
@@ -348,7 +355,7 @@ def build_alignment_transfer_agreement(
 
 def build_planning_layer_sensitivity(
     probe_csv,
-    variant: str = "normalized",
+    variant: str = "raw",
     steps: int = 1,
     inter_gnn_layers: Optional[Sequence[str]] = None,
     plan_task: str = "plan",
@@ -373,6 +380,8 @@ def build_planning_layer_sensitivity(
         & (df["variant"] == variant)
         & (df["steps"] == steps)
     )
+    if "other_task" in df.columns:
+        mask &= df["other_task"].fillna("_none") == "_none"
     sub = df.loc[mask, ["layer", "grad_norm"]].copy().drop_duplicates(
         subset=["layer", "grad_norm"], keep="first"
     )
@@ -399,7 +408,7 @@ def run_planning_importance(
     probe_csv,
     out_dir,
     aux_tasks: Sequence[str] = _DEFAULT_AUX,
-    variant: str = "normalized",
+    variant: str = "raw",
     steps: int = 1,
     inter_gnn_groups: Optional[Sequence[str]] = None,
     inter_gnn_layers: Optional[Sequence[str]] = None,

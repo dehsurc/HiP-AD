@@ -1,0 +1,101 @@
+# Stage-1 (from-scratch JOINT training) gradient probe.
+# Same model architecture as stage-2 (E2 init from E1), so we reuse the stage-2
+# grad-analysis model_config and just point ckpt_root at the stage-1 run's EARLY
+# checkpoints.  Goal: test whether aux<->plan gradient coupling is large/non-null
+# EARLY in co-learning (where the user's gating/weighting method would act),
+# vs the near-converged stage-2 regime where we previously measured ~orthogonal.
+# stage-1 has det/map/plan/ego but NO motion head (with_motion=False) — motion
+# was added in stage-2.  So probe det/map -> plan only; use the stage-1 native
+# config so the model is built WITHOUT motion and the ckpt loads cleanly.
+tasks: [det, map, plan]
+
+adapter: hipad
+ckpt_root: /home/yongjae/e2e/HiP-AD/work_dirs/exp/E1_stage1_12ep_1_3_seed0
+model_config: /home/yongjae/e2e/HiP-AD/projects/configs/experiments/E1_stage1_12ep_1_3_seed0.py
+
+# 585 iters/epoch.  Early -> full stage-1.  s01ep is genuinely early (rep forming).
+checkpoints:
+  s01ep: iter_585.pth
+  s02ep: iter_1170.pth
+  s04ep: iter_2340.pth
+  s06ep: iter_3510.pth
+  s08ep: iter_4680.pth
+  s12ep: iter_7020.pth
+
+primary:
+  batch_size: 6
+  num_batches: 100        # light screen (vs 1000 in the headline run)
+
+supplementary:
+  enabled: false
+  batch_size: 1
+  num_samples: 500
+  checkpoint: s01ep
+
+probe:
+  alpha: 0.001
+  steps: [1]
+  variants: [raw, pcgrad_strict, pcgrad_normpreserved]
+  target_layers:
+    - dec0_inter_gnn_0
+    - dec1_inter_gnn_0
+    - dec2_inter_gnn_0
+  freeze_matching: true
+  reset_temporal_state: true
+  forward_seed: 42
+
+landscape:
+  enabled: false
+  num_batches: 5
+  batch_size: null
+  t_grid: [-1.0, -0.5, 0.0, 0.5, 1.0]
+
+binning:
+  cosine_bins: [-1.0, -0.3, -0.1, 0.1, 0.3, 1.0]
+
+shared_param_groups:
+  - backbone
+  - neck
+  - norm
+  - ffn
+  - gnn
+  - inter_gnn
+  - fc_before
+  - fc_after
+
+layer_conflict:
+  enabled: true
+  layers:
+    - dec0_inter_gnn_0
+    - dec1_inter_gnn_0
+    - dec2_inter_gnn_0
+
+planning_importance:
+  aux_tasks: [det, map]
+  variant: raw
+  steps: 1
+  plan_task: plan
+  collinear_ref: det
+  inter_gnn_groups: null
+  inter_gnn_layers: null
+
+output_root: gradient_analysis_results_stage1
+
+null_baseline:
+  n_repeats: 200
+
+bootstrap:
+  enabled: false
+  n_resamples: 2000
+
+alpha_sweep:
+  enabled: false
+  alphas: [1.0e-3]
+  sources: [det]
+  num_batches: 50
+  checkpoint: s01ep
+
+seed: 42
+deterministic: true
+fp16: true
+device: cuda:0
