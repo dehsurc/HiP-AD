@@ -20,7 +20,7 @@ import multiprocessing as mp
 
 INTERP_NUM = 200 # number of points to interpolate during evaluation
 THRESHOLDS = [0.5, 1.0, 1.5] # AP thresholds
-N_WORKERS = 16 # num workers to parallel
+N_WORKERS = 0 # num workers to parallel; 0 = serial (avoid Pool deadlock seen on large result sets)
 
 class VectorEvaluate(object):
     """Evaluator for vectorized map.
