@@ -3,6 +3,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.functional import linear
 from torch.nn.init import xavier_uniform_, constant_
 
@@ -248,7 +249,6 @@ class MultiheadFlashAttention(BaseModule):
             if self.batch_first is False, else
             [bs, num_queries embed_dims].
         """
-        assert attn_mask is None, 'attn mask not supported now.'
         if key is None:
             key = query
         if value is None:
@@ -268,17 +268,40 @@ class MultiheadFlashAttention(BaseModule):
         if key_pos is not None:
             key = key + key_pos
 
-        # The dataflow('key', 'query', 'value') of ``FlashAttention`` is (batch, num_query, embed_dims).
         if not self.batch_first:
             query = query.transpose(0, 1)
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
-        
-        out = self.attn(
-            q=query,
-            k=key,
-            v=value,
-            key_padding_mask=key_padding_mask)[0]
+
+        # Use a single torch-1.x-compatible scaled dot-product path so additive
+        # distance/structured masks remain differentiable. This intentionally
+        # reuses FlashMHA's projections and output layer, preserving checkpoint
+        # compatibility with the unmasked implementation.
+        fmha = self.attn
+        q, k, v = _in_projection_packed(
+            query, key, value, fmha.in_proj_weight, fmha.in_proj_bias)
+        q = rearrange(q, 'b s (h d) -> b h s d', h=fmha.num_heads)
+        k = rearrange(k, 'b s (h d) -> b h s d', h=fmha.num_heads)
+        v = rearrange(v, 'b s (h d) -> b h s d', h=fmha.num_heads)
+
+        final_mask = attn_mask
+        if key_padding_mask is not None:
+            kpm = torch.zeros_like(key_padding_mask, dtype=q.dtype)
+            kpm = kpm.masked_fill(key_padding_mask, float('-inf'))
+            kpm = kpm[:, None, None, :]
+            final_mask = kpm if final_mask is None else (final_mask + kpm)
+
+        dropout_p = fmha.inner_attn.dropout_p if self.training else 0.0
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if final_mask is not None:
+            attn = attn + final_mask
+        attn = attn.softmax(dim=-1)
+        if dropout_p > 0:
+            attn = F.dropout(attn, p=dropout_p, training=self.training)
+        context = torch.matmul(attn, v)
+        out = rearrange(context, 'b h s d -> b s (h d)')
+        out = fmha.out_proj(out)
 
         if not self.batch_first:
             out = out.transpose(0, 1)
@@ -304,4 +327,3 @@ def gen_sineembed_for_position(pos_tensor, hidden_dim=256):
     pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
     pos = torch.cat((pos_y, pos_x), dim=-1)
     return pos
-

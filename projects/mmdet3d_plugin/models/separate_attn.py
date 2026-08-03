@@ -30,11 +30,21 @@ class SeparateAttention(nn.Module):
                  query_select=None,
                  separate_list=None,
                  decouple_list=None,
+                 with_distance_attn_mask=True,
+                 with_velocity_attn_mask=False,
+                 with_structured_mask=False,
+                 perception_modalities=("det", "map"),
+                 planning_modalities=("plan", "ego"),
                  **kwargs):
         super(SeparateAttention, self).__init__()
         self.query_select = query_select
         self.separate_list = separate_list
         self.decouple_list = decouple_list
+        self.with_distance_attn_mask = with_distance_attn_mask
+        self.with_velocity_attn_mask = with_velocity_attn_mask
+        self.with_structured_mask = with_structured_mask
+        self.perception_modalities = tuple(perception_modalities)
+        self.planning_modalities = tuple(planning_modalities)
         assert separate_list is not None
         assert decouple_list is not None
         assert len(separate_list) == len(decouple_list)
@@ -55,6 +65,8 @@ class SeparateAttention(nn.Module):
                 num_anchor_cumsum=None,
                 num_temp_anchor_cumsum=None,
                 fc_before=None, fc_after=None,
+                distance_tau=None,
+                velocity_tau=None,
                 **kwargs):
         output_instance = query.clone()
         if key is None:
@@ -77,6 +89,31 @@ class SeparateAttention(nn.Module):
                 sep_query_pos = torch.cat(sep_query_pos, dim=1) if len(sep_query_pos) else None
 
                 sep_attn_mask = self.get_separate_attn_mask(attn_mask, separate, num_anchor_cumsum)
+
+                if self.with_distance_attn_mask:
+                    dist_attn_mask = InteractiveAttention.get_distance_attn_mask(
+                        self, sep_query, separate, separate, distance_tau, kwargs)
+                    sep_attn_mask = (
+                        sep_attn_mask + dist_attn_mask
+                        if sep_attn_mask is not None else dist_attn_mask
+                    )
+
+                if self.with_velocity_attn_mask:
+                    velo_attn_mask = InteractiveAttention.get_velocity_attn_mask(
+                        self, sep_query, separate, separate, velocity_tau, kwargs)
+                    sep_attn_mask = (
+                        sep_attn_mask + velo_attn_mask
+                        if sep_attn_mask is not None else velo_attn_mask
+                    )
+
+                if self.with_structured_mask:
+                    struct_mask = self._make_structured_mask(
+                        separate, num_query_list, sep_query.dtype, sep_query.device)
+                    if struct_mask is not None:
+                        sep_attn_mask = (
+                            sep_attn_mask + struct_mask
+                            if sep_attn_mask is not None else struct_mask
+                        )
 
                 if self.decouple_list[sep]:
                     sep_query = torch.cat([sep_query, sep_query_pos], dim=-1)
@@ -157,6 +194,33 @@ class SeparateAttention(nn.Module):
                     output_instance[:, start2:end2] = output[:, start1:end1]
 
         return output_instance
+
+
+    def _make_structured_mask(self, separate, num_query_list, dtype, device):
+        """Block perception queries from attending to planning/ego keys."""
+        cum = [0]
+        for num_query in num_query_list:
+            cum.append(cum[-1] + num_query)
+
+        perception_ranges = []
+        planning_ranges = []
+        for i, modality in enumerate(separate):
+            query_range = (cum[i], cum[i + 1])
+            if modality in self.perception_modalities:
+                perception_ranges.append(query_range)
+            elif modality in self.planning_modalities:
+                planning_ranges.append(query_range)
+
+        if not perception_ranges or not planning_ranges:
+            return None
+
+        total = cum[-1]
+        mask = torch.zeros((total, total), dtype=dtype, device=device)
+        neg_inf = torch.finfo(dtype).min
+        for p_start, p_end in perception_ranges:
+            for q_start, q_end in planning_ranges:
+                mask[p_start:p_end, q_start:q_end] = neg_inf
+        return mask
 
 
     def get_separate_attn_mask(self, attn_mask, separate, num_anchor_cumsum, num_temp_anchor_cumsum=None):
@@ -340,7 +404,7 @@ class InteractiveAttention(nn.Module):
                  query_list=None,
                  key_list=None,
                  decouple_list=None,
-                 with_distance_attn_mask=False,
+                 with_distance_attn_mask=True,
                  with_velocity_attn_mask=False,
                  attn_mask_ban_list=None,
                  attn_mask_cancel_list=None,
@@ -571,6 +635,7 @@ class InteractiveAttention(nn.Module):
             return dist
 
         all_query2key_dist_list = []
+        q_lens = []
         for query_type in sep_query_list:
             query2key_dist_list = []
             for key_type in sep_key_list:
@@ -578,13 +643,19 @@ class InteractiveAttention(nn.Module):
                 query2key_dist_list.append(query_key_dist)
             all_query2key_dist = torch.cat(query2key_dist_list, dim=-1)
             all_query2key_dist_list.append(all_query2key_dist)
+            q_lens.append(all_query2key_dist.shape[-2])
         distance = torch.cat(all_query2key_dist_list, dim=-2)
 
         tau = distance_tau(sep_query)
+        q_offset = 0
+        for q_type, q_len in zip(sep_query_list, q_lens):
+            if q_type in ("plan", "ego"):
+                tau = tau.clone()
+                tau[:, q_offset:q_offset + q_len, :] = 0.0
+            q_offset += q_len
         tau = tau.permute(0, 2, 1)
 
         attn_mask = -distance[:, None, :, :] * tau[..., None]
-        attn_mask = attn_mask.flatten(0, 1)
 
         return attn_mask
 
@@ -636,6 +707,7 @@ class InteractiveAttention(nn.Module):
             return vels
 
         all_query2key_vel_list = []
+        q_lens = []
         for query_type in sep_query_list:
             query2key_vel_list = []
             for key_type in sep_key_list:
@@ -643,14 +715,20 @@ class InteractiveAttention(nn.Module):
                 query2key_vel_list.append(query_key_vel)
             all_query2key_vel = torch.cat(query2key_vel_list, dim=-1)
             all_query2key_vel_list.append(all_query2key_vel)
+            q_lens.append(all_query2key_vel.shape[-2])
         velocity = torch.cat(all_query2key_vel_list, dim=-2)
         velocity = velocity - velocity.max()
 
         tau = velocity_tau(sep_query)
+        q_offset = 0
+        for q_type, q_len in zip(sep_query_list, q_lens):
+            if q_type in ("plan", "ego"):
+                tau = tau.clone()
+                tau[:, q_offset:q_offset + q_len, :] = 0.0
+            q_offset += q_len
         tau = tau.permute(0, 2, 1)
 
         attn_mask = velocity[:, None, :, :] * tau[..., None]
-        attn_mask = attn_mask.flatten(0, 1)
 
         return attn_mask
 

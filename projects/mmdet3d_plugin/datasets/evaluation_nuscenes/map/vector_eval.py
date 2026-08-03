@@ -1,3 +1,5 @@
+import os
+
 import prettytable
 from typing import Dict, List, Optional
 from time import time
@@ -20,7 +22,10 @@ import multiprocessing as mp
 
 INTERP_NUM = 200 # number of points to interpolate during evaluation
 THRESHOLDS = [0.5, 1.0, 1.5] # AP thresholds
-N_WORKERS = 0 # num workers to parallel; 0 = serial (avoid Pool deadlock seen on large result sets)
+# spawn-based workers avoid the fork-related Pool deadlock. Override via
+# MAP_EVAL_WORKERS when several evaluations share a machine: each worker is a
+# fresh interpreter, so N concurrent evals really do cost N*N_WORKERS processes.
+N_WORKERS = int(os.environ.get('MAP_EVAL_WORKERS', 16))
 
 class VectorEvaluate(object):
     """Evaluator for vectorized map.

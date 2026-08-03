@@ -133,7 +133,7 @@ class SparseOneDecoder(BaseModule):
 
             attn_mask_dict=dict(),
             with_attn_mask=False,               # enable mask-attn
-            with_distance_attn_mask=False,      # enable and set distance attn_mask
+            with_distance_attn_mask=True,       # paper §3.2 Eq. 1 τ·D — on by default
             with_velocity_attn_mask=False,      # enable and set velocity attn_mask
             with_plan_group_attn_mask=False,    # enable and set plan_group attn_mask
 
