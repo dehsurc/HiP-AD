@@ -2,79 +2,67 @@ log_level = 'INFO'
 dist_params = dict(backend='nccl')
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
-work_dir = 'work_dirs/exp/E9_fd_identity_dense_rkd_l01'
-num_gpus = 4
-batch_size = 4
-# dataset size (28128 = old 1758 iters * old global batch 16); keep epochs fixed
-# regardless of batch by deriving iters from the current global batch.
-num_iters_per_epoch = 28128 // (num_gpus * batch_size)
+experiment_name = 'E12_gtfree_pseudo_denoised_l5_12ep'
+work_dir = 'work_dirs/exp/E12_gtfree_pseudo_denoised_l5_12ep'
+wandb_entity = 'e2ekd'
+wandb_project = 'hipad'
+num_gpus = 2
+batch_size = 8
+effective_batch_size = 16
+num_train_samples_per_epoch = 28128
+num_iters_per_epoch = 1758
 num_epochs = 12
-checkpoint_epoch_interval = 3
-checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=2)
-wandb_name = 'E9_fd_identity_dense_rkd_l01'
-log_config = dict(
-    interval=50,
-    hooks=[
-        dict(
-            type='ScientificTextLoggerHook',
-            by_epoch=False,
-            sci_keys=['map_loss_kd_feat'],
-            sci_prefixes=['map_loss_kd_feat_']),
-        dict(
-            type='WandbLoggerHook',
-            init_kwargs=dict(
-                entity='e2ekd',
-                project='hipad',
-                name=wandb_name),
-            by_epoch=False)
-    ])
-load_from = None
-resume_from = None
-workflow = [('train', 1)]
-fp16 = dict(loss_scale=32.0)
-det_class_names = [
-    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
-    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-]
-map_class_names = ['ped_crossing', 'divider', 'boundary']
-# The cached top20_l01 teacher pkl was empirically evaluated in this order.
-# Do not apply the original MapTR [divider, ped_crossing, boundary] swap here.
-map_teacher_class_names = ['ped_crossing', 'divider', 'boundary']
-map_teacher_to_student_class_perm = None
-map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l01.pkl'
-map_feature_match_score_thr = 0.3
-map_feature_match_dist_thr = 4.0  # gt_anchor: teacher-to-GT line-distance gate.
-map_feature_match_mode = 'gt_anchor'
-map_feature_distill_alpha = 1.0
-# Distill only at the early map decoder layers. Split the unit KD scale across
-# layers so the total feature-KD weight stays comparable to the l5-only run.
-map_feature_distill_layers = (0, 1)
-map_feature_distill_weights = (0.5, 0.5)
-map_feature_distill_cached_layers = (0, 1)
-map_feature_distill_teacher_dim = 256
-map_feature_distill_kd_dim = 256
-map_feature_distill_num_classes = 3
-# Geometry-only matching (line cost only). The cls 1:10 weighting from the
-# anti-absorption run changed which teacher queries supervise which student
-# queries and scored worse (det 0.1400/map 0.1486 vs 0.2865/0.3397 val1).
+checkpoint_epoch_interval = 1
+evaluation_epoch_interval = 3
+max_keep_checkpoints = 2
+log_interval = 50
+workers_per_gpu = 8
+fp16_loss_scale = 32.0
+eval_with_det = False
+eval_with_tracking = False
+eval_with_map = True
+eval_with_motion = False
+eval_with_planning = False
+selected_tasks = ['map']
+det_task_weight = 0.0
+map_task_weight = 1.0
+map_teacher_cache_path = 'data/cache/map/maptrv2_teacher_train_feat_top20_l5.pkl'
+map_teacher_cached_layers = (5, )
+map_teacher_feature_dim = 256
+map_teacher_num_queries = 20
+map_teacher_require_features = True
+map_teacher_num_layers = 1
+map_gt_loss_weight = 0.0
+map_distill_mode = 'pseudo_gt'
+map_distill_alpha_cls = 1.0
+map_distill_alpha_reg = 1.0
+map_distill_score_thr = 0.3
+map_distill_last_layer_only = False
+map_distill_layers = (0, 1, 2, 3, 4, 5)
+map_soft_logit_kd_weight = 0.5
+map_pseudo_gt_filter_by_gt = False
+map_pseudo_gt_class_score_thrs = (0.3, 0.25, 0.25)
+map_pseudo_gt_dedup_dist_thr = 1.0
+map_pseudo_gt_max_per_class = 10
+map_pseudo_gt_confidence_power = 1.0
+map_teacher_label_from_score = True
+map_feature_match_mode = 'direct'
+map_feature_distill_alpha = 0.5
+map_feature_distill_score_thr = 0.3
+map_feature_distill_dist_thr = 6.0
+map_feature_distill_layers = (5, )
+map_feature_distill_weights = (1.0, )
+map_feature_distill_cached_layers = (5, )
+map_feature_distill_teacher_layers = None
+map_feature_distill_cross_layer = False
 map_feature_distill_cls_cost_weight = 0.0
 map_feature_distill_line_cost_weight = 1.0
-map_feature_distill_student_proj_depth = 1
-map_feature_distill_detach_point_embed = True
-map_feature_distill_use_point_tokens = True
-map_feature_distill_point_tokens_as_main = True
-# When point tokens refine the main map output, the regular map_loss_line already
-# supervises them directly. Keep the old auxiliary-only line loss disabled.
-map_feature_distill_point_aux_weight = 0.0
-map_feature_distill_freeze_student_proj = False
-# Clean point-token KD: student point tokens refine the main map output, so the
-# regular map_loss_line keeps them connected to real map geometry.
-map_feature_distill_teacher_identity = True
-# Veto geometrically-matched pairs whose argmax classes disagree (guards the
-# looser dist_thr=4.0 against parallel divider<->boundary mismatches; pkl class
-# order verified ped_crossing/divider/boundary on 2026-06-11).
 map_feature_distill_same_class_only = True
-map_gt_loss_weight = 1.0
+map_feature_distill_student_source = 'sampled_points'
+map_feature_distill_detach_sample_locations = True
+map_spatial_teacher_cache_path = None
+map_spatial_distill_alpha = 0.0
+map_spatial_use_map_adapter = False
 model = dict(
     type='SparseDetector',
     use_grid_mask=True,
@@ -86,7 +74,7 @@ model = dict(
         frozen_stages=-1,
         norm_eval=False,
         style='pytorch',
-        with_cp=True,
+        with_cp=False,
         out_indices=(0, 1, 2, 3),
         norm_cfg=dict(type='BN', requires_grad=True),
         pretrained='ckpts/resnet50-19c8e357.pth'),
@@ -100,19 +88,15 @@ model = dict(
         norm_cfg=dict(type='BN', requires_grad=True),
         no_norm_on_lateral=True,
         in_channels=[256, 512, 1024, 2048]),
-    depth_branch=dict(
-        type='DenseDepthNet',
-        embed_dims=256,
-        num_depth_layers=3,
-        loss_weight=0.2),
+    depth_branch=None,
     head=dict(
         type='SparseHead',
         task_config=dict(with_onedecoder=True),
         evaluate_bench2dive=False,
         onedecoder_head=dict(
             type='SparseOneDecoder',
-            task_select=['det', 'map', 'plan', 'ego'],
-            query_select=['det', 'map', 'plan', 'ego'],
+            task_select=['map'],
+            query_select=['map'],
             operation_order=[
                 'concat', 'gnn', 'inter_gnn', 'norm', 'split', 'deformable',
                 'concat', 'ffn', 'norm', 'split', 'refine', 'concat',
@@ -139,30 +123,49 @@ model = dict(
             with_distance_attn_mask=True,
             motion_anchor='data/kmeans/kmeans_motion_6.npy',
             cls_threshold_to_reg=0.05,
-            # Feature-KD match filtering. In gt_anchor mode, dist_thr gates the
-            # teacher-to-GT line distance; direct mode gates student-to-teacher.
-            map_distill_score_thr=map_feature_match_score_thr,
-            map_distill_dist_thr=map_feature_match_dist_thr,
-            map_gt_loss_weight=map_gt_loss_weight,
-            map_feature_distill_alpha=map_feature_distill_alpha,
-            map_feature_distill_layers=map_feature_distill_layers,
-            map_feature_distill_weights=map_feature_distill_weights,
-            map_feature_distill_cached_layers=map_feature_distill_cached_layers,
-            map_feature_distill_teacher_dim=map_feature_distill_teacher_dim,
-            map_feature_distill_kd_dim=map_feature_distill_kd_dim,
-            map_feature_distill_num_classes=map_feature_distill_num_classes,
-            map_feature_distill_cls_cost_weight=map_feature_distill_cls_cost_weight,
-            map_feature_distill_line_cost_weight=map_feature_distill_line_cost_weight,
-            map_feature_distill_student_proj_depth=map_feature_distill_student_proj_depth,
-            map_feature_distill_detach_point_embed=map_feature_distill_detach_point_embed,
-            map_feature_distill_use_point_tokens=map_feature_distill_use_point_tokens,
-            map_feature_distill_point_aux_weight=map_feature_distill_point_aux_weight,
-            map_feature_distill_point_tokens_as_main=map_feature_distill_point_tokens_as_main,
-            map_feature_distill_freeze_student_proj=map_feature_distill_freeze_student_proj,
-            map_feature_distill_teacher_identity=map_feature_distill_teacher_identity,
-            map_feature_distill_same_class_only=map_feature_distill_same_class_only,
-            map_feature_match_mode=map_feature_match_mode,
-            map_teacher_to_student_class_perm=map_teacher_to_student_class_perm,
+            det_task_weight=0.0,
+            map_task_weight=1.0,
+            task_grad_monitor_interval=100,
+            map_feature_match_mode='direct',
+            map_feature_distill_alpha=0.5,
+            map_feature_distill_score_thr=0.3,
+            map_feature_distill_dist_thr=6.0,
+            map_feature_distill_layers=(5, ),
+            map_feature_distill_weights=(1.0, ),
+            map_feature_distill_cached_layers=(5, ),
+            map_feature_distill_teacher_dim=256,
+            map_feature_distill_kd_dim=256,
+            map_feature_distill_teacher_layers=None,
+            map_feature_distill_cross_layer=False,
+            map_feature_distill_cross_layer_temperature=1.0,
+            map_feature_distill_cross_layer_identity_bias=2.0,
+            map_feature_distill_teacher_proj_depth=2,
+            map_feature_distill_freeze_teacher_proj=True,
+            map_feature_distill_init_teacher_proj_identity=False,
+            map_feature_distill_num_classes=3,
+            map_feature_distill_cls_cost_weight=0.0,
+            map_feature_distill_line_cost_weight=1.0,
+            map_feature_distill_student_proj_depth=2,
+            map_feature_distill_student_proj_residual=True,
+            map_feature_distill_layer_specific_proj=False,
+            map_feature_distill_layer_norm=False,
+            map_feature_distill_init_student_proj_identity=False,
+            map_feature_distill_student_source='sampled_points',
+            map_feature_distill_sampled_add_query=True,
+            map_feature_distill_sampled_add_index_embed=True,
+            map_feature_distill_detach_sample_locations=True,
+            map_sampled_point_refine_layers=(),
+            map_sampled_point_refine_max_delta=1.0,
+            map_feature_distill_detach_point_embed=False,
+            map_feature_distill_use_point_embed=False,
+            map_feature_distill_rkd_weight=0.0,
+            map_feature_distill_use_point_tokens=False,
+            map_feature_distill_point_tokens_as_main=False,
+            map_feature_distill_point_aux_weight=0.0,
+            map_feature_distill_freeze_student_proj=False,
+            map_feature_distill_teacher_identity=True,
+            map_feature_distill_same_class_only=True,
+            map_teacher_to_student_class_perm=None,
             det_instance_bank=dict(
                 type='InstanceBank',
                 num_anchor=900,
@@ -225,30 +228,12 @@ model = dict(
             custom_op=dict(type='CustomOperation'),
             temp_graph_model=dict(
                 type='TemporalSeparateAttention',
-                query_select=['det', 'map', 'plan', 'ego'],
-                query_list=[['det'], ['map'], ['plan', 'ego'], ['plan', 'ego']],
-                key_list=[['det'], ['map'], ['plan', 'ego'], ['det', 'map']],
-                decouple_list=[True, False, False, False],
+                query_select=['map'],
+                query_list=[['map']],
+                key_list=[['map']],
+                decouple_list=[False],
                 use_updated_query=True,
                 attn=[
-                    dict(
-                        type='MultiheadFlashAttention',
-                        embed_dims=512,
-                        num_heads=8,
-                        batch_first=True,
-                        dropout=0.1),
-                    dict(
-                        type='MultiheadFlashAttention',
-                        embed_dims=256,
-                        num_heads=8,
-                        batch_first=True,
-                        dropout=0.1),
-                    dict(
-                        type='MultiheadFlashAttention',
-                        embed_dims=256,
-                        num_heads=8,
-                        batch_first=True,
-                        dropout=0.1),
                     dict(
                         type='MultiheadFlashAttention',
                         embed_dims=256,
@@ -258,23 +243,11 @@ model = dict(
                 ]),
             graph_model=dict(
                 type='SeparateAttention',
-                query_select=['det', 'map', 'plan', 'ego'],
-                separate_list=[['det'], ['map'], ['plan', 'ego']],
-                decouple_list=[True, False, False],
+                query_select=['map'],
+                separate_list=[['map']],
+                decouple_list=[False],
                 with_distance_attn_mask=False,
                 attn=[
-                    dict(
-                        type='MultiheadFlashAttention',
-                        embed_dims=512,
-                        num_heads=8,
-                        batch_first=True,
-                        dropout=0.1),
-                    dict(
-                        type='MultiheadFlashAttention',
-                        embed_dims=256,
-                        num_heads=8,
-                        batch_first=True,
-                        dropout=0.1),
                     dict(
                         type='MultiheadFlashAttention',
                         embed_dims=256,
@@ -284,11 +257,11 @@ model = dict(
                 ]),
             inter_graph_model=dict(
                 type='SeparateAttention',
-                query_select=['det', 'map', 'plan', 'ego'],
-                separate_list=[['det', 'map', 'plan', 'ego']],
+                query_select=['map'],
+                separate_list=[['map']],
                 decouple_list=[False],
                 with_distance_attn_mask=True,
-                with_structured_mask=True,
+                with_structured_mask=False,
                 attn=[
                     dict(
                         type='MultiheadFlashAttention',
@@ -450,7 +423,7 @@ model = dict(
                 loss_centerness=dict(
                     type='CrossEntropyLoss', use_sigmoid=True),
                 loss_yawness=dict(type='GaussianFocalLoss'),
-                cls_allow_reverse=[det_class_names.index('barrier')]),
+                cls_allow_reverse=[5]),
             loss_map_cls=dict(
                 type='FocalLoss',
                 use_sigmoid=True,
@@ -497,54 +470,31 @@ model = dict(
                 anchor_refer=('temp', '2hz'),
                 speed_refer=None,
                 with_rescore=True),
-            motion_decoder=dict(type='SparseMotionDecoder'))))
-eval_config = dict(
-    type='NuScenes3DDataset',
-    data_root='data/nuscenes/',
-    classes=[
-        'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
-        'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-    ],
-    map_classes=['ped_crossing', 'divider', 'boundary'],
-    ego_status_dims=6,
-    modality=dict(
-        use_lidar=False,
-        use_camera=True,
-        use_radar=False,
-        use_map=False,
-        use_external=False),
-    version='v1.0-trainval',
-    work_dir=work_dir,
-    eval_data_root='data/nuscenes/',
-    ann_file='data/infos/nuscenes_infos_val.pkl',
-    pipeline=[
-        dict(
-            type='CircleObjectRangeFilter',
-            class_dist_thred=[55, 55, 55, 55, 55, 55, 55, 55, 55, 55]),
-        dict(
-            type='InstanceNameFilter',
-            classes=[
-                'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
-                'barrier', 'motorcycle', 'bicycle', 'pedestrian',
-                'traffic_cone'
-            ]),
-        dict(
-            type='VectorizeMap',
-            roi_size=(30, 60),
-            simplify=True,
-            normalize=False),
-        dict(
-            type='Collect',
-            keys=[
-                'vectors', 'gt_bboxes_3d', 'gt_labels_3d',
-                'gt_agent_fut_trajs', 'gt_agent_fut_masks', 'gt_ego_fut_trajs',
-                'gt_ego_fut_masks', 'gt_ego_fut_cmd', 'fut_boxes'
-            ],
-            meta_keys=['token', 'timestamp'])
-    ],
-    test_mode=True)
+            motion_decoder=dict(type='SparseMotionDecoder'),
+            map_spatial_distill_alpha=0.0,
+            map_spatial_distill_teacher_dim=256,
+            map_spatial_distill_num_levels=4,
+            map_spatial_distill_class_balanced=True,
+            map_spatial_distill_ground_z=-1.84023,
+            map_spatial_use_map_adapter=False,
+            map_spatial_adapter_hidden_dim=64,
+            map_spatial_detach_fpn_for_kd=True,
+            map_gt_loss_weight=0.0,
+            map_distill_mode='pseudo_gt',
+            map_distill_alpha_cls=1.0,
+            map_distill_alpha_reg=1.0,
+            map_distill_score_thr=0.3,
+            map_distill_last_layer_only=False,
+            map_distill_layers=(0, 1, 2, 3, 4, 5),
+            map_soft_logit_kd_weight=0.5,
+            map_pseudo_gt_filter_by_gt=False,
+            map_pseudo_gt_class_score_thrs=(0.3, 0.25, 0.25),
+            map_pseudo_gt_dedup_dist_thr=1.0,
+            map_pseudo_gt_max_per_class=10,
+            map_pseudo_gt_confidence_power=1.0,
+            map_teacher_label_from_score=True)))
 data = dict(
-    samples_per_gpu=batch_size,
+    samples_per_gpu=8,
     workers_per_gpu=8,
     train=dict(
         type='NuScenes3DDataset',
@@ -562,18 +512,11 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir=work_dir,
+        work_dir='work_dirs/exp/E12_gtfree_pseudo_denoised_l5_12ep',
         ann_file='data/infos/nuscenes_infos_train.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
-            dict(
-                type='LoadPointsFromFile',
-                coord_type='LIDAR',
-                load_dim=5,
-                use_dim=5,
-                file_client_args=dict(backend='disk')),
             dict(type='ResizeCropFlipImage'),
-            dict(type='MultiScaleDepthMapGenerator', downsample=[4, 8, 16]),
             dict(type='BBoxRotation'),
             dict(type='PhotoMetricDistortionMultiViewImage'),
             dict(
@@ -581,40 +524,15 @@ data = dict(
                 mean=[123.675, 116.28, 103.53],
                 std=[58.395, 57.12, 57.375],
                 to_rgb=True),
-            dict(
-                type='CircleObjectRangeFilter',
-                class_dist_thred=[55, 55, 55, 55, 55, 55, 55, 55, 55, 55]),
-            dict(
-                type='InstanceNameFilter',
-                classes=[
-                    'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
-                    'barrier', 'motorcycle', 'bicycle', 'pedestrian',
-                    'traffic_cone'
-                ]),
-            dict(
-                type='VectorizeMap',
-                roi_size=(30, 60),
-                simplify=False,
-                normalize=False,
-                sample_num=20,
-                permute=True),
             dict(type='NuScenesSparse4DAdaptor'),
             dict(
                 type='Collect',
                 keys=[
                     'img', 'timestamp', 'projection_mat', 'image_wh',
-                    'gt_depth', 'focal', 'gt_bboxes_3d', 'gt_labels_3d',
-                    'gt_map_labels', 'gt_map_pts', 'gt_agent_fut_trajs',
-                    'gt_agent_fut_masks', 'gt_ego_fut_trajs',
-                    'gt_ego_fut_masks', 'gt_ego_fut_cmd',
-                    'gt_ego_fut_trajs_2hz', 'gt_ego_fut_masks_2hz',
-                    'ego_status', 'ego_status_mask', 'teacher_map_logits',
-                    'teacher_map_pts', 'teacher_map_scores',
-                    'teacher_map_features'
+                    'teacher_map_logits', 'teacher_map_pts',
+                    'teacher_map_scores', 'teacher_map_features'
                 ],
-                meta_keys=[
-                    'T_global', 'T_global_inv', 'timestamp', 'instance_id'
-                ])
+                meta_keys=['T_global', 'T_global_inv', 'timestamp'])
         ],
         test_mode=False,
         data_aug_conf=dict(
@@ -629,12 +547,15 @@ data = dict(
         with_seq_flag=True,
         sequences_split_num=2,
         keep_consistent_seq_aug=True,
-        map_teacher_cache_path=map_teacher_cache_path,
-        map_teacher_num_layers=2,
+        map_teacher_cache_path=
+        'data/cache/map/maptrv2_teacher_train_feat_top20_l5.pkl',
+        map_teacher_num_layers=1,
         map_teacher_num_queries=20,
         map_teacher_num_pts=20,
         map_teacher_feature_dim=256,
-        map_teacher_require_features=True),
+        map_teacher_require_features=True,
+        map_spatial_teacher_cache_path=None,
+        load_gt=False),
     val=dict(
         type='NuScenes3DDataset',
         data_root='data/nuscenes/',
@@ -651,7 +572,7 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir=work_dir,
+        work_dir='work_dirs/exp/E12_gtfree_pseudo_denoised_l5_12ep',
         ann_file='data/infos/nuscenes_infos_val.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -697,7 +618,7 @@ data = dict(
                 use_map=False,
                 use_external=False),
             version='v1.0-trainval',
-            work_dir=work_dir,
+            work_dir='work_dirs/exp/E12_gtfree_pseudo_denoised_l5_12ep',
             eval_data_root='data/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
@@ -743,7 +664,7 @@ data = dict(
             use_map=False,
             use_external=False),
         version='v1.0-trainval',
-        work_dir=work_dir,
+        work_dir='work_dirs/exp/E12_gtfree_pseudo_denoised_l5_12ep',
         ann_file='data/infos/nuscenes_infos_val.pkl',
         pipeline=[
             dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -789,7 +710,7 @@ data = dict(
                 use_map=False,
                 use_external=False),
             version='v1.0-trainval',
-            work_dir=work_dir,
+            work_dir='work_dirs/exp/E12_gtfree_pseudo_denoised_l5_12ep',
             eval_data_root='data/nuscenes/',
             ann_file='data/infos/nuscenes_infos_val.pkl',
             pipeline=[
@@ -831,15 +752,42 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=0.3333333333333333,
     min_lr_ratio=0.001)
-runner = dict(type='IterBasedRunner', max_iters=num_iters_per_epoch * num_epochs)
+checkpoint_config = dict(interval=1758, max_keep_ckpts=2)
+log_config = dict(
+    interval=50,
+    hooks=[
+        dict(
+            type='ScientificTextLoggerHook',
+            by_epoch=False,
+            sci_keys=[
+                'map_loss_kd_cls', 'map_loss_kd_line', 'map_loss_kd_feat',
+                'map_pgt_count', 'map_kd_feat_matches'
+            ],
+            sci_prefixes=['map_loss_kd_feat_']),
+        dict(
+            type='WandbLoggerHook',
+            init_kwargs=dict(
+                entity='e2ekd',
+                project='hipad',
+                name='E12_gtfree_pseudo_denoised_l5_12ep'),
+            by_epoch=False)
+    ])
+load_from = None
+resume_from = None
+workflow = [('train', 1)]
+fp16 = dict(loss_scale=32.0)
+custom_hooks = []
+runner = dict(type='IterBasedRunner', max_iters=21096)
 evaluation = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval,
+    interval=5274,
     jsonfile_prefix='val/',
     eval_mode=dict(
-        with_det=True,
+        with_det=False,
         with_tracking=False,
         with_map=True,
         with_motion=False,
         with_planning=False,
         tracking_threshold=0.2,
         motion_threshhold=0.2))
+gpu_ids = range(0, 2)
+find_unused_parameters = True
